@@ -1,0 +1,617 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>OpenClaw Collector · Adaptive Flowboard</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --canvas: #f5f5f7;
+      --chrome: rgba(251, 251, 253, .84);
+      --card: rgba(255,255,255,.96);
+      --ink: #1d1d1f;
+      --secondary: #6e6e73;
+      --tertiary: #8e8e93;
+      --line: rgba(0,0,0,.055);
+      --blue: #007aff;
+      --green: #34c759;
+      --orange: #ff9f0a;
+      --red: #ff3b30;
+      --agent: #3b746d;
+      --spring-settle: linear(0, .145 6%, .407 18%, .632 30%, .79 42%, .89 54%, .948 66%, .98 78%, .994 90%, 1);
+      --lane-h: 96px;
+      --stage-head: 38px;
+      --radius: 14px;
+      font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "PingFang SC", "Noto Sans SC", sans-serif;
+      -webkit-font-smoothing: antialiased;
+    }
+    * { box-sizing: border-box; }
+    html, body { margin: 0; min-height: 100%; background: var(--canvas); color: var(--ink); }
+    button { font: inherit; color: inherit; }
+    .app { min-height: 100vh; display: grid; grid-template-rows: 58px auto 1fr; }
+    .topbar {
+      display: flex; align-items: center; gap: 28px; padding: 0 24px;
+      background: var(--chrome); backdrop-filter: blur(24px) saturate(135%);
+      border-bottom: 1px solid var(--line); position: sticky; top: 0; z-index: 50;
+    }
+    .brand { display: flex; align-items: center; gap: 12px; font-weight: 650; letter-spacing: -.15px; }
+    .mark { width: 30px; height: 30px; border-radius: 9px; background: #1d1d1f; color: white; display: grid; place-items: center; font-weight: 750; }
+    .nav { display: flex; gap: 22px; font-size: 13px; color: var(--secondary); }
+    .nav .active { color: var(--ink); font-weight: 620; }
+    .gateway { margin-left: auto; height: 36px; padding: 0 14px; border-radius: 11px; background: white; border: 1px solid var(--line); display: flex; align-items: center; gap: 9px; font-size: 13px; }
+    .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--green); }
+    .summary { padding: 24px 24px 14px; display: grid; grid-template-columns: 1fr auto; gap: 12px; align-items: end; }
+    .eyebrow { font-size: 10px; letter-spacing: .11em; font-weight: 700; color: var(--tertiary); margin-bottom: 8px; }
+    h1 { margin: 0; font-size: 30px; line-height: 1.05; letter-spacing: -.85px; font-weight: 680; }
+    .metrics { margin-top: 10px; display: flex; align-items: center; gap: 18px; color: var(--secondary); font-size: 13px; font-variant-numeric: tabular-nums; }
+    .metrics strong { color: var(--ink); font-weight: 650; }
+    .metrics .live { color: #248a3d; }
+    .metrics .wait { color: #a65f00; }
+    .controls { display: flex; gap: 8px; align-items: center; }
+    .load-caption { font-size:10px; font-weight:650; letter-spacing:.04em; color:var(--tertiary); margin-right:2px; }
+    .segmented { display: flex; padding: 3px; gap: 2px; background: rgba(118,118,128,.12); border-radius: 12px; }
+    .segmented button, .quiet-button {
+      border: 0; background: transparent; border-radius: 9px; min-height: 34px; padding: 0 12px; font-size: 12px; cursor: pointer;
+    }
+    .segmented button[aria-pressed="true"] { background: white; box-shadow: 0 1px 3px rgba(0,0,0,.09); }
+    .quiet-button { background: white; border: 1px solid var(--line); }
+    .quiet-button:active, .segmented button:active { transform: scale(.985); }
+    .board-shell { min-height: 0; padding: 0 24px 24px; }
+    .board {
+      position: relative; height: min(735px, calc(100vh - 176px)); min-height: 520px;
+      border-radius: 22px; overflow: hidden; background: rgba(255,255,255,.28); border: 1px solid rgba(0,0,0,.045);
+      box-shadow: 0 1px 1px rgba(0,0,0,.02);
+    }
+    .stage-bands { position: absolute; inset: 0 72px 0 184px; display: grid; grid-template-columns: 12% 48% 18% 22%; pointer-events: none; }
+    .band { border-left: 1px solid rgba(0,0,0,.035); background: transparent; }
+    .band.waiting { box-shadow: inset 12px 0 28px -28px rgba(255,159,10,.22); }
+    .stage-heads { position: absolute; top: 0; left: 184px; right: 72px; height: var(--stage-head); display: grid; grid-template-columns: 12% 48% 18% 22%; z-index: 7; pointer-events: none; }
+    .stage-head { padding: 11px 16px 0; font-size: 10px; font-weight: 700; letter-spacing: .1em; color: var(--tertiary); }
+    .stage-head small { display:block; margin-top:4px; font-size:9px; letter-spacing:0; font-weight:520; color:#9b9ba0; }
+    .agent-head-label { position: absolute; top: 14px; left: 16px; font-size: 10px; font-weight: 700; letter-spacing: .1em; color: var(--tertiary); }
+    .flow-arrow { float: right; font-size: 15px; letter-spacing: 0; font-weight: 450; }
+    .lanes { position: absolute; left: 0; top: var(--stage-head); right: 0; bottom: 34px; overflow: auto; scrollbar-width: thin; }
+    .lane { position: relative; height: var(--lane-h); border-top: 1px solid rgba(0,0,0,.03); }
+    .lane:hover { background: rgba(255,255,255,.22); }
+    .agent-label { position: sticky; left: 0; width: 184px; height: 100%; z-index: 6; display: grid; grid-template-columns: 36px 1fr auto; align-content: center; align-items: center; gap: 10px; padding: 0 16px; background: linear-gradient(90deg, rgba(245,245,247,.97) 88%, rgba(245,245,247,0)); }
+    .agent-avatar { width: 34px; height: 34px; border-radius: 11px; color: #fff7e7; display: grid; place-items: center; font-weight: 700; font-size: 12px; }
+    .agent-copy b { display:block; font-size: 13px; letter-spacing: -.08px; }
+    .agent-copy span { display:block; font-size: 10px; color: var(--secondary); margin-top: 4px; font-variant-numeric: tabular-nums; }
+    .agent-count { min-width: 28px; padding: 5px 7px; border-radius: 8px; text-align: center; font-size: 10px; color: var(--secondary); background: rgba(118,118,128,.08); font-variant-numeric: tabular-nums; }
+    .card {
+      position: absolute; z-index: 5; border: 1px solid rgba(0,0,0,.075); background: var(--card);
+      box-shadow: 0 1px 2px rgba(0,0,0,.045), 0 5px 13px rgba(0,0,0,.045);
+      cursor: pointer; overflow: hidden; transform-origin: center; will-change: left, top, width, height, transform;
+      transition:
+        left 360ms var(--spring-settle), top 320ms var(--spring-settle),
+        width 320ms var(--spring-settle), height 320ms var(--spring-settle),
+        border-radius 320ms cubic-bezier(.2,.75,.25,1), box-shadow 180ms ease-out, background 150ms ease-out;
+    }
+    .card::before { content:""; position:absolute; left:0; top:0; bottom:0; width:3px; background: var(--agent); opacity:.9; }
+    .card:hover { z-index: 20; transform: translateY(-2px); box-shadow: 0 1px 2px rgba(0,0,0,.055), 0 12px 26px rgba(0,0,0,.10); }
+    .card:active { transform: translateY(1px) scale(.985); }
+    .card.selected { z-index: 30; outline: 2px solid rgba(0,122,255,.62); outline-offset: 2px; box-shadow: 0 1px 2px rgba(0,0,0,.06), 0 16px 38px rgba(0,0,0,.14); }
+    .status-dot { position: absolute; border-radius: 50%; }
+    .card.waiting { background:#fffaf1; border-color: rgba(191,116,20,.18); }
+    .card.waiting .status-dot { background: var(--orange); }
+    .card.running .status-dot { background: var(--green); }
+    .card.incoming .status-dot { background: transparent; border: 1px solid var(--blue); }
+    .card.settled { background: rgba(250,250,247,.88); border-color: rgba(0,0,0,.045); box-shadow: 0 1px 2px rgba(0,0,0,.025); color: #666b67; }
+    .card.settled .status-dot { background: #8c958f; }
+    .card.attention { border-color: rgba(255,59,48,.38); }
+    .card.attention .status-dot { background: var(--red); border-radius: 2px; transform: rotate(45deg); }
+    .card.outcome-failed { border-color: rgba(255,59,48,.30); }
+    .card.outcome-failed .status-dot { background:transparent; border:1.5px solid var(--red); border-radius:50%; transform:none; }
+    .card-content { position: absolute; inset: 0; }
+    .card-title { font-weight: 630; letter-spacing: -.12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .card-meta { color: var(--secondary); white-space: nowrap; overflow:hidden; text-overflow:ellipsis; font-variant-numeric: tabular-nums; }
+    .card-badge { color:#27765b; font-weight:650; letter-spacing:.06em; }
+    .activity-type { position:absolute; color: var(--tertiary); font-size:10px; }
+    .footer { position:absolute; left:0; right:72px; bottom:0; height:34px; z-index:8; display:flex; align-items:center; gap:14px; padding:0 16px; font-size:10px; color:var(--secondary); background:rgba(251,251,253,.88); border-top:1px solid var(--line); backdrop-filter: blur(18px); }
+    .footer .push { margin-left:auto; }
+    .throughput { display:flex; gap:3px; align-items:end; height:14px; }
+    .throughput i { display:block; width:2px; border-radius:2px; background:#63a68d; }
+    .unseen { color:#9c5b0b; font-weight:600; }
+    .fleet-map { position:absolute; z-index:12; right:0; top:0; bottom:0; width:72px; padding:10px 9px 38px; border-left:1px solid rgba(0,0,0,.045); background:rgba(251,251,253,.78); backdrop-filter:blur(18px) saturate(125%); }
+    .fleet-map h2 { margin:0 0 8px; font-size:8px; line-height:1; letter-spacing:.1em; color:var(--tertiary); font-weight:700; }
+    .fleet-map-body { height:calc(100% - 18px); display:grid; align-content:start; gap:2px; }
+    .map-row { border:0; padding:0; min-height:4px; display:grid; grid-template-columns:12% 48% 18% 22%; gap:1px; background:transparent; cursor:pointer; }
+    .map-row span { display:block; min-height:4px; border-radius:2px; background:rgba(118,118,128,.10); }
+    .map-row span:nth-child(1) { background:rgba(0,122,255,var(--a1)); }
+    .map-row span:nth-child(2) { background:rgba(52,199,89,var(--a2)); }
+    .map-row span:nth-child(3) { background:rgba(255,159,10,var(--a3)); }
+    .map-row span:nth-child(4) { background:rgba(142,142,147,var(--a4)); }
+    .map-row:hover, .map-row:focus-visible { outline:1px solid rgba(0,122,255,.55); outline-offset:1px; }
+    .density-focus .card { border-radius: 18px; }
+    .density-focus .stage-bands, .density-focus .stage-heads { grid-template-columns:20% 38% 24% 18%; }
+    .density-focus .status-dot { width:8px; height:8px; left:18px; top:18px; }
+    .density-focus .card-title { position:absolute; left:18px; top:40px; right:16px; font-size:16px; }
+    .density-focus .card-meta { position:absolute; left:18px; top:66px; right:16px; font-size:12px; }
+    .density-focus .card-badge { position:absolute; left:32px; top:16px; font-size:9px; }
+    .density-focus .activity-type { right:14px; bottom:12px; }
+    .density-board .card { border-radius: 13px; }
+    .density-board .status-dot { width:7px; height:7px; left:12px; top:13px; }
+    .density-board .card-title { position:absolute; left:27px; top:9px; right:9px; font-size:12px; }
+    .density-board .card-meta { position:absolute; left:12px; top:32px; right:8px; font-size:10px; }
+    .density-board .card-badge { display:none; }
+    .density-board .activity-type { right:8px; bottom:7px; }
+    .density-dense .card { border-radius: 9px; box-shadow: 0 1px 2px rgba(0,0,0,.035); }
+    .density-dense .status-dot { width:6px; height:6px; left:9px; top:11px; }
+    .density-dense .card-title { position:absolute; left:21px; top:7px; right:7px; font-size:10px; }
+    .density-dense .card-meta, .density-dense .card-badge, .density-dense .activity-type { display:none; }
+    .density-radar .card { border-radius: 6px; box-shadow:none; }
+    .density-radar .status-dot { width:5px; height:5px; left:7px; top:8px; }
+    .density-radar .card-title, .density-radar .card-meta, .density-radar .card-badge, .density-radar .activity-type { display:none; }
+    .density-radar .agent-avatar { width:20px; height:20px; border-radius:7px; font-size:8px; }
+    .density-radar .agent-label { grid-template-columns:20px 1fr auto; gap:7px; }
+    .density-radar .agent-copy b { font-size:10px; }
+    .density-radar .agent-copy span { display:none; }
+    .density-radar .agent-count { padding:3px 5px; min-width:22px; }
+    @media (prefers-reduced-motion: reduce) {
+      .card { transition: opacity 150ms ease-out, background 150ms ease-out, border-color 150ms ease-out; }
+    }
+    @media (max-width: 900px) {
+      .summary { grid-template-columns:1fr; }
+      .controls { overflow:auto; }
+      .stage-bands, .stage-heads { left:132px; }
+      .agent-label { width:132px; grid-template-columns:30px 1fr; padding:0 10px; }
+      .agent-avatar { width:30px; height:30px; }
+      .agent-count { display:none; }
+      .agent-copy span { display:none; }
+    }
+  </style>
+</head>
+<body>
+  <div class="app">
+    <header class="topbar">
+      <div class="brand"><span class="mark">F</span>OpenClaw Collector</div>
+      <nav class="nav"><span class="active">Live flow</span><span>Relations</span><span>History</span><span>Sources</span></nav>
+      <div class="gateway"><span class="dot"></span>gateway-prod</div>
+    </header>
+    <section class="summary">
+      <div>
+        <div class="eyebrow">LIVE ACTIVITY</div>
+        <h1 id="headline">Activity is flowing</h1>
+        <div class="metrics" id="metrics"></div>
+      </div>
+      <div class="controls">
+        <span class="load-caption">ACTIVE LOAD</span>
+        <div class="segmented" aria-label="Operational activity load fixture">
+          <button data-load="sparse">4</button>
+          <button data-load="medium">48</button>
+          <button data-load="dense" aria-pressed="true">180</button>
+          <button data-load="extreme">600</button>
+        </div>
+        <button class="quiet-button" id="flow-one">Move selected</button>
+        <button class="quiet-button" id="burst">Burst ×20</button>
+        <button class="quiet-button" id="follow" aria-pressed="true">Pause demo</button>
+      </div>
+    </section>
+    <main class="board-shell">
+      <section class="board density-dense" id="board" aria-label="Adaptive activity flowboard">
+        <div class="stage-bands"><div class="band incoming"></div><div class="band running"></div><div class="band waiting"></div><div class="band settled"></div></div>
+        <div class="agent-head-label">AGENT FLOW</div>
+        <div class="stage-heads">
+          <div class="stage-head">INCOMING <span class="flow-arrow">→</span><small id="head-incoming"></small></div>
+          <div class="stage-head">IN FLIGHT <span class="flow-arrow">→</span><small id="head-running"></small></div>
+          <div class="stage-head">WAITING <span class="flow-arrow">↔</span><small id="head-waiting"></small></div>
+          <div class="stage-head">SETTLED <span class="flow-arrow">→</span><small id="head-settled"></small></div>
+        </div>
+        <div class="lanes" id="lanes"></div>
+        <div class="footer">
+          <span class="dot"></span><span id="density-label">Auto density · dense</span>
+          <span id="truth-label"></span>
+          <span class="throughput" id="throughput" aria-label="Recent throughput"></span>
+          <span class="push" id="flow-note">Prototype playback · production moves on observed events</span>
+        </div>
+        <aside class="fleet-map" aria-label="All Agent and stage distribution">
+          <h2>FLEET MAP</h2>
+          <div class="fleet-map-body" id="fleet-map-body"></div>
+        </aside>
+      </section>
+    </main>
+  </div>
+  <script>
+    const stages = ["incoming", "running", "waiting", "settled"];
+    const agentPalette = ["#39766e", "#bd6842", "#53679c", "#aa8738", "#8c657f", "#758653", "#517f87", "#815d45", "#5f7e66", "#a36f69", "#617aa0", "#948045"];
+    const agentNames = ["researcher","writer","ops","analyst","planner","builder","qa","deployer","reviewer","scheduler","publisher","monitor","crawler","summarizer","triage","auditor","notifier","orchestrator","indexer","planner-b","tester","release","watchdog","assistant","worker-a","worker-b","worker-c","cron-a","cron-b","subagent"];
+    const taskNames = ["Competitive scan","Source review","Publish release","Deploy monitor","Dependency map","Regression check","Audit backfill","Draft narrative","Policy check","Index refresh","Summarize session","Health probe","Tool analysis","Schedule report","Approval request","Plan rollout","Fetch sources","Compare builds","Validate output","Write brief"];
+    const fixtures = {
+      sparse: { active:4, recentOutflow:0, agents:2, boardH:454 },
+      medium: { active:48, recentOutflow:8, agents:8, boardH:714 },
+      dense: { active:180, recentOutflow:30, agents:15, boardH:734 },
+      extreme: { active:600, recentOutflow:60, agents:30, boardH:734 }
+    };
+    let activities = [];
+    let currentLoad = "dense";
+    let currentDensity = "dense";
+    let densityTimer = null;
+    let selectedId = null;
+    let demoPlaying = true;
+    let migrationTimer = null;
+    let arrivalTimer = null;
+    let nextActivitySerial = 1;
+    let flowEvents = { launched:[], waiting:[], resumed:[], settled:[] };
+    const board = document.querySelector("#board");
+    const lanesEl = document.querySelector("#lanes");
+    const metricsEl = document.querySelector("#metrics");
+
+    function seeded(n) { const x = Math.sin(n * 9187.31) * 10000; return x - Math.floor(x); }
+    function operationalStageFor(i) {
+      const r = seeded(i + 3);
+      if (r < .12) return "incoming";
+      if (r < .83) return "running";
+      return "waiting";
+    }
+    function seedFlowWindow(name) {
+      const targets = {
+        sparse:{launched:2,waiting:1,resumed:1,settled:1},
+        medium:{launched:12,waiting:3,resumed:2,settled:10},
+        dense:{launched:35,waiting:9,resumed:4,settled:30},
+        extreme:{launched:96,waiting:24,resumed:14,settled:82}
+      }[name];
+      const now = Date.now();
+      flowEvents = Object.fromEntries(Object.entries(targets).map(([kind,count]) => [
+        kind,
+        Array.from({length:count},(_,i)=>now-Math.round((i+1)*58000/(count+1)))
+      ]));
+    }
+    function recordFlow(kind) { flowEvents[kind].push(Date.now()); }
+    function rollingRates() {
+      const cutoff = Date.now()-60000;
+      for (const kind of Object.keys(flowEvents)) flowEvents[kind] = flowEvents[kind].filter(ts=>ts>=cutoff);
+      return Object.fromEntries(Object.entries(flowEvents).map(([kind,events])=>[kind,events.length]));
+    }
+    const densityOrder = ["focus","board","dense","radar"];
+    const densityBands = {
+      focus:{total:12,hotspot:4,laneH:190},
+      board:{total:70,hotspot:10,laneH:112},
+      dense:{total:260,hotspot:18,laneH:44},
+      radar:{total:Infinity,hotspot:Infinity,laneH:22}
+    };
+    function densityInputs() {
+      const f=fixtures[currentLoad];
+      let hotspot=0;
+      for(let agent=0;agent<f.agents;agent++) for(const stage of stages) {
+        hotspot=Math.max(hotspot,activities.filter(a=>a.agent===agent&&a.stage===stage).length);
+      }
+      const widthScale=Math.max(.68,Math.min(1.15,(board.clientWidth||1500)/1500));
+      const heightScale=Math.max(.78,Math.min(1.08,window.innerHeight/900));
+      return {total:activities.length,hotspot,scale:widthScale*heightScale};
+    }
+    function rawDensity() {
+      const {total,hotspot,scale}=densityInputs();
+      for(const name of densityOrder.slice(0,-1)) {
+        const band=densityBands[name];
+        if(total<=band.total*scale && hotspot<=band.hotspot*Math.sqrt(scale)) return name;
+      }
+      return "radar";
+    }
+    function densityWithHysteresis() {
+      const desired=rawDensity();
+      const from=densityOrder.indexOf(currentDensity);
+      const to=densityOrder.indexOf(desired);
+      if(from<0||from===to) return desired;
+      const {total,hotspot,scale}=densityInputs();
+      if(to>from) {
+        const band=densityBands[currentDensity];
+        if(total<=band.total*scale*1.12 && hotspot<=band.hotspot*Math.sqrt(scale)*1.12) return currentDensity;
+      } else {
+        const band=densityBands[desired];
+        if(total>band.total*scale*.88 || hotspot>band.hotspot*Math.sqrt(scale)*.88) return currentDensity;
+      }
+      return desired;
+    }
+    function applyDensity(name) {
+      currentDensity=name;
+      board.className=`board density-${name}`;
+      document.documentElement.style.setProperty("--lane-h",`${densityBands[name].laneH}px`);
+      selectedId=["focus","board"].includes(name)
+        ? (selectedId??activities.find(a=>a.stage==="running")?.id??activities[0]?.id)
+        : null;
+      document.querySelector("#density-label").textContent=`Auto density · ${name==="board"?"compact":name}`;
+      requestAnimationFrame(layoutCards);
+    }
+    function scheduleDensityResolve({immediate=false}={}) {
+      clearTimeout(densityTimer);
+      const resolve=()=>applyDensity(immediate?rawDensity():densityWithHysteresis());
+      if(immediate) resolve(); else densityTimer=setTimeout(resolve,300);
+    }
+    function buildFixture(name) {
+      currentLoad = name;
+      const f = fixtures[name];
+      seedFlowWindow(name);
+      const operational = Array.from({length:f.active}, (_,i) => {
+        const stage = name==="sparse" ? ["incoming","running","running","waiting"][i] : operationalStageFor(i);
+        return {
+          id:`activity-${i+1}`,
+          agent:i % f.agents,
+          stage,
+          title:taskNames[i % taskNames.length],
+          type:["task","session","cron","subagent"][i % 4],
+          age:`${String((i*7)%59).padStart(2,"0")}:${String((i*13)%59).padStart(2,"0")}`,
+          attention:i > 0 && i % 47 === 0,
+          failedOutcome:false,
+          settledAt:null,
+          slot:0
+        };
+      });
+      const outflow=Array.from({length:f.recentOutflow},(_,j)=>{
+        const i=f.active+j;
+        return {
+          id:`activity-${i+1}`,
+          agent:j%f.agents,
+          stage:"settled",
+          title:taskNames[i%taskNames.length],
+          type:["task","session","cron","subagent"][i%4],
+          age:`${String((i*7)%59).padStart(2,"0")}:${String((i*13)%59).padStart(2,"0")}`,
+          attention:false,
+          failedOutcome:j>0&&j%23===0,
+          settledAt:Date.now()-(j%5)*650,
+          slot:0
+        };
+      });
+      activities=[...operational,...outflow];
+      nextActivitySerial = activities.length + 1;
+      for (let agent=0; agent<f.agents; agent++) {
+        for (const stage of stages) {
+          activities.filter(a=>a.agent===agent && a.stage===stage).forEach((a,index)=>a.slot=index);
+        }
+      }
+      selectedId = null;
+      board.style.height = `${f.boardH}px`;
+      scheduleDensityResolve({immediate:true});
+      render();
+      startLiveFlow();
+    }
+    function sizes() {
+      const d = currentDensity;
+      return d === "focus" ? {w:240,h:116,gx:16,gy:12,pad:14}
+        : d === "board" ? {w:104,h:46,gx:8,gy:6,pad:10}
+        : d === "dense" ? {w:56,h:18,gx:4,gy:3,pad:6}
+        : {w:28,h:18,gx:3,gy:3,pad:5};
+    }
+    function stageBounds(stage, boardWidth) {
+      const label = window.innerWidth <= 900 ? 132 : 184;
+      const field = boardWidth - label - 72;
+      const focus = currentDensity==="focus";
+      const starts = focus
+        ? {incoming:0, running:.20, waiting:.58, settled:.82}
+        : {incoming:0, running:.12, waiting:.60, settled:.78};
+      const widths = focus
+        ? {incoming:.20, running:.38, waiting:.24, settled:.18}
+        : {incoming:.12, running:.48, waiting:.18, settled:.22};
+      return { x:label + field*starts[stage], width:field*widths[stage] };
+    }
+    function refreshCard(el, a) {
+      const currentAttention=a.attention&&a.stage!=="settled";
+      const failed=a.failedOutcome&&a.stage==="settled";
+      el.className = `card ${a.stage}${currentAttention?" attention":""}${failed?" outcome-failed":""}${a.id===selectedId?" selected":""}`;
+      el.setAttribute("aria-label", `${a.title}, ${a.stage}, ${agentNames[a.agent]}`);
+      const badge = el.querySelector(".card-badge");
+      const meta = el.querySelector(".card-meta");
+      if (badge) badge.textContent = a.stage.toUpperCase();
+      if (meta) meta.textContent = `${a.stage === "running" ? "Working now" : a.stage === "waiting" ? "Needs input" : a.stage === "settled" ? "Recently finished" : "Ready to start"} · ${a.age}`;
+    }
+    function createCard(a) {
+      const el = document.createElement("button");
+      el.type = "button";
+      el.className = "card";
+      el.dataset.id = a.id;
+      el.setAttribute("aria-label", `${a.title}, ${a.stage}, ${agentNames[a.agent]}`);
+      el.innerHTML = `<span class="card-content"><span class="status-dot"></span><span class="card-badge">${a.stage.toUpperCase()}</span><span class="card-title">${a.title}</span><span class="card-meta">${a.stage === "running" ? "Working now" : a.stage === "waiting" ? "Needs input" : a.stage === "settled" ? "Recently finished" : "Ready to start"} · ${a.age}</span><span class="activity-type">${a.type}</span></span>`;
+      el.addEventListener("click", () => { selectedId = a.id; layoutCards(); });
+      refreshCard(el,a);
+      return el;
+    }
+    function render() {
+      const f = fixtures[currentLoad];
+      lanesEl.innerHTML = "";
+      for (let i=0; i<f.agents; i++) {
+        const lane = document.createElement("section");
+        lane.className = "lane";
+        lane.dataset.agent = i;
+        const count = activities.filter(a=>a.agent===i && a.stage!=="settled").length;
+        const waiting = activities.filter(a=>a.agent===i && a.stage==="waiting").length;
+        lane.innerHTML = `<div class="agent-label"><span class="agent-avatar" style="background:${agentPalette[i%agentPalette.length]}">${agentNames[i][0].toUpperCase()}</span><span class="agent-copy"><b>${agentNames[i]}</b><span>${count} current${waiting?` · ${waiting} wait`:""}</span></span><span class="agent-count">${count}</span></div>`;
+        activities.filter(a=>a.agent===i).forEach(a => lane.appendChild(createCard(a)));
+        lanesEl.appendChild(lane);
+      }
+      requestAnimationFrame(layoutCards);
+      updateSummary();
+      renderFleetMap();
+      document.querySelectorAll("[data-load]").forEach(b=>b.setAttribute("aria-pressed", String(b.dataset.load===currentLoad)));
+      document.querySelector("#density-label").textContent = `Auto density · ${currentDensity==="board"?"compact":currentDensity}`;
+      document.querySelector("#truth-label").textContent = `· ${f.active} operational tokens · ${activities.length-f.active} recent outflow · ${f.agents} Agent lanes`;
+    }
+    function layoutCards() {
+      const s = sizes();
+      const boardWidth = board.clientWidth;
+      document.querySelectorAll(".lane").forEach(lane => {
+        const agent = Number(lane.dataset.agent);
+        stages.forEach(stage => {
+          const list = activities.filter(a=>a.agent===agent && a.stage===stage);
+          const b = stageBounds(stage, boardWidth);
+          const cols = Math.max(1, Math.floor((b.width - s.pad*2 + s.gx)/(s.w+s.gx)));
+          list.forEach(a => {
+            const card = lane.querySelector(`[data-id="${a.id}"]`);
+            if (!card) return;
+            const col = a.slot % cols;
+            const row = Math.floor(a.slot / cols);
+            card.style.left = `${b.x + s.pad + col*(s.w+s.gx)}px`;
+            card.style.top = `${8 + row*(s.h+s.gy)}px`;
+            card.style.width = `${s.w}px`;
+            card.style.height = `${s.h}px`;
+            card.style.setProperty("--agent", agentPalette[agent%agentPalette.length]);
+            refreshCard(card,a);
+          });
+        });
+      });
+    }
+    function updateSummary() {
+      const flowStats = rollingRates();
+      const counts = Object.fromEntries(stages.map(s=>[s, activities.filter(a=>a.stage===s).length]));
+      const live = counts.incoming + counts.running + counts.waiting;
+      document.querySelector("#headline").textContent = `${live} active now`;
+      metricsEl.innerHTML = `<span><strong class="live">${counts.running}</strong> in flight</span><span><strong class="wait">${counts.waiting}</strong> waiting</span><span><strong>${counts.incoming}</strong> incoming</span><span><strong>${counts.settled}</strong> recent outflow</span><span><strong>${flowStats.settled}</strong> settled/min</span><span>${fixtures[currentLoad].agents} active Agents</span>`;
+      document.querySelector("#head-incoming").textContent = `${counts.incoming} now · → ${flowStats.launched}/min`;
+      document.querySelector("#head-running").textContent = `${counts.running} now · ${flowStats.settled}/min out`;
+      document.querySelector("#head-waiting").textContent = `${counts.waiting} now · ← ${flowStats.resumed}/min resumed`;
+      document.querySelector("#head-settled").textContent = `${counts.settled} visible · ${flowStats.settled}/min`;
+      const bars = Array.from({length:34},(_,i)=>`<i style="height:${3+Math.round(seeded(i+activities.length)*11)}px;opacity:${.35+seeded(i+77)*.65}"></i>`).join("");
+      document.querySelector("#throughput").innerHTML = bars;
+      document.querySelector("#truth-label").textContent = `· ${live} exact operational tokens · ${counts.settled} recent outflow · ${fixtures[currentLoad].agents} Agent lanes`;
+    }
+    function renderFleetMap() {
+      const body = document.querySelector("#fleet-map-body");
+      const f = fixtures[currentLoad];
+      body.innerHTML = "";
+      body.style.gridTemplateRows = `repeat(${f.agents}, minmax(4px, 1fr))`;
+      for(let agent=0;agent<f.agents;agent++) {
+        const counts = stages.map(stage=>activities.filter(a=>a.agent===agent&&a.stage===stage).length);
+        const max = Math.max(1,...counts);
+        const row = document.createElement("button");
+        row.className="map-row";
+        row.title=`${agentNames[agent]} · ${counts.join(" / ")}`;
+        row.style.cssText=`--a1:${.12+.68*counts[0]/max};--a2:${.12+.68*counts[1]/max};--a3:${.12+.68*counts[2]/max};--a4:${.10+.52*counts[3]/max}`;
+        row.innerHTML="<span></span><span></span><span></span><span></span>";
+        row.addEventListener("click",()=>document.querySelector(`.lane[data-agent=\"${agent}\"]`)?.scrollIntoView({block:"center",behavior:"smooth"}));
+        body.appendChild(row);
+      }
+    }
+    function refreshLaneStats(agent) {
+      const lane = document.querySelector(`.lane[data-agent="${agent}"]`);
+      if (!lane) return;
+      const live = activities.filter(a=>a.agent===agent&&a.stage!=="settled").length;
+      const waiting = activities.filter(a=>a.agent===agent&&a.stage==="waiting").length;
+      const span = lane.querySelector(".agent-copy span");
+      const count = lane.querySelector(".agent-count");
+      if(span) span.textContent=`${live} current${waiting?` · ${waiting} wait`:""}`;
+      if(count) count.textContent=String(live);
+    }
+    function nextFreeSlot(agent,stage,excludeId) {
+      const used = new Set(activities.filter(a=>a.id!==excludeId&&a.agent===agent&&a.stage===stage).map(a=>a.slot));
+      let slot=0; while(used.has(slot)) slot++; return slot;
+    }
+    function moveActivity(id, target) {
+      const a = activities.find(x=>x.id===id); if (!a) return;
+      const old = a.stage;
+      if (old===target) return;
+      const card = document.querySelector(`[data-id="${id}"]`);
+      a.slot = nextFreeSlot(a.agent,target,a.id);
+      a.stage = target;
+      a.settledAt = target==="settled" ? Date.now() : null;
+      if(target==="settled") {
+        a.failedOutcome=a.attention || seeded(Date.now()+Number(a.id.split("-")[1]))>.96;
+        a.attention=false;
+      } else {
+        a.failedOutcome=false;
+      }
+      if(old==="incoming"&&target==="running") recordFlow("launched");
+      if(target==="waiting") recordFlow("waiting");
+      if(old==="waiting"&&target==="running") recordFlow("resumed");
+      if(target==="settled") recordFlow("settled");
+      if(card) refreshCard(card,a);
+      layoutCards();
+      refreshLaneStats(a.agent);
+      updateSummary();
+      renderFleetMap();
+      scheduleDensityResolve();
+    }
+    function expireRecentOutflow(maxCount) {
+      const ready = activities
+        .filter(a=>a.stage==="settled" && a.id!==selectedId && Date.now()-(a.settledAt??Date.now())>4200)
+        .slice(0,maxCount);
+      for (const old of ready) {
+        const lane = document.querySelector(`.lane[data-agent="${old.agent}"]`);
+        const oldCard = lane?.querySelector(`[data-id="${old.id}"]`);
+        activities = activities.filter(a=>a.id!==old.id);
+        oldCard?.remove();
+        refreshLaneStats(old.agent);
+      }
+      if (ready.length) { layoutCards(); updateSummary(); renderFleetMap(); scheduleDensityResolve(); }
+    }
+    function spawnIncoming(count) {
+      const f=fixtures[currentLoad];
+      for(let n=0;n<count;n++) {
+        const serial=nextActivitySerial++;
+        const agent=Math.floor(seeded(Date.now()/130+serial*17)*f.agents);
+        const fresh={
+          id:`activity-${serial}`,
+          agent,
+          stage:"incoming",
+          title:taskNames[serial%taskNames.length],
+          type:["task","session","cron","subagent"][serial%4],
+          age:"00:00",
+          attention:false,
+          failedOutcome:false,
+          settledAt:null,
+          slot:nextFreeSlot(agent,"incoming","")
+        };
+        activities.push(fresh);
+        const freshCard=createCard(fresh);
+        freshCard.animate(
+          [{opacity:0,transform:"scale(.94)"},{opacity:1,transform:"scale(1)"}],
+          {duration:matchMedia("(prefers-reduced-motion: reduce)").matches?1:220,easing:"cubic-bezier(.2,.75,.25,1)"}
+        );
+        document.querySelector(`.lane[data-agent="${agent}"]`)?.appendChild(freshCard);
+        refreshLaneStats(agent);
+      }
+      if(count) { layoutCards(); updateSummary(); renderFleetMap(); scheduleDensityResolve(); }
+    }
+    function nextStage(a) {
+      if (a.stage==="incoming") return "running";
+      if (a.stage==="running") return seeded(Date.now()+Number(a.id.split("-")[1]))>.74 ? "waiting" : "settled";
+      if (a.stage==="waiting") return "running";
+      return null;
+    }
+    function startLiveFlow() {
+      clearInterval(migrationTimer);
+      clearInterval(arrivalTimer);
+      if (new URLSearchParams(location.search).get("static") === "1") return;
+      migrationTimer = setInterval(()=>{
+        if (!demoPlaying || !activities.length) return;
+        const count = currentLoad==="extreme" ? 6 : currentLoad==="dense" ? 3 : 1;
+        const candidates = activities.filter(a=>a.stage!=="settled");
+        if (!candidates.length) return;
+        for(let j=0;j<count;j++) {
+          const idx = Math.floor(seeded(Date.now()/170+j*31)*candidates.length);
+          const a = candidates[idx];
+          const target = nextStage(a);
+          if (target) moveActivity(a.id,target);
+        }
+        expireRecentOutflow(currentLoad==="extreme" ? 4 : currentLoad==="dense" ? 2 : 1);
+      }, currentLoad==="extreme" ? 700 : 1100);
+      arrivalTimer=setInterval(()=>{
+        if(!demoPlaying) return;
+        const f=fixtures[currentLoad];
+        const operational=activities.filter(a=>a.stage!=="settled").length;
+        if(operational<f.active) spawnIncoming(Math.min(f.active-operational,currentLoad==="extreme"?4:currentLoad==="dense"?2:1));
+      },currentLoad==="extreme"?640:currentLoad==="dense"?900:1250);
+    }
+    document.querySelectorAll("[data-load]").forEach(b=>b.addEventListener("click",()=>buildFixture(b.dataset.load)));
+    document.querySelector("#flow-one").addEventListener("click",()=>{
+      const a=activities.find(x=>x.id===selectedId) ?? activities.find(x=>x.stage==="running");
+      if (!a) return;
+      selectedId = a.id;
+      const target = nextStage(a);
+      if (target) moveActivity(a.id,target);
+    });
+    document.querySelector("#burst").addEventListener("click",()=>{
+      const moving=activities.filter(a=>a.stage!=="settled").slice(0,20);
+      moving.forEach((a,i)=>setTimeout(()=>moveActivity(a.id,nextStage(a)),Math.floor(i/5)*90));
+      document.querySelector("#flow-note").innerHTML=`<span class="unseen">Prototype burst · ${moving.length} exact transitions</span>`;
+      setTimeout(()=>document.querySelector("#flow-note").textContent="Prototype playback · production moves on observed events",1100);
+    });
+    document.querySelector("#follow").addEventListener("click",e=>{
+      demoPlaying=!demoPlaying;
+      e.currentTarget.setAttribute("aria-pressed",String(demoPlaying));
+      e.currentTarget.textContent=demoPlaying?"Pause demo":"Resume demo";
+    });
+    window.addEventListener("resize",()=>{ requestAnimationFrame(layoutCards); scheduleDensityResolve(); });
+    const requestedLoad = new URLSearchParams(location.search).get("load");
+    buildFixture(fixtures[requestedLoad] ? requestedLoad : "dense");
+  </script>
+</body>
+</html>

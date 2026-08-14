@@ -64,6 +64,32 @@ describe("CollectorRepository", () => {
     expect(repo.snapshotViews().items[0]).toMatchObject({ state: "unknown", stage: "unresolved", freshness: "stale" });
   });
 
+  it("upgrades only a unique unbound session placeholder when a run reference arrives", () => {
+    const repo = repository();
+    const sessionKey = "agent:pm-awb:feishu:group:one";
+    const placeholder = (id: string, sourceKey: string, now: number) => attemptPatch({
+      id,
+      sourceKey,
+      origin: "session_segment",
+      agentId: "pm-awb",
+      title: "Feishu session",
+      now,
+      sessionKey,
+      state: "active",
+      phase: "unknown",
+      source: "session",
+      eventKind: "session_snapshot",
+    });
+
+    repo.upsertMany([placeholder("attempt:placeholder-one", "attempt:session:one", 1_000)], ["snapshot"]);
+    expect(repo.findOpenAttempt({ runRef: "run-one", sessionKey })?.id).toBe("attempt:placeholder-one");
+
+    repo.upsertMany([placeholder("attempt:placeholder-two", "attempt:session:two", 2_000)], ["ambiguous_snapshot"]);
+    expect(repo.findOpenAttempt({ runRef: "run-two", sessionKey })).toBeUndefined();
+    expect(repo.findOpenAttempt({ sessionKey })).toBeUndefined();
+    expect(repo.findOpenAttemptsBySessionKey(sessionKey)).toHaveLength(2);
+  });
+
   it("aggregates the complete settled range before grouping and preserves low-frequency series", () => {
     const repo = repository();
     const day = 24 * 60 * 60 * 1_000;

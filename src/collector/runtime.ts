@@ -11,6 +11,7 @@ import type {
 } from "../contracts.js";
 import type { ResolvedCollectorConfig } from "../config.js";
 import {
+  agentIdFromSessionKey,
   attemptPatch,
   newAttemptActivityId,
   numberField,
@@ -326,6 +327,13 @@ export class CollectorRuntime {
         const key = sessionKey(session);
         if (!key) continue;
         const runRefs = sessionRunRefs(session);
+        if (runRefs.length === 0) {
+          const openAttempts = this.repository.findOpenAttemptsBySessionKey(key);
+          if (openAttempts.length > 1) {
+            for (const attempt of openAttempts) activeSourceKeys.add(attempt.sourceKey);
+            continue;
+          }
+        }
         const refs: Array<string | undefined> = runRefs.length > 0 ? runRefs : [undefined];
         for (const runRef of refs) {
           const sourceKey = runRef
@@ -402,7 +410,7 @@ export class CollectorRuntime {
     const active = payload.hasActiveRun === true || phase === "start" || stringField(payload, "status") === "running";
     const terminal = phase === "end" || phase === "error" || (!active && (payload.hasActiveRun === false || ["done", "failed", "killed", "timeout"].includes(stringField(payload, "status") ?? "")));
     if (!active && !terminal) return;
-    const existing = this.repository.findOpenAttempt(runRef ? { runRef } : key ? { sessionKey: key } : {})
+    const existing = this.repository.findOpenAttempt({ ...(runRef ? { runRef } : {}), ...(key ? { sessionKey: key } : {}) })
       ?? (runRef ? this.repository.findBySourceKey(`attempt:run:${runRef}`) : undefined);
     const now = nowOr(payload.ts, Date.now());
     const data = record(payload.data);
@@ -417,7 +425,7 @@ export class CollectorRuntime {
       id: existing?.id ?? newAttemptActivityId(),
       sourceKey,
       origin: runRef ? "online" : "session_segment",
-      agentId: stringField(payload, "agentId") ?? existing?.agentId ?? "Unattributed",
+      agentId: stringField(payload, "agentId") ?? agentIdFromSessionKey(key) ?? existing?.agentId ?? "Unattributed",
       title: stringField(payload, "label") ?? stringField(payload, "displayName") ?? existing?.title ?? "Interactive run",
       now,
       ...(runRef ? { runRef } : existing?.runRef ? { runRef: existing.runRef } : {}),
@@ -440,7 +448,7 @@ export class CollectorRuntime {
     const runRef = stringField(payload, "runId");
     const key = stringField(payload, "sessionKey");
     if (!runRef && !key) return;
-    const existing = this.repository.findOpenAttempt(runRef ? { runRef } : key ? { sessionKey: key } : {})
+    const existing = this.repository.findOpenAttempt({ ...(runRef ? { runRef } : {}), ...(key ? { sessionKey: key } : {}) })
       ?? (runRef ? this.repository.findBySourceKey(`attempt:run:${runRef}`) : undefined);
     const stream = stringField(payload, "stream") ?? (eventName === "session.tool" ? "tool" : "unknown");
     const lifecyclePhase = stringField(data, "phase");
@@ -454,7 +462,7 @@ export class CollectorRuntime {
       id: existing?.id ?? newAttemptActivityId(),
       sourceKey,
       origin: runRef ? "online" : "session_segment",
-      agentId: stringField(payload, "agentId") ?? existing?.agentId ?? "Unattributed",
+      agentId: stringField(payload, "agentId") ?? agentIdFromSessionKey(key) ?? existing?.agentId ?? "Unattributed",
       title: existing?.title ?? (runRef ? `OpenClaw run ${runRef.slice(0, 8)}` : "Interactive run"),
       now,
       ...(runRef ? { runRef } : existing?.runRef ? { runRef: existing.runRef } : {}),

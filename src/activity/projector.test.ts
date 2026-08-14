@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { attemptPatch, stableTaskActivityId, taskToActivity } from "./projector.js";
+import { agentIdFromSessionKey, attemptPatch, sessionAgentId, stableTaskActivityId, taskToActivity } from "./projector.js";
 
 describe("activity projector", () => {
   it("keeps the task ledger and observed attempt as different activity kinds", () => {
@@ -53,5 +53,12 @@ describe("activity projector", () => {
     expect(taskToActivity({ id: "ok", status: "completed", terminalOutcome: "succeeded" }, 10)?.outcome).toBe("succeeded");
     expect(taskToActivity({ id: "blocked", status: "completed", terminalOutcome: "blocked" }, 10)?.outcome).toBe("blocked");
     expect(taskToActivity({ id: "failed", status: "failed" }, 10)?.outcome).toBe("failed");
+  });
+
+  it("derives a missing session agent from a structured OpenClaw session key", () => {
+    expect(sessionAgentId({ key: "agent:pm-awb:feishu:group:group-one" })).toBe("pm-awb");
+    expect(sessionAgentId({ key: "agent:pm-awb:one", agentId: "explicit-agent" })).toBe("explicit-agent");
+    expect(agentIdFromSessionKey("not-an-agent-key")).toBeUndefined();
+    expect(sessionAgentId({ key: "not-an-agent-key" })).toBe("Unattributed");
   });
 });

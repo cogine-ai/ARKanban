@@ -58,4 +58,70 @@ describe("CollectorRuntime", () => {
     clientSocket?.send(JSON.stringify({ type: "event", event: "agent", seq: 1, payload: { runId: "run-one", sessionKey: "agent:builder:one", agentId: "builder", seq: 1, stream: "lifecycle", ts: 3_000, data: { phase: "end", endedAt: 3_000 } } }));
     await vi.waitFor(() => expect(runtime.getSnapshot().items.find((item) => item.kind === "attempt")).toMatchObject({ state: "terminal", outcome: "unknown" }));
   });
+
+  it("upgrades a snapshot placeholder when the run event arrives without creating an Unattributed duplicate", async () => {
+    const server = new WebSocketServer({ host: "127.0.0.1", port: 0 });
+    await once(server, "listening");
+    const address = server.address();
+    if (!address || typeof address === "string") throw new Error("mock gateway did not bind TCP");
+    let clientSocket: WebSocket | undefined;
+    const sessionKey = "agent:pm-awb:feishu:group:group-one";
+    const runRef = "run-feishu-one";
+    server.on("connection", (socket) => {
+      clientSocket = socket;
+      socket.send(JSON.stringify({ type: "event", event: "connect.challenge", payload: { nonce: "placeholder-test", ts: Date.now() } }));
+      socket.on("message", (raw) => {
+        const request = JSON.parse(raw.toString()) as { id: string; method: string };
+        const respond = (payload: unknown) => socket.send(JSON.stringify({ type: "res", id: request.id, ok: true, payload }));
+        if (request.method === "connect") respond({ type: "hello-ok", protocol: 4, server: { version: "runtime-test", connId: "placeholder" }, features: { methods: ["tasks.list", "sessions.list", "sessions.subscribe"], events: ["task", "agent", "sessions.changed", "session.tool"] }, snapshot: {}, auth: { role: "operator", scopes: ["operator.read"] }, policy: { maxPayload: 1_000_000, maxBufferedBytes: 1_000_000, tickIntervalMs: 30_000 } });
+        else if (request.method === "sessions.subscribe") respond({ subscribed: true });
+        else if (request.method === "tasks.list") respond({ tasks: [] });
+        else if (request.method === "sessions.list") respond({ sessions: [{ key: sessionKey, label: "Feishu session", status: "running", hasActiveRun: true }], hasMore: false, nextOffset: 1 });
+      });
+    });
+
+    const directory = mkdtempSync(path.join(tmpdir(), "collector-runtime-placeholder-"));
+    const config: ResolvedCollectorConfig = {
+      gateway: { name: "test", url: `ws://127.0.0.1:${address.port}`, tokenEnv: "TEST_GATEWAY_TOKEN", token: "test-token" },
+      server: { host: "127.0.0.1", port: 47_124 },
+      storage: { path: path.join(directory, "collector.sqlite"), terminalRetentionDays: 1 },
+      reconcile: { tasksMs: 60_000, sessionsMs: 60_000 },
+      ui: { recentLimit: 200 },
+      configPath: path.join(directory, "config.json"),
+    };
+    const runtime = new CollectorRuntime(config);
+    cleanups.push(async () => {
+      await runtime.stop();
+      for (const socket of server.clients) socket.terminate();
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+      rmSync(directory, { recursive: true, force: true });
+    });
+    runtime.start();
+
+    await vi.waitFor(() => expect(runtime.getStatus().syncState).toBe("live"), { timeout: 5_000 });
+    expect(runtime.getSnapshot().items).toEqual([
+      expect.objectContaining({ kind: "attempt", agentId: "pm-awb", state: "active" }),
+    ]);
+    expect(runtime.repository.findOpenAttemptsBySessionKey(sessionKey)).toHaveLength(1);
+
+    clientSocket?.send(JSON.stringify({
+      type: "event",
+      event: "sessions.changed",
+      seq: 1,
+      payload: { runId: runRef, sessionKey, agentId: "pm-awb", phase: "start", status: "running", ts: 3_000 },
+    }));
+    await vi.waitFor(() => expect(runtime.repository.findOpenAttempt({ runRef })?.runRef).toBe(runRef));
+    expect(runtime.getSnapshot().items).toHaveLength(1);
+    expect(runtime.getSnapshot().items[0]).toMatchObject({ agentId: "pm-awb", state: "active", phase: "starting" });
+
+    clientSocket?.send(JSON.stringify({
+      type: "event",
+      event: "sessions.changed",
+      seq: 2,
+      payload: { runId: runRef, sessionKey, agentId: "pm-awb", phase: "end", status: "done", ts: 4_000 },
+    }));
+    await vi.waitFor(() => expect(runtime.getSnapshot().items[0]).toMatchObject({ state: "terminal" }));
+    expect(runtime.getSnapshot().items).toHaveLength(1);
+    expect(runtime.getSnapshot().items.some((item) => item.agentId === "Unattributed")).toBe(false);
+  });
 });

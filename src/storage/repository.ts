@@ -568,15 +568,28 @@ export class CollectorRepository {
       const row = this.db
         .prepare("SELECT * FROM activities WHERE kind = 'attempt' AND state = 'active' AND run_ref = ? ORDER BY updated_at DESC LIMIT 1")
         .get(params.runRef) as ActivityRow | undefined;
-      return row ? rowToStored(row) : undefined;
-    }
-    if (params.sessionKey) {
-      const row = this.db
-        .prepare("SELECT * FROM activities WHERE kind = 'attempt' AND state = 'active' AND session_key = ? ORDER BY updated_at DESC LIMIT 1")
-        .get(params.sessionKey) as ActivityRow | undefined;
       if (row) return rowToStored(row);
     }
+    if (params.sessionKey) {
+      const rows = this.db
+        .prepare(`
+          SELECT * FROM activities
+          WHERE kind = 'attempt' AND state = 'active' AND session_key = ?
+            ${params.runRef ? "AND run_ref IS NULL" : ""}
+          ORDER BY updated_at DESC
+          LIMIT 2
+        `)
+        .all(params.sessionKey) as ActivityRow[];
+      if (rows.length === 1) return rowToStored(rows[0]!);
+    }
     return undefined;
+  }
+
+  findOpenAttemptsBySessionKey(sessionKey: string): StoredActivity[] {
+    const rows = this.db
+      .prepare("SELECT * FROM activities WHERE kind = 'attempt' AND state = 'active' AND session_key = ? ORDER BY updated_at DESC")
+      .all(sessionKey) as ActivityRow[];
+    return rows.map(rowToStored);
   }
 
   findBySourceKey(sourceKey: string): StoredActivity | undefined {

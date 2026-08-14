@@ -135,12 +135,19 @@ export function taskToActivity(task: RawTaskSummary, now = Date.now()): Activity
   };
 }
 
-export function sessionAgentId(session: RawSessionRow): string {
-  return stringOrUndefined(session.agentId) ?? "Unattributed";
-}
-
 export function sessionKey(session: RawSessionRow): string | undefined {
   return stringOrUndefined(session.key) ?? stringOrUndefined(session.sessionKey);
+}
+
+export function agentIdFromSessionKey(value: unknown): string | undefined {
+  const key = stringOrUndefined(value);
+  if (!key) return undefined;
+  const match = /^agent:([^:]+):/.exec(key);
+  return stringOrUndefined(match?.[1]);
+}
+
+export function sessionAgentId(session: RawSessionRow): string {
+  return stringOrUndefined(session.agentId) ?? agentIdFromSessionKey(sessionKey(session)) ?? "Unattributed";
 }
 
 export function sessionTitle(session: RawSessionRow): string {

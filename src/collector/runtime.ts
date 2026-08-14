@@ -4,6 +4,9 @@ import type {
   ActivitySnapshot,
   CollectorStatus,
   CollectorSyncState,
+  SettledGroupSnapshot,
+  SettledRange,
+  SettledSeriesRuns,
   SourceCoverage,
 } from "../contracts.js";
 import type { ResolvedCollectorConfig } from "../config.js";
@@ -28,7 +31,12 @@ import {
   type GatewayEventFrame,
   type GatewayHello,
 } from "../gateway/adapter.js";
-import { CollectorRepository, type RepositoryChange, type StoredActivity } from "../storage/repository.js";
+import {
+  CollectorRepository,
+  settledRangeDuration,
+  type RepositoryChange,
+  type StoredActivity,
+} from "../storage/repository.js";
 
 const REQUIRED_METHODS = ["tasks.list", "sessions.list", "sessions.subscribe"] as const;
 
@@ -186,9 +194,21 @@ export class CollectorRuntime {
     return this.repository.detail(id);
   }
 
+  getSettledGroups(range: SettledRange, rangeEnd = Date.now()): SettledGroupSnapshot {
+    return this.repository.settledGroups(range, rangeEnd, this.hasCompleteSettledRange(range));
+  }
+
+  getSettledSeriesRuns(seriesKey: string, range: SettledRange, rangeEnd = Date.now()): SettledSeriesRuns | undefined {
+    return this.repository.settledSeriesRuns(seriesKey, range, rangeEnd, this.hasCompleteSettledRange(range));
+  }
+
   async checkConnection(timeoutMs = 10_000): Promise<GatewayHello> {
     if (this.stopped) this.start();
     return await this.gateway.waitUntilConnected(timeoutMs);
+  }
+
+  private hasCompleteSettledRange(range: SettledRange): boolean {
+    return this.config.storage.terminalRetentionDays * 24 * 60 * 60 * 1_000 >= settledRangeDuration(range);
   }
 
   private async handleGatewayState(state: GatewayConnectionState): Promise<void> {

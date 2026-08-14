@@ -162,6 +162,71 @@ export type ActivitySnapshot = {
   relations: ActivityRelation[];
 };
 
+export type SettledRange = "24h" | "7d" | "30d";
+export type SettledGroupingConfidence = "canonical" | "display_exact";
+export type SettledPriorityTier = "P0" | "P1" | "P2" | "P3";
+
+export type SettledOutcomeCounts = Record<ActivityOutcome, number>;
+
+export type SettledGroupSummary = {
+  seriesKey: string;
+  groupingConfidence: SettledGroupingConfidence;
+  agentId: string;
+  kind: ActivityKind;
+  title: string;
+  rangeStart: number;
+  rangeEnd: number;
+  runCount: number;
+  succeededCount: number;
+  failedCount: number;
+  timedOutCount: number;
+  cancelledCount: number;
+  blockedCount: number;
+  unknownCount: number;
+  latestActivityId: string;
+  latestOutcome: ActivityOutcome;
+  latestEndedAt: number;
+  failureRate: number;
+  priorityTier: SettledPriorityTier;
+};
+
+export type SettledGroupSnapshot = {
+  apiVersion: 1;
+  epoch: string;
+  revision: number;
+  generatedAt: number;
+  range: SettledRange;
+  rangeStart: number;
+  rangeEnd: number;
+  complete: boolean;
+  totalSeries: number;
+  totalRuns: number;
+  outcomeCounts: SettledOutcomeCounts;
+  groupsByAgent: Record<string, SettledGroupSummary[]>;
+};
+
+export type SettledRunSummary = {
+  id: string;
+  agentId: string;
+  kind: ActivityKind;
+  title: string;
+  outcome: ActivityOutcome;
+  terminalAt: number;
+  updatedAt: number;
+};
+
+export type SettledSeriesRuns = {
+  apiVersion: 1;
+  epoch: string;
+  revision: number;
+  range: SettledRange;
+  rangeStart: number;
+  rangeEnd: number;
+  complete: boolean;
+  group: SettledGroupSummary;
+  runs: SettledRunSummary[];
+};
+
 export type CollectorChange = {
   epoch: string;
   revision: number;

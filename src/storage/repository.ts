@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import { DatabaseSync, type StatementSync } from "node:sqlite";
@@ -9,6 +9,12 @@ import type {
   EvidenceState,
   LaneSummary,
   ObservationView,
+  SettledGroupSnapshot,
+  SettledGroupSummary,
+  SettledOutcomeCounts,
+  SettledPriorityTier,
+  SettledRange,
+  SettledSeriesRuns,
   StageCounts,
 } from "../contracts.js";
 import type { ActivityWrite } from "../activity/projector.js";
@@ -37,6 +43,111 @@ const EMPTY_COUNTS: StageCounts = {
   settled: 0,
   unresolved: 0,
 };
+
+const SETTLED_RANGE_MS: Record<SettledRange, number> = {
+  "24h": 24 * 60 * 60 * 1_000,
+  "7d": 7 * 24 * 60 * 60 * 1_000,
+  "30d": 30 * 24 * 60 * 60 * 1_000,
+};
+
+const PRIORITY_ORDER: Record<SettledPriorityTier, number> = { P0: 0, P1: 1, P2: 2, P3: 3 };
+
+export function settledRangeDuration(range: SettledRange): number {
+  return SETTLED_RANGE_MS[range];
+}
+
+function emptyOutcomeCounts(): SettledOutcomeCounts {
+  return {
+    none: 0,
+    succeeded: 0,
+    failed: 0,
+    cancelled: 0,
+    timed_out: 0,
+    blocked: 0,
+    unknown: 0,
+  };
+}
+
+function terminalAt(item: StoredActivity): number {
+  return item.endedAt ?? item.updatedAt;
+}
+
+function fallbackSeriesKey(item: StoredActivity): string {
+  const identity = JSON.stringify([item.agentId, item.title.trim(), item.kind]);
+  const digest = createHash("sha256").update(identity).digest("base64url").slice(0, 18);
+  return `display_exact:${digest}`;
+}
+
+function priorityTier(counts: SettledOutcomeCounts, latestOutcome: StoredActivity["outcome"], runCount: number): SettledPriorityTier {
+  if (latestOutcome === "failed" || latestOutcome === "timed_out" || latestOutcome === "blocked") return "P0";
+  if (latestOutcome === "unknown" || latestOutcome === "none") return "P1";
+  if (latestOutcome === "cancelled") return "P2";
+  if (latestOutcome === "succeeded" && counts.failed + counts.timed_out > 0) return "P2";
+  if (counts.succeeded === runCount) return "P3";
+  return "P1";
+}
+
+function compareSettledGroups(left: SettledGroupSummary, right: SettledGroupSummary): number {
+  const tierDifference = PRIORITY_ORDER[left.priorityTier] - PRIORITY_ORDER[right.priorityTier];
+  if (tierDifference !== 0) return tierDifference;
+  if (left.priorityTier === "P2" && left.failureRate !== right.failureRate) return right.failureRate - left.failureRate;
+  if (left.priorityTier === "P3" && left.runCount !== right.runCount) return left.runCount - right.runCount;
+  if (left.latestEndedAt !== right.latestEndedAt) return right.latestEndedAt - left.latestEndedAt;
+  const titleDifference = left.title.localeCompare(right.title, "en");
+  return titleDifference !== 0 ? titleDifference : left.seriesKey.localeCompare(right.seriesKey, "en");
+}
+
+function aggregateSettledGroups(
+  stored: StoredActivity[],
+  rangeStart: number,
+  rangeEnd: number,
+): { groupsByAgent: Record<string, SettledGroupSummary[]>; outcomeCounts: SettledOutcomeCounts; totalSeries: number } {
+  const outcomeCounts = emptyOutcomeCounts();
+  const grouped = new Map<string, StoredActivity[]>();
+  for (const item of stored) {
+    outcomeCounts[item.outcome] += 1;
+    const seriesKey = fallbackSeriesKey(item);
+    const runs = grouped.get(seriesKey) ?? [];
+    runs.push(item);
+    grouped.set(seriesKey, runs);
+  }
+
+  const groups = [...grouped.entries()].map(([seriesKey, runs]): SettledGroupSummary => {
+    runs.sort((left, right) => terminalAt(right) - terminalAt(left) || right.updatedAt - left.updatedAt || left.id.localeCompare(right.id, "en"));
+    const latest = runs[0]!;
+    const counts = emptyOutcomeCounts();
+    for (const run of runs) counts[run.outcome] += 1;
+    const runCount = runs.length;
+    return {
+      seriesKey,
+      groupingConfidence: "display_exact",
+      agentId: latest.agentId,
+      kind: latest.kind,
+      title: latest.title,
+      rangeStart,
+      rangeEnd,
+      runCount,
+      succeededCount: counts.succeeded,
+      failedCount: counts.failed,
+      timedOutCount: counts.timed_out,
+      cancelledCount: counts.cancelled,
+      blockedCount: counts.blocked,
+      unknownCount: counts.unknown,
+      latestActivityId: latest.id,
+      latestOutcome: latest.outcome,
+      latestEndedAt: terminalAt(latest),
+      failureRate: (counts.failed + counts.timed_out) / runCount,
+      priorityTier: priorityTier(counts, latest.outcome, runCount),
+    };
+  });
+
+  const groupsByAgent = Object.create(null) as Record<string, SettledGroupSummary[]>;
+  const agentIds = [...new Set(groups.map((group) => group.agentId))].sort((left, right) => left.localeCompare(right, "en"));
+  for (const agentId of agentIds) {
+    groupsByAgent[agentId] = groups.filter((group) => group.agentId === agentId).sort(compareSettledGroups);
+  }
+  return { groupsByAgent, outcomeCounts, totalSeries: groups.length };
+}
 
 function asString(value: unknown): string | undefined {
   return typeof value === "string" && value.length > 0 ? value : undefined;
@@ -250,6 +361,8 @@ export class CollectorRepository {
       CREATE INDEX IF NOT EXISTS idx_activities_run_ref ON activities(run_ref);
       CREATE INDEX IF NOT EXISTS idx_activities_session_key ON activities(session_key);
       CREATE INDEX IF NOT EXISTS idx_activities_updated_at ON activities(updated_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_activities_terminal_at
+        ON activities(catalog, COALESCE(ended_at, updated_at) DESC);
 
       CREATE TABLE IF NOT EXISTS observations (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -516,6 +629,62 @@ export class CollectorRepository {
     };
   }
 
+  settledGroups(range: SettledRange, rangeEnd = Date.now(), complete = true): SettledGroupSnapshot {
+    const rangeStart = rangeEnd - settledRangeDuration(range);
+    const stored = this.listSettledInRange(rangeStart, rangeEnd);
+    const aggregation = aggregateSettledGroups(stored, rangeStart, rangeEnd);
+    return {
+      apiVersion: 1,
+      epoch: this.epoch,
+      revision: this.currentRevision,
+      generatedAt: Date.now(),
+      range,
+      rangeStart,
+      rangeEnd,
+      complete,
+      totalSeries: aggregation.totalSeries,
+      totalRuns: stored.length,
+      outcomeCounts: aggregation.outcomeCounts,
+      groupsByAgent: aggregation.groupsByAgent,
+    };
+  }
+
+  settledSeriesRuns(
+    seriesKey: string,
+    range: SettledRange,
+    rangeEnd = Date.now(),
+    complete = true,
+  ): SettledSeriesRuns | undefined {
+    const rangeStart = rangeEnd - settledRangeDuration(range);
+    const stored = this.listSettledInRange(rangeStart, rangeEnd);
+    const aggregation = aggregateSettledGroups(stored, rangeStart, rangeEnd);
+    const group = Object.values(aggregation.groupsByAgent).flat().find((candidate) => candidate.seriesKey === seriesKey);
+    if (!group) return undefined;
+    const runs = stored
+      .filter((item) => fallbackSeriesKey(item) === seriesKey)
+      .sort((left, right) => terminalAt(right) - terminalAt(left) || right.updatedAt - left.updatedAt || left.id.localeCompare(right.id, "en"))
+      .map((item) => ({
+        id: item.id,
+        agentId: item.agentId,
+        kind: item.kind,
+        title: item.title,
+        outcome: item.outcome,
+        terminalAt: terminalAt(item),
+        updatedAt: item.updatedAt,
+      }));
+    return {
+      apiVersion: 1,
+      epoch: this.epoch,
+      revision: this.currentRevision,
+      range,
+      rangeStart,
+      rangeEnd,
+      complete,
+      group,
+      runs,
+    };
+  }
+
   detail(id: string): ActivityDetail | undefined {
     const row = this.db.prepare("SELECT * FROM activities WHERE id = ?").get(id) as ActivityRow | undefined;
     if (!row) return undefined;
@@ -558,6 +727,20 @@ export class CollectorRepository {
       .run(cutoff);
     this.db.prepare("DELETE FROM observations WHERE activity_id NOT IN (SELECT id FROM activities)").run();
     return Number(result.changes);
+  }
+
+  private listSettledInRange(rangeStart: number, rangeEnd: number): StoredActivity[] {
+    const rows = this.db
+      .prepare(`
+        SELECT * FROM activities
+        WHERE catalog = 'terminal_history'
+          AND state = 'terminal'
+          AND COALESCE(ended_at, updated_at) >= ?
+          AND COALESCE(ended_at, updated_at) <= ?
+        ORDER BY COALESCE(ended_at, updated_at) DESC, updated_at DESC, id ASC
+      `)
+      .all(rangeStart, rangeEnd) as ActivityRow[];
+    return rows.map(rowToStored);
   }
 
   private bumpRevision(): void {

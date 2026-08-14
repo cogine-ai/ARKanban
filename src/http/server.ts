@@ -2,12 +2,23 @@ import { existsSync } from "node:fs";
 import path from "node:path";
 import fastifyStatic from "@fastify/static";
 import Fastify, { LogController, type FastifyInstance } from "fastify";
-import type { CollectorChange, CollectorStatus } from "../contracts.js";
+import type { CollectorChange, CollectorStatus, SettledRange } from "../contracts.js";
 import type { CollectorRuntime } from "../collector/runtime.js";
 import type { ResolvedCollectorConfig } from "../config.js";
 
 function sseEvent(event: string, data: unknown): string {
   return `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
+}
+
+function settledRange(value: string | undefined): SettledRange | undefined {
+  if (value === undefined) return "7d";
+  return value === "24h" || value === "7d" || value === "30d" ? value : undefined;
+}
+
+function settledRangeEnd(value: string | undefined): number | undefined {
+  if (value === undefined) return Date.now();
+  const parsed = Number(value);
+  return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : undefined;
 }
 
 export async function createHttpServer(
@@ -27,6 +38,25 @@ export async function createHttpServer(
   });
   app.get("/api/v1/meta", async () => runtime.getStatus());
   app.get("/api/v1/snapshot", async () => runtime.getSnapshot());
+  app.get<{ Querystring: { range?: string; rangeEnd?: string } }>("/api/v1/settled-groups", async (request, reply) => {
+    const range = settledRange(request.query.range);
+    if (!range) return reply.code(400).send({ error: "invalid_settled_range", allowed: ["24h", "7d", "30d"] });
+    const rangeEnd = settledRangeEnd(request.query.rangeEnd);
+    if (rangeEnd === undefined) return reply.code(400).send({ error: "invalid_range_end" });
+    return runtime.getSettledGroups(range, rangeEnd);
+  });
+  app.get<{
+    Params: { seriesKey: string };
+    Querystring: { range?: string; rangeEnd?: string };
+  }>("/api/v1/settled-groups/:seriesKey/runs", async (request, reply) => {
+    const range = settledRange(request.query.range);
+    if (!range) return reply.code(400).send({ error: "invalid_settled_range", allowed: ["24h", "7d", "30d"] });
+    const rangeEnd = settledRangeEnd(request.query.rangeEnd);
+    if (rangeEnd === undefined) return reply.code(400).send({ error: "invalid_range_end" });
+    const detail = runtime.getSettledSeriesRuns(request.params.seriesKey, range, rangeEnd);
+    if (!detail) return reply.code(404).send({ error: "settled_series_not_found" });
+    return detail;
+  });
   app.get<{ Params: { id: string } }>("/api/v1/activities/:id", async (request, reply) => {
     const detail = runtime.getDetail(request.params.id);
     if (!detail) return reply.code(404).send({ error: "activity_not_found" });

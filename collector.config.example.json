@@ -1,0 +1,22 @@
+{
+  "gateway": {
+    "name": "gateway-local",
+    "url": "ws://127.0.0.1:18789",
+    "tokenEnv": "OPENCLAW_GATEWAY_TOKEN"
+  },
+  "server": {
+    "host": "127.0.0.1",
+    "port": 47123
+  },
+  "storage": {
+    "path": "./data/collector.sqlite",
+    "terminalRetentionDays": 30
+  },
+  "reconcile": {
+    "tasksMs": 15000,
+    "sessionsMs": 8000
+  },
+  "ui": {
+    "recentLimit": 200
+  }
+}

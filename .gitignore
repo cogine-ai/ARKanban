@@ -6,6 +6,7 @@ node_modules/
 dist/
 coverage/
 data/
+collector.config.json
 *.db
 *.db-shm
 *.db-wal

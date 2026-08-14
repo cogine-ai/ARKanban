@@ -1,8 +1,62 @@
 # OpenClaw Collector
 
-An independent, read-only runtime observer for a single OpenClaw Gateway.
+An independent, read-only runtime observer for a single OpenClaw Gateway. The v1 MVP is implemented: it connects with `operator.read`, reconciles authoritative task and session snapshots with low-latency events, stores a bounded SQLite projection, and serves the Adaptive Activity River web interface.
 
-The project is currently at the architecture and interaction-design stage. No production Collector implementation has been started yet.
+![Implemented dense Live Flow](docs/v1/openclaw-collector-v1-implementation-dense.png)
+
+## Run it
+
+Requirements: Node.js 22.16+ and pnpm.
+
+```bash
+pnpm install
+cp collector.config.example.json collector.config.json
+export OPENCLAW_GATEWAY_TOKEN="your-local-gateway-token"
+pnpm dev
+```
+
+Open `http://127.0.0.1:5173`. The API runs on `http://127.0.0.1:47123`.
+
+For a production-style local bundle:
+
+```bash
+pnpm build
+pnpm start
+```
+
+Check Gateway protocol support without starting the web server:
+
+```bash
+pnpm check
+```
+
+The check verifies protocol v4, the granted scope, and support for `tasks.list`, `sessions.list`, and `sessions.subscribe`.
+
+## Deterministic UI demo
+
+Use the bundled mock when you want to inspect dense layout and live event behavior without creating real OpenClaw work:
+
+```bash
+# terminal 1
+pnpm mock:gateway
+
+# terminal 2
+pnpm demo
+```
+
+Open `http://127.0.0.1:47123`. This fixture produces 180 operational records, about 30 waiting attempts, 30 recent terminal records, and live tool events. Demo records are never used by the normal `start` or `dev` commands.
+
+## Implemented surfaces
+
+- Live Flow: adaptive-density Agent lanes across Incoming, In Flight, Waiting, and Settled
+- Activity Inspector: current state, observation evidence, identities, timeline, and relations
+- Relations: exact parent links and correlation-only run links
+- Archive: recent terminal task and attempt projections
+- Connections: Gateway, Task snapshot, Session snapshot, and Event stream health
+- HTTP API and SSE: `/api/v1/meta`, `/api/v1/snapshot`, `/api/v1/activities/:id`, `/api/v1/events`
+- Operational probes: `/healthz` and `/readyz`
+
+Task ledger records and observed execution attempts are intentionally separate. A generic attempt end remains `outcome: unknown`; Collector only shows success when an authoritative source establishes it.
 
 ## v1 design package
 
@@ -11,13 +65,14 @@ The project is currently at the architecture and interaction-design stage. No pr
 - [Motion specimen](docs/v1/openclaw-collector-v1-adaptive-flowboard-motion.webm)
 - Load specimens: [4 active](docs/v1/openclaw-collector-v1-adaptive-flowboard-sparse-final.png), [180 active](docs/v1/openclaw-collector-v1-adaptive-flowboard-dense-final.png), [600 active](docs/v1/openclaw-collector-v1-adaptive-flowboard-extreme-final.png)
 
-The proposed v1 uses the public OpenClaw Gateway protocol with explicit `operator.read`, reconciles authoritative RPC snapshots with low-latency events, stores a privacy-bounded projection in SQLite, and serves an independent read-only web interface.
+The v1 uses the public OpenClaw Gateway protocol with explicit `operator.read`. The raw protocol adapter is isolated in `src/gateway/adapter.ts` so it can be replaced by an official published Gateway client without changing the collector or UI layers.
 
 Source analysis and code links in the blueprint are pinned to OpenClaw commit `ff73a14f5ae71a899e5db9a3a41718ab1d104517`.
 
 ## Repository status
 
-- Architecture: frozen for v1 implementation slicing
-- Product and interaction design: frozen for the first implementation pass
-- Collector backend: not implemented
-- Web application: prototype only
+- Architecture and interaction design: frozen for v1
+- Collector MVP: implemented
+- Deterministic integration tests: implemented
+- OpenClaw 2026.8.1 / protocol v4 compatibility: verified against a real isolated Gateway
+- Packaging and deployment: not yet productized

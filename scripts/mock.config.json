@@ -1,0 +1,22 @@
+{
+  "gateway": {
+    "name": "gateway-demo",
+    "url": "ws://127.0.0.1:18790",
+    "tokenEnv": "OPENCLAW_GATEWAY_TOKEN"
+  },
+  "server": {
+    "host": "127.0.0.1",
+    "port": 47123
+  },
+  "storage": {
+    "path": "../data/mock-v3.sqlite",
+    "terminalRetentionDays": 7
+  },
+  "reconcile": {
+    "tasksMs": 15000,
+    "sessionsMs": 8000
+  },
+  "ui": {
+    "recentLimit": 200
+  }
+}

@@ -5,6 +5,8 @@
 > 核验基线：OpenClaw `ff73a14f5ae71a899e5db9a3a41718ab1d104517`，仓库干净，2026-08-13
 > 交付形态：独立项目、单 Gateway、只读、本地 Web UI、SQLite；不嵌入 OpenClaw，不修改 OpenClaw core
 
+> 实施补充：2026-08-14 的 [自适应 Settled 规格](./ar-kanban-adaptive-board-implementation-spec.md) 与 2026-08-15 的 [Incoming Cron 规格](./ar-kanban-incoming-cron-implementation-spec.md) 是本冻结蓝图的后续实施修订；涉及范围、分组、单元格配额和未来 Cron 时，以后两份文档为准。
+
 本蓝图一次性冻结 v1 的产品范围、领域抽象、架构、数据模型、协议、界面、交互、测试和完成门。后续“切片”只改变代码实现顺序，不再逐阶段补设计或改变公开契约。
 
 ---
@@ -431,7 +433,9 @@ Hello 会公开 server version、protocol、methods、events：[frames.ts](https
 **条件能力**
 
 - `audit.activity.list`：Gateway 未 advertise 时允许启动并将 Audit coverage 标为 unavailable；一旦 advertise，v1 **必须**采集 Gateway 当前 retained window 中的 `agent_run/tool_action` metadata（上限为 30 天/100k，实际可能更短），不能由配置关闭。RPC 被 advertise 只说明接口存在，不能证明 Gateway audit logging 当前启用；空结果只能显示 `Available · no records observed`，绝不能显示 `disabled`。
-- `cron` event：只作 task reconcile hint，不产生独立 schedule Activity。
+- `cron` event：只允许作为未来的 reconcile hint，不直接产生 Activity；当前实现以 60 秒 canonical RPC reconcile 为准。
+- `cron.status` + `cron.list`：若 Gateway advertise，则作为可选的 Upcoming Schedule 预测源；预测不进入 Activity/SQLite，缺失时只把 Schedule coverage 标为 unavailable，不影响 Task/Session 主同步。
+- `agents.list`：仅用于无显式 `job.agentId` 的 Cron 回退到 Gateway default Agent；无法归属时省略该预测并显示 partial，不创建 Unattributed lane。
 
 缺少必需项时 fail closed，UI 显示 `Incompatible` 及具体缺项；条件能力缺失只影响相应 Evidence/History，不伪装为完整覆盖。`hello.auth.scopes` 排序去重后必须**精确等于** `["operator.read"]`；`operator.write/admin/approvals/pairing/questions/talk.secrets` 等任何额外 authority 都触发 `OVERPRIVILEGED_GRANT`。`gateway.identity.get` 返回的 public key digest 是唯一 canonical `gatewayId`：`gw_` + base32(SHA-256(raw public key)) 前 26 字符；endpoint 只作 pre-auth token lookup/pin 与连接诊断，绝不成为第二套事实身份。
 
@@ -1226,6 +1230,15 @@ type ActivitySnapshot = {
   lanes: LaneSummary[];
   items: ActivityItem[];
   relations: ActivityRelation[];
+  schedule: {
+    revision: number;
+    state: "live" | "partial" | "unavailable" | "offline" | "error";
+    schedulerEnabled: boolean;
+    windowMinutes: 60;
+    dueGraceMinutes: 3;
+    lastSnapshotAt?: number;
+    items: UpcomingSchedule[];
+  };
   nextCursor?: string;
   truncated: boolean;
 };
@@ -1398,6 +1411,7 @@ Incoming ──→ In flight ←─→ Waiting ──→ Settled outflow
 - 同一 Activity 在进入、执行、等待、恢复和完成过程中始终使用同一个 DOM/virtual node、同一个 `ActivityItem.id` 和同一 selection；只改变位置与语义层级。
 - Collector 首次看见已经处于 In flight 的 Activity 时，直接在该位置 materialize；不能伪造一次从 Incoming 飞来的历史。
 - Settled Activity 只短暂停留后收缩进入 outflow；它不能重新变成 Incoming。新的工作必须有新的 Activity ID。
+- Incoming 还可承载未来 1 小时内的 enabled Cron 预测。它是独立 `UpcomingSchedule`，使用虚线/时钟样式并单独计数；queued Task 在单元格配额中始终优先，预测不能进入 Activity Inspector 或 Settled。
 
 顶部摘要只显示可验证事实，例如：`485 active now · 30 Agents · 57 incoming · 82 waiting · 96 started/min · 82 settled/min`。没有可靠容量上限时，不显示“利用率 83%”之类推断。
 
@@ -1709,6 +1723,8 @@ OPENCLAW_GATEWAY_TOKEN=... pnpm exec openclaw-collector start --config ./collect
 | E2E | 两 Agent + 普通 run + cron + subagent/ACP/CLI + failure + restart |
 | Performance | 10k Task、2k Session、50 event/s；无 O(n) 单事件扫描 |
 | Security | scope/method audit、secret scan、loopback、CSP、payload whitelist |
+
+Schedule 预测还必须覆盖 `now-3m`/`now+60m` 闭区间、disabled/无 nextRun 排除、default Agent fallback、Cron 方法缺失降级、`cron.list.limit<=200`、不写 SQLite，以及 Incoming C=3/4/8 的 queued-first Overflow 配额。
 
 ### 11.2 必测场景
 

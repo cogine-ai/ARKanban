@@ -1,6 +1,6 @@
-# OpenClaw Collector
+# AR Kanban
 
-A read-only live activity board for a single OpenClaw Gateway. It combines authoritative task and session snapshots with low-latency events, stores a bounded local SQLite projection, and connects with `operator.read` only.
+AR Kanban is a read-only live activity board for a single OpenClaw Gateway, powered by the OpenClaw Collector runtime. It combines authoritative task and session snapshots, a next-hour Cron forecast, and low-latency events; operational history stays in a bounded local SQLite projection and the Gateway connection uses `operator.read` only.
 
 ![Implemented dense Live Flow](docs/v1/openclaw-collector-v1-implementation-dense.png)
 
@@ -59,7 +59,7 @@ Open `http://127.0.0.1:47123`. This fixture produces 180 operational records, ab
 - Relations: exact parent links and correlation-only run links
 - Archive: recent terminal task and attempt projections
 - Connections: Gateway, Task snapshot, Session snapshot, and Event stream health
-- HTTP API and SSE: `/api/v1/meta`, `/api/v1/snapshot`, `/api/v1/activities/:id`, `/api/v1/events`
+- HTTP API and SSE: `/api/v1/meta`, `/api/v1/snapshot` (including the separate Schedule forecast), `/api/v1/settled-groups`, `/api/v1/activities/:id`, and `/api/v1/events`
 - Operational probes: `/healthz` and `/readyz`
 
 Task ledger records and observed execution attempts are intentionally separate. A generic attempt end remains `outcome: unknown`; Collector only shows success when an authoritative source establishes it.
@@ -67,6 +67,8 @@ Task ledger records and observed execution attempts are intentionally separate. 
 ## Design package
 
 - [Complete v1 blueprint](docs/v1/openclaw-collector-v1-blueprint.md)
+- [Incoming queued Task + next-hour Cron implementation spec](docs/v1/ar-kanban-incoming-cron-implementation-spec.md)
+- [Adaptive Settled range, grouping, sorting, and quota spec](docs/v1/ar-kanban-adaptive-board-implementation-spec.md)
 - [Interactive Adaptive Activity River prototype](docs/v1/openclaw-collector-v1-adaptive-flowboard-prototype.html)
 - [Motion specimen](docs/v1/openclaw-collector-v1-adaptive-flowboard-motion.webm)
 - Load specimens: [4 active](docs/v1/openclaw-collector-v1-adaptive-flowboard-sparse-final.png), [180 active](docs/v1/openclaw-collector-v1-adaptive-flowboard-dense-final.png), [600 active](docs/v1/openclaw-collector-v1-adaptive-flowboard-extreme-final.png)
@@ -77,7 +79,7 @@ Source analysis and code links in the blueprint are pinned to OpenClaw commit `f
 
 ## Status
 
-The v1 MVP and deterministic integration tests are implemented. OpenClaw 2026.8.1 / protocol v4 compatibility has been verified against a real isolated Gateway. System-service and container packaging are not included yet.
+The v1 MVP and deterministic integration tests are implemented. Protocol v4 compatibility has been verified against OpenClaw 2026.7.1 locally and an isolated OpenClaw 2026.8.1 Gateway. System-service and container packaging are not included yet.
 
 ## License
 

@@ -1,12 +1,14 @@
 # AR Kanban 自适应看板：范围、分组、排序与配额实施规格
 
-状态：Final for implementation
+状态：Implemented
 
 冻结日期：2026-08-14
 
-适用范围：AR Kanban Live Flow、Settled 展开层、Archive
+实施更新：2026-08-15
 
-补充关系：本规格细化并覆盖 v1 蓝图中与 Settled 默认范围、分组、公平展示及单元格配额相关的模糊部分。
+适用范围：AR Kanban Live Flow、Settled 展开层、Archive；Incoming 预测由配套规格定义
+
+补充关系：本规格细化并覆盖 v1 蓝图中与 Settled 默认范围、分组、公平展示及单元格配额相关的模糊部分。Queued Task 与未来 Cron 的 Incoming 合同见 [Incoming 实施规格](./ar-kanban-incoming-cron-implementation-spec.md)。
 
 ## 1. 目标
 
@@ -69,6 +71,8 @@ Radix UI 自带的基础语义可以保留，但不作为本规格的额外验�
 
 Incoming、In Flight、Waiting、Unresolved 中尚未可靠终结的 Activity。它不受 Settled 时间范围影响。
 
+未来 Cron 是独立的 `UpcomingSchedule` 预测，不属于 Operational Activity，不进入本规格的 Series、Run 或 Settled 统计。
+
 ## 4. 数据处理顺序
 
 实现 MUST 使用以下顺序：
@@ -108,6 +112,7 @@ Settled 和 Archive 首次打开时 MUST 使用最近 `7d`。
 ### 5.2 影响边界
 
 - Incoming、In Flight、Waiting、Unresolved MUST 始终包含全部当前 Activity。
+- Incoming MAY 同时显示配套规格定义的未来 Cron；Cron 必须单独计数，不能改变当前 Activity 数。
 - 范围只影响 Settled group summary、Settled 展开层和 Archive。
 - 切换范围 MUST 原子替换完整结果，不能暂时混合两个范围的计数。
 
@@ -399,6 +404,8 @@ type SettledGroupSnapshot = {
 如果数据不完整，UI 必须显示 `Partial coverage`，不能无提示地展示失败率或总数。
 
 ## 14. 标准桌面真实数据演算
+
+> 本节保留 2026-08-14 修复前的历史数据，用于证明“完整范围先聚合”的产品问题；其中 `Unattributed` 是当时的投影缺陷证据，不代表当前预期泳道。当前实现必须以实时 attribution 与回归测试为准。
 
 数据时间：2026-08-14 17:53:45 +08
 

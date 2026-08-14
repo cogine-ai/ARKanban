@@ -3,7 +3,12 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
+  "license": "Apache-2.0",
   "description": "Read-only live runtime observer for one OpenClaw Gateway",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/cogine-ai/ARKanban.git"
+  },
   "bin": {
     "openclaw-collector": "dist/server/main.js"
   },

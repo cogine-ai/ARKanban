@@ -101,6 +101,7 @@ button { color: inherit; }
 .agent-copy small { display: block; margin-top: 4px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--secondary); font-size: 9px; font-variant-numeric: tabular-nums; }
 .agent-count { min-width: 26px; padding: 4px 6px; border-radius: 7px; background: rgba(118,118,128,.08); color: var(--secondary); text-align: center; font-size: 9px; font-variant-numeric: tabular-nums; }
 .stage-cell { min-width: 0; padding: 9px 8px; display: grid; grid-template-columns: repeat(auto-fill,minmax(112px,1fr)); align-content: center; gap: 6px; border-left: 1px solid rgba(0,0,0,.035); }
+.stage-cell.stage-incoming { background: linear-gradient(90deg, rgba(0,122,255,.012), rgba(0,122,255,.028)); }
 .stage-cell.stage-waiting { background: linear-gradient(90deg, rgba(255,159,10,.015), rgba(255,159,10,.035)); }
 .stage-cell.stage-settled { max-height: 196px; overflow: hidden; background: rgba(255,255,255,.12); }
 .activity-card { position: relative; min-width: 0; height: 50px; padding: 8px 8px 6px 24px; border: 1px solid rgba(0,0,0,.075); border-radius: 12px; background: var(--card); box-shadow: 0 1px 2px rgba(0,0,0,.045), 0 4px 11px rgba(0,0,0,.035); display: grid; grid-template-rows: auto auto; align-content: center; gap: 4px; overflow: hidden; text-align: left; cursor: pointer; transition: transform 160ms ease, box-shadow 160ms ease, border-color 160ms ease; }
@@ -112,6 +113,14 @@ button { color: inherit; }
 .activity-meta { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--secondary); font-size: 8px; text-transform: uppercase; letter-spacing: .035em; }
 .activity-tool { position: absolute; right: 7px; bottom: 5px; max-width: 44%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #27765b; font-size: 7px; font-weight: 660; text-transform: uppercase; letter-spacing: .04em; }
 .activity-card.incoming .status-dot { background: transparent; border: 1px solid var(--blue); }
+.schedule-card { cursor: default; border-style: dashed; font-variant-numeric: tabular-nums; }
+.schedule-card::before { background: var(--blue); opacity: .38; }
+.schedule-card:hover { transform: none; box-shadow: 0 1px 2px rgba(0,0,0,.045), 0 4px 11px rgba(0,0,0,.035); }
+.schedule-card .schedule-clock { left: 8px; top: 9px; width: 11px; height: 13px; border: 0; border-radius: 0; color: #1672c4; font-size: 12px; line-height: 13px; }
+.schedule-card .activity-meta { color: #4e7191; }
+.incoming-overflow-card { cursor: pointer; border-style: dashed; box-shadow: none; }
+.incoming-overflow-card::before { background: #8e8e93; opacity: .42; }
+.incoming-overflow-card:hover { transform: none; box-shadow: none; }
 .activity-card.waiting { border-color: rgba(191,116,20,.18); background: #fffaf1; }
 .activity-card.waiting .status-dot { background: var(--orange); }
 .activity-card.settled { border-color: rgba(0,0,0,.045); background: rgba(250,250,247,.9); box-shadow: 0 1px 2px rgba(0,0,0,.025); color: #646a66; }
@@ -145,6 +154,7 @@ button { color: inherit; }
 .density-dense .status-dot { left: 7px; top: 7px; width: 5px; height: 5px; }
 .density-dense .activity-title { font-size: 8px; }
 .density-dense .activity-meta, .density-dense .activity-tool { display: none; }
+.density-dense .schedule-card .schedule-clock { left: 5px; top: 2px; font-size: 9px; }
 .density-radar .agent-cell, .density-radar .stage-cell { min-height: 32px; }
 .density-radar .agent-cell { grid-template-columns: 20px minmax(0,1fr) auto; gap: 7px; }
 .density-radar .agent-avatar { width: 20px; height: 20px; border-radius: 6px; font-size: 7px; }
@@ -155,6 +165,7 @@ button { color: inherit; }
 .density-radar .activity-card::before { width: 2px; }
 .density-radar .status-dot { left: 6px; top: 6px; width: 5px; height: 5px; }
 .density-radar .activity-title, .density-radar .activity-meta, .density-radar .activity-tool { display: none; }
+.density-radar .schedule-card .schedule-clock { display: none; }
 .stage-cell.stage-settled[data-cell-layout="compact"] { grid-template-columns: repeat(auto-fill,minmax(120px,1fr)); padding: 8px; gap: 6px; align-content: center; }
 .stage-cell.stage-settled[data-cell-layout="standard"] { grid-template-columns: repeat(auto-fill,minmax(156px,1fr)); padding: 8px; gap: 6px; align-content: center; }
 .stage-cell.stage-settled[data-cell-layout="wide"] { grid-template-columns: repeat(auto-fill,minmax(176px,1fr)); padding: 8px; gap: 6px; align-content: center; }
@@ -250,12 +261,14 @@ button { color: inherit; }
 .overflow-list { max-height: min(520px, calc(100vh - 160px)); padding: 10px; display: grid; gap: 5px; overflow-y: auto; }
 .overflow-list > button { min-height: 58px; padding: 8px 10px; display: grid; grid-template-columns: 34px minmax(0,1fr) 48px; align-items: center; gap: 10px; border: 1px solid var(--line); border-radius: 11px; background: #fff; text-align: left; cursor: pointer; }
 .overflow-list > button:hover { border-color: rgba(0,122,255,.2); background: #fafcff; }
-.overflow-list > button > span:nth-child(2) { min-width: 0; }
+.incoming-overflow-list > article { min-height: 58px; padding: 8px 10px; display: grid; grid-template-columns: 34px minmax(0,1fr) 72px; align-items: center; gap: 10px; border: 1px dashed rgba(0,122,255,.18); border-radius: 11px; background: rgba(246,250,255,.72); }
+.overflow-list > button > span:nth-child(2), .incoming-overflow-list > article > span:nth-child(2) { min-width: 0; }
 .overflow-list b, .overflow-list small { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .overflow-list b { font-size: 10px; }
 .overflow-list small { margin-top: 3px; color: var(--secondary); font-size: 8px; text-transform: capitalize; }
-.overflow-list > button > span:last-child { text-align: right; }
+.overflow-list > button > span:last-child, .incoming-overflow-list > article > span:last-child { text-align: right; }
 .overflow-tier { width: 30px; height: 30px; display: grid; place-items: center; border-radius: 9px; background: var(--canvas); font-size: 9px; font-weight: 750; }
+.schedule-tier { background: rgba(0,122,255,.08); color: #1672c4; font-size: 13px; }
 
 .content-shell { padding: 26px 24px 32px; }
 .view-surface { min-height: calc(100vh - 116px); padding: 26px; background: rgba(255,255,255,.46); }

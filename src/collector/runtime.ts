@@ -8,6 +8,7 @@ import type {
   SettledRange,
   SettledSeriesRuns,
   SourceCoverage,
+  UpcomingScheduleSnapshot,
 } from "../contracts.js";
 import type { ResolvedCollectorConfig } from "../config.js";
 import {
@@ -38,8 +39,15 @@ import {
   type RepositoryChange,
   type StoredActivity,
 } from "../storage/repository.js";
+import {
+  DUE_GRACE_MINUTES,
+  selectUpcomingSchedules,
+  UPCOMING_WINDOW_MINUTES,
+} from "./upcoming-schedules.js";
 
 const REQUIRED_METHODS = ["tasks.list", "sessions.list", "sessions.subscribe"] as const;
+const SCHEDULE_RECONCILE_MS = 60_000;
+const CRON_PAGE_LIMIT = 200;
 
 type StatusListener = (status: CollectorStatus) => void;
 type ChangeListener = (change: RepositoryChange) => void;
@@ -93,9 +101,11 @@ export class CollectorRuntime {
   private readonly changeListeners = new Set<ChangeListener>();
   private taskTimer?: NodeJS.Timeout;
   private sessionTimer?: NodeJS.Timeout;
+  private scheduleTimer?: NodeJS.Timeout;
   private pruneTimer?: NodeJS.Timeout;
   private taskSyncing = false;
   private sessionSyncing = false;
+  private scheduleSyncing = false;
   private syncState: CollectorSyncState = "starting";
   private syncReasons: string[] = ["collector_starting"];
   private gatewayHello?: GatewayHello;
@@ -103,12 +113,21 @@ export class CollectorRuntime {
   private disconnectedAt?: number;
   private lastGatewayEventAt?: number;
   private lastAuthoritativeSnapshotAt?: number;
+  private defaultAgentId?: string;
+  private schedule: UpcomingScheduleSnapshot = {
+    revision: 0,
+    state: "offline",
+    schedulerEnabled: false,
+    windowMinutes: UPCOMING_WINDOW_MINUTES,
+    dueGraceMinutes: DUE_GRACE_MINUTES,
+    items: [],
+  };
   private stopped = true;
 
   constructor(readonly config: ResolvedCollectorConfig) {
     this.repository = new CollectorRepository(config.storage.path);
     this.repository.subscribe((change) => {
-      for (const listener of this.changeListeners) listener(change);
+      this.emitChange(change);
     });
     this.gateway = new RawGatewayClient({
       url: config.gateway.url,
@@ -124,6 +143,7 @@ export class CollectorRuntime {
     this.stopped = false;
     this.taskTimer = setInterval(() => void this.syncTasks("task_interval"), this.config.reconcile.tasksMs);
     this.sessionTimer = setInterval(() => void this.syncSessions("session_interval"), this.config.reconcile.sessionsMs);
+    this.scheduleTimer = setInterval(() => void this.syncSchedules("schedule_interval"), SCHEDULE_RECONCILE_MS);
     this.pruneTimer = setInterval(() => this.prune(), 6 * 60 * 60 * 1_000);
     this.gateway.start();
   }
@@ -132,6 +152,7 @@ export class CollectorRuntime {
     this.stopped = true;
     if (this.taskTimer) clearInterval(this.taskTimer);
     if (this.sessionTimer) clearInterval(this.sessionTimer);
+    if (this.scheduleTimer) clearInterval(this.scheduleTimer);
     if (this.pruneTimer) clearInterval(this.pruneTimer);
     this.gateway.stop();
     this.repository.close();
@@ -188,6 +209,10 @@ export class CollectorRuntime {
         ...(this.lastAuthoritativeSnapshotAt ? { lastAuthoritativeSnapshotAt: this.lastAuthoritativeSnapshotAt } : {}),
       },
       ...projection,
+      schedule: {
+        ...this.schedule,
+        items: this.schedule.items.map((item) => ({ ...item })),
+      },
     };
   }
 
@@ -219,6 +244,7 @@ export class CollectorRuntime {
       this.updateAllOffline("connecting");
     } else if (state.state === "connected") {
       this.gatewayHello = state.hello;
+      this.defaultAgentId = undefined;
       this.connectedAt = state.connectedAt;
       this.syncState = "reconciling";
       this.syncReasons = ["initial_snapshot"];
@@ -236,18 +262,20 @@ export class CollectorRuntime {
       } else {
         this.setSource("events", { state: "unavailable", code: "sessions_subscribe_missing" });
       }
-      await Promise.all([this.syncTasks("gateway_connected"), this.syncSessions("gateway_connected")]);
+      await Promise.all([this.syncTasks("gateway_connected"), this.syncSessions("gateway_connected"), this.syncSchedules("gateway_connected")]);
       this.deriveSyncState();
     } else if (state.state === "unauthorized") {
       this.syncState = "unauthorized";
       this.syncReasons = ["gateway_unauthorized"];
       this.disconnectedAt = state.at;
       this.updateAllOffline("unauthorized");
+      this.updateSchedule({ state: "offline", schedulerEnabled: false, items: [] }, "schedule_unauthorized");
     } else if (state.state === "incompatible") {
       this.syncState = "incompatible";
       this.syncReasons = ["gateway_protocol_incompatible"];
       this.disconnectedAt = state.at;
       this.updateAllOffline("incompatible");
+      this.updateSchedule({ state: "offline", schedulerEnabled: false, items: [] }, "schedule_incompatible");
     } else if (state.state === "error") {
       if (!this.gateway.isConnected) {
         this.syncState = "error";
@@ -259,6 +287,7 @@ export class CollectorRuntime {
         this.syncState = "offline";
         this.syncReasons = ["gateway_disconnected"];
         this.updateAllOffline("disconnected");
+        this.updateSchedule({ state: "offline", schedulerEnabled: false, items: [] }, "schedule_disconnected");
       }
     }
     this.emitStatus();
@@ -372,6 +401,58 @@ export class CollectorRuntime {
       this.sessionSyncing = false;
       this.deriveSyncState();
       this.emitStatus();
+    }
+  }
+
+  private async syncSchedules(reason: string): Promise<void> {
+    if (this.scheduleSyncing || !this.gateway.isConnected) return;
+    const methods = new Set(this.gatewayHello?.features.methods ?? []);
+    if (!methods.has("cron.status") || !methods.has("cron.list")) {
+      this.updateSchedule({ state: "unavailable", schedulerEnabled: false, items: [] }, "schedule_methods_unavailable");
+      return;
+    }
+
+    this.scheduleSyncing = true;
+    try {
+      const status = record(await this.gateway.request("cron.status", {}));
+      const schedulerEnabled = status.enabled === true;
+      const jobs: Record<string, unknown>[] = [];
+      if (schedulerEnabled) {
+        let offset = 0;
+        for (let page = 0; page < 20; page += 1) {
+          const result = record(await this.gateway.request("cron.list", { includeDisabled: true, limit: CRON_PAGE_LIMIT, offset }));
+          const rows = arrayRecords(result.jobs);
+          jobs.push(...rows);
+          const nextOffset = typeof result.nextOffset === "number" ? result.nextOffset : offset + rows.length;
+          if (result.hasMore !== true || rows.length === 0 || nextOffset <= offset) break;
+          offset = nextOffset;
+        }
+      }
+
+      if (!this.defaultAgentId && methods.has("agents.list")) {
+        try {
+          const agents = record(await this.gateway.request("agents.list", {}));
+          this.defaultAgentId = stringField(agents, "defaultId");
+        } catch {
+          // Explicitly attributed jobs remain useful; unresolved jobs make the snapshot partial.
+        }
+      }
+
+      const now = Date.now();
+      const selected = selectUpcomingSchedules(jobs, { now, ...(this.defaultAgentId ? { defaultAgentId: this.defaultAgentId } : {}) });
+      this.updateSchedule(
+        {
+          state: selected.omittedAgentCount > 0 ? "partial" : "live",
+          schedulerEnabled,
+          lastSnapshotAt: now,
+          items: selected.items,
+        },
+        `schedule_${reason}`,
+      );
+    } catch {
+      this.updateSchedule({ state: "error", schedulerEnabled: false, items: [] }, "schedule_sync_error");
+    } finally {
+      this.scheduleSyncing = false;
     }
   }
 
@@ -546,6 +627,39 @@ export class CollectorRuntime {
   private emitStatus(): void {
     const status = this.getStatus();
     for (const listener of this.statusListeners) listener(status);
+  }
+
+  private emitChange(change: RepositoryChange): void {
+    for (const listener of this.changeListeners) listener(change);
+  }
+
+  private updateSchedule(
+    patch: Partial<Omit<UpcomingScheduleSnapshot, "revision" | "windowMinutes" | "dueGraceMinutes">>,
+    reason: string,
+  ): void {
+    const next: UpcomingScheduleSnapshot = {
+      ...this.schedule,
+      ...patch,
+      revision: this.schedule.revision,
+      windowMinutes: UPCOMING_WINDOW_MINUTES,
+      dueGraceMinutes: DUE_GRACE_MINUTES,
+    };
+    const changed = JSON.stringify({
+      state: this.schedule.state,
+      schedulerEnabled: this.schedule.schedulerEnabled,
+      items: this.schedule.items,
+    }) !== JSON.stringify({
+      state: next.state,
+      schedulerEnabled: next.schedulerEnabled,
+      items: next.items,
+    });
+    if (!changed) {
+      this.schedule = next;
+      return;
+    }
+
+    this.schedule = { ...next, revision: this.schedule.revision + 1 };
+    this.emitChange({ epoch: this.repository.epoch, revision: this.repository.revision, ids: [], reasons: [reason] });
   }
 
   private prune(): void {

@@ -160,6 +160,27 @@ export type ActivitySnapshot = {
   lanes: LaneSummary[];
   items: ActivityItem[];
   relations: ActivityRelation[];
+  schedule: UpcomingScheduleSnapshot;
+};
+
+export type UpcomingSchedule = {
+  id: string;
+  jobId: string;
+  agentId: string;
+  title: string;
+  nextRunAt: number;
+  scheduleKind: string;
+  timezone?: string;
+};
+
+export type UpcomingScheduleSnapshot = {
+  revision: number;
+  state: "live" | "partial" | "unavailable" | "offline" | "error";
+  schedulerEnabled: boolean;
+  windowMinutes: 60;
+  dueGraceMinutes: 3;
+  lastSnapshotAt?: number;
+  items: UpcomingSchedule[];
 };
 
 export type SettledRange = "24h" | "7d" | "30d";

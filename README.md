@@ -49,11 +49,12 @@ pnpm mock:gateway
 pnpm demo
 ```
 
-Open `http://127.0.0.1:47123`. This fixture produces 180 operational records, about 30 waiting attempts, 30 recent terminal records, and live tool events. Mock data is never used by `check`, `start`, or `dev`.
+Open `http://127.0.0.1:47123`. This fixture produces 180 operational records, about 30 waiting attempts, 30 recent terminal records, five next-hour Cron forecasts, and live tool events. Mock data is never used by `check`, `start`, or `dev`.
 
 ## What you get
 
 - Live Flow: adaptive-density Agent lanes across Incoming, In Flight, Waiting, and Settled
+- Incoming forecast: queued Tasks first, followed by enabled Cron jobs due within the next hour; Cron remains a read-only, non-persisted forecast
 - Activity Inspector: current state, observation evidence, identities, timeline, and relations
 - Relations: exact parent links and correlation-only run links
 - Archive: recent terminal task and attempt projections

@@ -124,4 +124,67 @@ describe("CollectorRuntime", () => {
     expect(runtime.getSnapshot().items).toHaveLength(1);
     expect(runtime.getSnapshot().items.some((item) => item.agentId === "Unattributed")).toBe(false);
   });
+
+  it("publishes the next-hour cron forecast separately from operational activity", async () => {
+    const server = new WebSocketServer({ host: "127.0.0.1", port: 0 });
+    await once(server, "listening");
+    const address = server.address();
+    if (!address || typeof address === "string") throw new Error("mock gateway did not bind TCP");
+    const nextRunAt = Date.now() + 30 * 60_000;
+    let cronListLimit: number | undefined;
+    server.on("connection", (socket) => {
+      socket.send(JSON.stringify({ type: "event", event: "connect.challenge", payload: { nonce: "schedule-test", ts: Date.now() } }));
+      socket.on("message", (raw) => {
+        const request = JSON.parse(raw.toString()) as { id: string; method: string; params?: Record<string, unknown> };
+        const respond = (payload: unknown) => socket.send(JSON.stringify({ type: "res", id: request.id, ok: true, payload }));
+        if (request.method === "connect") respond({ type: "hello-ok", protocol: 4, server: { version: "runtime-test", connId: "schedule" }, features: { methods: ["tasks.list", "sessions.list", "sessions.subscribe", "cron.status", "cron.list", "agents.list"], events: ["task", "agent", "sessions.changed", "session.tool"] }, snapshot: {}, auth: { role: "operator", scopes: ["operator.read"] }, policy: { maxPayload: 1_000_000, maxBufferedBytes: 1_000_000, tickIntervalMs: 30_000 } });
+        else if (request.method === "sessions.subscribe") respond({ subscribed: true });
+        else if (request.method === "tasks.list") respond({ tasks: [] });
+        else if (request.method === "sessions.list") respond({ sessions: [], hasMore: false, nextOffset: 0 });
+        else if (request.method === "agents.list") respond({ defaultId: "main", agents: [{ id: "main" }] });
+        else if (request.method === "cron.status") respond({ enabled: true, jobs: 1, nextWakeAtMs: nextRunAt });
+        else if (request.method === "cron.list") {
+          cronListLimit = typeof request.params?.limit === "number" ? request.params.limit : undefined;
+          respond({ jobs: [{ id: "memory", name: "Memory Dreaming Promotion", enabled: true, schedule: { kind: "cron", tz: "Asia/Singapore" }, state: { nextRunAtMs: nextRunAt } }], total: 1, offset: 0, limit: 1, hasMore: false, nextOffset: null });
+        }
+      });
+    });
+
+    const directory = mkdtempSync(path.join(tmpdir(), "collector-runtime-schedule-"));
+    const config: ResolvedCollectorConfig = {
+      gateway: { name: "test", url: `ws://127.0.0.1:${address.port}`, tokenEnv: "TEST_GATEWAY_TOKEN", token: "test-token" },
+      server: { host: "127.0.0.1", port: 47_125 },
+      storage: { path: path.join(directory, "collector.sqlite"), terminalRetentionDays: 1 },
+      reconcile: { tasksMs: 60_000, sessionsMs: 60_000 },
+      ui: { recentLimit: 200 },
+      configPath: path.join(directory, "config.json"),
+    };
+    const runtime = new CollectorRuntime(config);
+    const changeReasons: string[] = [];
+    const unsubscribeChanges = runtime.subscribeChanges((change) => changeReasons.push(...change.reasons));
+    cleanups.push(async () => {
+      unsubscribeChanges();
+      await runtime.stop();
+      for (const socket of server.clients) socket.terminate();
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+      rmSync(directory, { recursive: true, force: true });
+    });
+    runtime.start();
+
+    await vi.waitFor(() => expect(runtime.getSnapshot().schedule.state).toBe("live"), { timeout: 5_000 });
+    expect(runtime.getSnapshot()).toMatchObject({
+      summary: { incoming: 0 },
+      items: [],
+      schedule: {
+        revision: 1,
+        state: "live",
+        schedulerEnabled: true,
+        windowMinutes: 60,
+        dueGraceMinutes: 3,
+        items: [{ id: "cron:memory", jobId: "memory", agentId: "main", nextRunAt }],
+      },
+    });
+    expect(cronListLimit).toBe(200);
+    expect(changeReasons).toContain("schedule_gateway_connected");
+  });
 });

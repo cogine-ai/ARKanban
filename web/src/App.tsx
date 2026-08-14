@@ -15,15 +15,18 @@ import type {
   SettledRange,
   SettledSeriesRuns,
   SourceCoverage,
+  UpcomingSchedule,
+  UpcomingScheduleSnapshot,
 } from "../../src/contracts";
 import { collectorApi } from "./api";
+import { applyIncomingQuota, sortQueuedActivities } from "./incoming-layout";
 import { applyCellQuota, initialCellLayout, nextCellLayout, type CellLayout } from "./settled-layout";
 
 type View = "live" | "relations" | "archive" | "connections";
 type KindFilter = "all" | "task" | "attempt";
 
 const OPERATIONAL_STAGES: Array<{ key: Exclude<ActivityStage, "settled" | "unresolved">; label: string; hint: string; arrow: string }> = [
-  { key: "incoming", label: "INCOMING", hint: "queued ledger work", arrow: "→" },
+  { key: "incoming", label: "INCOMING", hint: "queued now · scheduled next 1h", arrow: "→" },
   { key: "in_flight", label: "IN FLIGHT", hint: "observed execution", arrow: "→" },
   { key: "waiting", label: "WAITING", hint: "operator attention", arrow: "↔" },
 ];
@@ -82,6 +85,10 @@ function formatDateTime(value?: number): string {
   }).format(value);
 }
 
+function formatHourMinute(value: number): string {
+  return new Intl.DateTimeFormat(undefined, { hour: "2-digit", minute: "2-digit" }).format(value);
+}
+
 function formatRelative(value?: number): string {
   if (!value) return "unknown";
   const seconds = Math.max(0, Math.round((Date.now() - value) / 1_000));
@@ -91,6 +98,38 @@ function formatRelative(value?: number): string {
   const hours = Math.floor(minutes / 60);
   if (hours < 48) return `${hours}h ago`;
   return `${Math.floor(hours / 24)}d ago`;
+}
+
+function formatScheduleRelative(nextRunAt: number, now: number): string {
+  const delta = nextRunAt - now;
+  if (delta <= 0) return "Due now";
+  const minutes = Math.ceil(delta / 60_000);
+  return minutes <= 1 ? "in <1m" : `in ${minutes}m`;
+}
+
+function scheduleTone(schedule: UpcomingScheduleSnapshot | undefined): "good" | "warn" | "bad" | "quiet" {
+  if (!schedule) return "warn";
+  if (schedule.state === "live") return schedule.schedulerEnabled ? "good" : "quiet";
+  if (schedule.state === "partial") return "warn";
+  if (schedule.state === "unavailable") return "quiet";
+  return "bad";
+}
+
+function scheduleLabel(schedule: UpcomingScheduleSnapshot | undefined): string {
+  if (!schedule) return "Schedule loading";
+  if (schedule.state === "unavailable") return "Schedule unavailable";
+  if (schedule.state === "offline") return "Schedule offline";
+  if (schedule.state === "error") return "Schedule error";
+  if (!schedule.schedulerEnabled) return "Cron disabled";
+  return schedule.state === "partial" ? "Schedule partial" : "Schedule live";
+}
+
+function incomingHeaderHint(schedule: UpcomingScheduleSnapshot | undefined, queued: number, scheduled: number): string {
+  if (!schedule) return `${queued} queued · schedule loading`;
+  if (schedule.state === "unavailable") return `${queued} queued · schedule unavailable`;
+  if (schedule.state === "offline" || schedule.state === "error") return `${queued} queued · schedule ${schedule.state}`;
+  if (!schedule.schedulerEnabled) return `${queued} queued · Cron disabled`;
+  return `${queued} queued · ${scheduled} scheduled next 1h${schedule.state === "partial" ? " · partial" : ""}`;
 }
 
 function outcomeLabel(item: ActivityItem): string {
@@ -189,6 +228,9 @@ function StatusPills({
       <span className={`truth-pill ${allLive ? "good" : "warn"}`} title={[tasks, sessions, events].filter(Boolean).map((item) => `${item!.source}: ${item!.state}`).join(" · ")}>
         <i /> Coverage {allLive ? "complete" : "partial"}
       </span>
+      <span className={`truth-pill ${scheduleTone(snapshot?.schedule)}`}>
+        <i /> {scheduleLabel(snapshot?.schedule)}
+      </span>
       {settled && !settled.complete ? <span className="truth-pill warn"><i /> Settled partial coverage</span> : null}
       {snapshot && snapshot.summary.unresolved > 0 ? <span className="truth-pill warn"><i /> {snapshot.summary.unresolved} unresolved</span> : null}
     </div>
@@ -231,7 +273,7 @@ function ActivityCard({ item, selected, onSelect }: { item: ActivityItem; select
   );
 }
 
-function useSettledCellLayout() {
+function useCellLayout() {
   const cellRef = useRef<HTMLDivElement>(null);
   const timerRef = useRef<number | undefined>(undefined);
   const [layout, setLayout] = useState<CellLayout>({ mode: "standard", capacity: 4 });
@@ -253,6 +295,111 @@ function useSettledCellLayout() {
     };
   }, []);
   return { cellRef, layout };
+}
+
+function useScheduleNow(): number {
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    const timer = window.setInterval(() => setNow(Date.now()), 30_000);
+    return () => window.clearInterval(timer);
+  }, []);
+  return now;
+}
+
+function ScheduleCard({ schedule }: { schedule: UpcomingSchedule }) {
+  const now = useScheduleNow();
+  return (
+    <motion.article
+      initial={{ opacity: 0, y: 4 }}
+      animate={{ opacity: 1, y: 0 }}
+      exit={{ opacity: 0, y: -3 }}
+      transition={{ duration: 0.16, ease: "easeOut" }}
+      className="activity-card schedule-card incoming border-blue-200/70 bg-blue-50/45 text-slate-900"
+      data-schedule-id={schedule.id}
+      data-next-run-at={schedule.nextRunAt}
+      title={`${schedule.title} · ${formatHourMinute(schedule.nextRunAt)} · ${formatScheduleRelative(schedule.nextRunAt, now)}`}
+    >
+      <span className="status-dot schedule-clock" aria-hidden="true">◷</span>
+      <span className="activity-title">{schedule.title}</span>
+      <span className="activity-meta">CRON · {formatHourMinute(schedule.nextRunAt)} · {formatScheduleRelative(schedule.nextRunAt, now)}</span>
+    </motion.article>
+  );
+}
+
+function IncomingOverflowCard({
+  hiddenQueued,
+  hiddenSchedules,
+  onOpen,
+}: {
+  hiddenQueued: number;
+  hiddenSchedules: number;
+  onOpen: () => void;
+}) {
+  const title = [hiddenQueued > 0 ? `+${hiddenQueued} queued` : "", hiddenSchedules > 0 ? `+${hiddenSchedules} scheduled` : ""]
+    .filter(Boolean)
+    .join(" · ");
+  return (
+    <motion.button
+      initial={{ opacity: 0, y: 4 }}
+      animate={{ opacity: 1, y: 0 }}
+      exit={{ opacity: 0, y: -3 }}
+      transition={{ duration: 0.16, ease: "easeOut" }}
+      className="activity-card incoming-overflow-card incoming border-slate-300 bg-slate-100 text-slate-800"
+      data-incoming-overflow
+      data-hidden-queued={hiddenQueued}
+      data-hidden-schedules={hiddenSchedules}
+      title={title}
+      onClick={onOpen}
+    >
+      <span className="status-dot" />
+      <span className="activity-title">{title}</span>
+      <span className="activity-meta">Incoming cell capacity reached</span>
+    </motion.button>
+  );
+}
+
+function IncomingCell({
+  queued,
+  schedules,
+  selectedId,
+  onSelectActivity,
+  onOpenOverflow,
+}: {
+  queued: ActivityItem[];
+  schedules: UpcomingSchedule[];
+  selectedId?: string;
+  onSelectActivity: (id: string) => void;
+  onOpenOverflow: (queued: ActivityItem[], schedules: UpcomingSchedule[]) => void;
+}) {
+  const { cellRef, layout } = useCellLayout();
+  const orderedQueued = sortQueuedActivities(queued);
+  const orderedSchedules = [...schedules].sort((left, right) => left.nextRunAt - right.nextRunAt || left.title.localeCompare(right.title));
+  const quota = applyIncomingQuota(orderedQueued, orderedSchedules, layout.capacity);
+  const hiddenCount = quota.hiddenQueued.length + quota.hiddenSchedules.length;
+  return (
+    <div
+      ref={cellRef}
+      className="stage-cell stage-incoming"
+      data-cell-layout={layout.mode}
+      data-cell-capacity={layout.capacity}
+      data-visible-cards={quota.visibleQueued.length + quota.visibleSchedules.length + (hiddenCount > 0 ? 1 : 0)}
+    >
+      <AnimatePresence initial={false}>
+        {quota.visibleQueued.map((item) => (
+          <ActivityCard key={item.id} item={item} selected={item.id === selectedId} onSelect={() => onSelectActivity(item.id)} />
+        ))}
+        {quota.visibleSchedules.map((schedule) => <ScheduleCard key={schedule.id} schedule={schedule} />)}
+        {hiddenCount > 0 ? (
+          <IncomingOverflowCard
+            key="incoming-overflow"
+            hiddenQueued={quota.hiddenQueued.length}
+            hiddenSchedules={quota.hiddenSchedules.length}
+            onOpen={() => onOpenOverflow(quota.hiddenQueued, quota.hiddenSchedules)}
+          />
+        ) : null}
+      </AnimatePresence>
+    </div>
+  );
 }
 
 function SeriesGroupCard({
@@ -356,7 +503,7 @@ function SettledCell({
   onOpenSeries: (seriesKey: string) => void;
   onOpenOverflow: (groups: SettledGroupSummary[]) => void;
 }) {
-  const { cellRef, layout } = useSettledCellLayout();
+  const { cellRef, layout } = useCellLayout();
   const quota = applyCellQuota(groups, layout.capacity);
   const visibleGroups = quota.visible;
   const hiddenGroups = quota.hidden;
@@ -390,11 +537,14 @@ function SettledCell({
 type AgentBoardRow = {
   agentId: string;
   items: ActivityItem[];
+  schedules: UpcomingSchedule[];
   groups: SettledGroupSummary[];
 };
 
 function FlowBoard({
   items,
+  schedules,
+  scheduleState,
   settled,
   range,
   kind,
@@ -404,8 +554,11 @@ function FlowBoard({
   onSelectActivity,
   onSelectSeries,
   onSelectOverflow,
+  onOpenIncomingOverflow,
 }: {
   items: ActivityItem[];
+  schedules: UpcomingSchedule[];
+  scheduleState?: UpcomingScheduleSnapshot;
   settled?: SettledGroupSnapshot;
   range: SettledRange;
   kind: KindFilter;
@@ -415,14 +568,20 @@ function FlowBoard({
   onSelectActivity: (id: string) => void;
   onSelectSeries: (seriesKey: string) => void;
   onSelectOverflow: (agentId: string, groups: SettledGroupSummary[]) => void;
+  onOpenIncomingOverflow: (agentId: string, queued: ActivityItem[], schedules: UpcomingSchedule[]) => void;
 }) {
   const lowered = query.trim().toLowerCase();
   const rows = useMemo(() => {
     const byAgent = new Map<string, AgentBoardRow>();
     for (const item of items) {
-      const row = byAgent.get(item.agentId) ?? { agentId: item.agentId, items: [], groups: [] };
+      const row = byAgent.get(item.agentId) ?? { agentId: item.agentId, items: [], schedules: [], groups: [] };
       row.items.push(item);
       byAgent.set(item.agentId, row);
+    }
+    for (const schedule of schedules) {
+      const row = byAgent.get(schedule.agentId) ?? { agentId: schedule.agentId, items: [], schedules: [], groups: [] };
+      row.schedules.push(schedule);
+      byAgent.set(schedule.agentId, row);
     }
     for (const [agentId, candidates] of Object.entries(settled?.groupsByAgent ?? {})) {
       const groups = candidates.filter((group) => {
@@ -430,7 +589,7 @@ function FlowBoard({
         return !lowered || `${group.title} ${group.agentId}`.toLowerCase().includes(lowered);
       });
       if (groups.length === 0) continue;
-      const row = byAgent.get(agentId) ?? { agentId, items: [], groups: [] };
+      const row = byAgent.get(agentId) ?? { agentId, items: [], schedules: [], groups: [] };
       row.groups = groups;
       byAgent.set(agentId, row);
     }
@@ -438,14 +597,15 @@ function FlowBoard({
       const leftAttention = left.items.filter((item) => item.attention !== "none").length;
       const rightAttention = right.items.filter((item) => item.attention !== "none").length;
       return rightAttention - leftAttention
-        || right.items.length + right.groups.length - (left.items.length + left.groups.length)
+        || right.items.length + right.schedules.length + right.groups.length - (left.items.length + left.schedules.length + left.groups.length)
         || left.agentId.localeCompare(right.agentId);
     });
-  }, [items, settled, kind, lowered]);
+  }, [items, schedules, settled, kind, lowered]);
 
   const seriesCount = rows.reduce((total, row) => total + row.groups.length, 0);
   const settledRunCount = rows.reduce((total, row) => total + row.groups.reduce((subtotal, group) => subtotal + group.runCount, 0), 0);
-  const densitySignal = items.length + seriesCount;
+  const queuedCount = items.filter((item) => item.stage === "incoming").length;
+  const densitySignal = items.length + schedules.length + seriesCount;
   const density = densitySignal <= 12 ? "focus" : densitySignal <= 70 ? "board" : densitySignal <= 260 ? "dense" : "radar";
 
   if (rows.length === 0) {
@@ -463,7 +623,7 @@ function FlowBoard({
       <div className="flow-head agent-head">AGENT FLOW</div>
       {OPERATIONAL_STAGES.map((stage) => (
         <div className="flow-head" key={stage.key}>
-          <span>{stage.label}</span><b>{stage.arrow}</b><small>{stage.hint}</small>
+          <span>{stage.label}</span><b>{stage.arrow}</b><small>{stage.key === "incoming" ? incomingHeaderHint(scheduleState, queuedCount, schedules.length) : stage.hint}</small>
         </div>
       ))}
       <div className="flow-head settled-head">
@@ -471,7 +631,7 @@ function FlowBoard({
         <b>→</b>
         <small>{settled?.complete === false ? "partial coverage" : "grouped terminal work"}</small>
       </div>
-      {rows.map(({ agentId, items: agentItems, groups }) => {
+      {rows.map(({ agentId, items: agentItems, schedules: agentSchedules, groups }) => {
         const activeCount = agentItems.filter((item) => item.state === "active").length;
         const groupRunCount = groups.reduce((total, group) => total + group.runCount, 0);
         return (
@@ -480,12 +640,24 @@ function FlowBoard({
               <span className="agent-avatar" style={{ background: AGENT_COLORS[hash(agentId) % AGENT_COLORS.length] }}>{shortAgent(agentId)}</span>
               <span className="agent-copy">
                 <b>{agentId}</b>
-                <small>{activeCount} active · {groups.length} series / {groupRunCount} runs</small>
+                <small>{activeCount} active · {agentSchedules.length} scheduled · {groups.length} series / {groupRunCount} runs</small>
               </span>
-              <span className="agent-count">{agentItems.length + groups.length}</span>
+              <span className="agent-count">{agentItems.length + agentSchedules.length + groups.length}</span>
             </div>
             {OPERATIONAL_STAGES.map((stage) => {
               const stageItems = agentItems.filter((item) => item.stage === stage.key || (stage.key === "waiting" && item.stage === "unresolved"));
+              if (stage.key === "incoming") {
+                return (
+                  <IncomingCell
+                    key={stage.key}
+                    queued={stageItems}
+                    schedules={agentSchedules}
+                    selectedId={selectedId}
+                    onSelectActivity={onSelectActivity}
+                    onOpenOverflow={(queued, hiddenSchedules) => onOpenIncomingOverflow(agentId, queued, hiddenSchedules)}
+                  />
+                );
+              }
               return (
                 <div className={`stage-cell stage-${stage.key}`} key={stage.key}>
                   {stageItems.map((item) => <ActivityCard key={item.id} item={item} selected={item.id === selectedId} onSelect={() => onSelectActivity(item.id)} />)}
@@ -506,11 +678,11 @@ function FlowBoard({
       <aside className="fleet-map" aria-label="Fleet stage distribution">
         <h4>FLEET<br />MAP</h4>
         <div className="fleet-map-rows">
-          {rows.map(({ agentId, items: agentItems, groups }) => {
-            const total = Math.max(1, agentItems.length + groups.length);
+          {rows.map(({ agentId, items: agentItems, schedules: agentSchedules, groups }) => {
+            const total = Math.max(1, agentItems.length + agentSchedules.length + groups.length);
             return (
               <div className="fleet-map-row" key={agentId} title={agentId}>
-                <span style={{ flex: agentItems.filter((item) => item.stage === "incoming").length / total }} />
+                <span style={{ flex: (agentItems.filter((item) => item.stage === "incoming").length + agentSchedules.length) / total }} />
                 <span style={{ flex: agentItems.filter((item) => item.stage === "in_flight").length / total }} />
                 <span style={{ flex: agentItems.filter((item) => item.stage === "waiting" || item.stage === "unresolved").length / total }} />
                 <span style={{ flex: groups.length / total }} />
@@ -521,7 +693,7 @@ function FlowBoard({
       </aside>
       <div className="flow-footer">
         <span className="mini-live" /> Auto density · {density}
-        <span>{items.length} operational · {seriesCount} settled series / {settledRunCount} runs · {range}</span>
+        <span>{items.length} operational · {schedules.length} scheduled next 1h · {seriesCount} settled series / {settledRunCount} runs · {range}</span>
         <span className="flow-footer-push">Full-range server aggregation</span>
       </div>
     </div>
@@ -700,6 +872,46 @@ function OverflowDialog({
   );
 }
 
+function IncomingOverflowDialog({
+  agentId,
+  queued,
+  schedules,
+  onClose,
+  onOpenActivity,
+}: {
+  agentId: string;
+  queued: ActivityItem[];
+  schedules: UpcomingSchedule[];
+  onClose: () => void;
+  onOpenActivity: (id: string) => void;
+}) {
+  return (
+    <DialogFrame
+      title={agentId}
+      eyebrow={`INCOMING OVERFLOW · ${queued.length} QUEUED · ${schedules.length} SCHEDULED`}
+      onClose={onClose}
+      widthClass="max-w-[640px]"
+    >
+      <div className="overflow-list incoming-overflow-list">
+        {queued.map((item) => (
+          <button key={item.id} data-activity-id={item.id} onClick={() => onOpenActivity(item.id)}>
+            <span className="overflow-tier">Q</span>
+            <span><b>{item.title}</b><small>Queued task · {formatRelative(item.createdAt ?? item.updatedAt)}</small></span>
+            <span><b>Queued</b><small>task</small></span>
+          </button>
+        ))}
+        {schedules.map((schedule) => (
+          <article key={schedule.id} data-schedule-id={schedule.id}>
+            <span className="overflow-tier schedule-tier">◷</span>
+            <span><b>{schedule.title}</b><small>Scheduled · {formatScheduleRelative(schedule.nextRunAt, Date.now())}</small></span>
+            <span><b>{formatHourMinute(schedule.nextRunAt)}</b><small>{schedule.timezone ?? schedule.scheduleKind}</small></span>
+          </article>
+        ))}
+      </div>
+    </DialogFrame>
+  );
+}
+
 function Inspector({ id, onClose }: { id: string; onClose: () => void }) {
   const [detail, setDetail] = useState<ActivityDetail>();
   const [error, setError] = useState<string>();
@@ -818,6 +1030,7 @@ export function App() {
   const [selectedId, setSelectedId] = useState<string>();
   const [selectedSeriesKey, setSelectedSeriesKey] = useState<string>();
   const [overflow, setOverflow] = useState<{ agentId: string; groups: SettledGroupSummary[] }>();
+  const [incomingOverflow, setIncomingOverflow] = useState<{ agentId: string; queued: ActivityItem[]; schedules: UpcomingSchedule[] }>();
 
   useEffect(() => {
     try {
@@ -836,14 +1049,24 @@ export function App() {
     });
   }, [snapshot, kind, query]);
 
+  const visibleSchedules = useMemo(() => {
+    if (kind !== "all") return [];
+    const lowered = query.trim().toLowerCase();
+    return (snapshot?.schedule.items ?? []).filter((schedule) => (
+      !lowered || `${schedule.title} ${schedule.agentId}`.toLowerCase().includes(lowered)
+    ));
+  }, [snapshot, kind, query]);
+
   const selectedGroup = useMemo(
     () => Object.values(settled?.groupsByAgent ?? {}).flat().find((group) => group.seriesKey === selectedSeriesKey),
     [settled, selectedSeriesKey],
   );
   const active = snapshot?.items.filter((item) => item.catalog === "operational").length ?? 0;
   const waiting = snapshot?.items.filter((item) => item.stage === "waiting" || item.stage === "unresolved").length ?? 0;
+  const scheduled = snapshot?.schedule.items.length ?? 0;
   const agentCount = new Set([
     ...(snapshot?.items.filter((item) => item.state !== "terminal").map((item) => item.agentId) ?? []),
+    ...(snapshot?.schedule.items.map((item) => item.agentId) ?? []),
     ...Object.keys(settled?.groupsByAgent ?? {}),
   ]).size;
 
@@ -851,15 +1074,18 @@ export function App() {
     setRange(next);
     setSelectedSeriesKey(undefined);
     setOverflow(undefined);
+    setIncomingOverflow(undefined);
   };
   const openItem = (id: string) => {
     setSelectedSeriesKey(undefined);
     setOverflow(undefined);
+    setIncomingOverflow(undefined);
     setSelectedId(id);
   };
   const openSeries = (seriesKey: string) => {
     setSelectedId(undefined);
     setOverflow(undefined);
+    setIncomingOverflow(undefined);
     setSelectedSeriesKey(seriesKey);
   };
 
@@ -881,6 +1107,7 @@ export function App() {
               <h1>{status?.syncState === "live" ? (active > 0 ? "Activity is flowing" : "Collector is watching") : statusLabel(status)}</h1>
               <div className="metrics">
                 <span><b>{active}</b> operational</span>
+                <span><b>{scheduled}</b> scheduled next 1h</span>
                 <span className="wait"><b>{waiting}</b> waiting / unresolved</span>
                 <span><b>{settled?.totalSeries ?? "—"}</b> settled series</span>
                 <span><b>{settled?.totalRuns ?? "—"}</b> runs · {range}</span>
@@ -890,7 +1117,7 @@ export function App() {
             <div className="summary-actions">
               <StatusPills status={status} snapshot={snapshot} settled={settled} />
               <div className="filters">
-                <label className="search"><span>⌕</span><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Search activity or series" aria-label="Search activity" /></label>
+                <label className="search"><span>⌕</span><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Search activity, schedule or series" aria-label="Search board" /></label>
                 <div className="segmented" aria-label="Activity kind"><button aria-pressed={kind === "all"} onClick={() => setKind("all")}>All</button><button aria-pressed={kind === "task"} onClick={() => setKind("task")}>Tasks</button><button aria-pressed={kind === "attempt"} onClick={() => setKind("attempt")}>Attempts</button></div>
                 <RangeSelector value={range} onChange={changeRange} />
                 <button className="refresh-button" onClick={() => void refresh()} aria-label="Refresh snapshots">↻</button>
@@ -903,6 +1130,8 @@ export function App() {
               <FlowBoard
                 key={range}
                 items={visibleOperationalItems}
+                schedules={visibleSchedules}
+                scheduleState={snapshot?.schedule}
                 settled={settled}
                 range={range}
                 kind={kind}
@@ -912,6 +1141,7 @@ export function App() {
                 onSelectActivity={openItem}
                 onSelectSeries={openSeries}
                 onSelectOverflow={(agentId, groups) => setOverflow({ agentId, groups })}
+                onOpenIncomingOverflow={(agentId, queued, schedules) => setIncomingOverflow({ agentId, queued, schedules })}
               />
             </section>
           </main>
@@ -924,6 +1154,15 @@ export function App() {
         </main>
       )}
 
+      {incomingOverflow ? (
+        <IncomingOverflowDialog
+          agentId={incomingOverflow.agentId}
+          queued={incomingOverflow.queued}
+          schedules={incomingOverflow.schedules}
+          onClose={() => setIncomingOverflow(undefined)}
+          onOpenActivity={openItem}
+        />
+      ) : null}
       {overflow ? (
         <OverflowDialog
           agentId={overflow.agentId}

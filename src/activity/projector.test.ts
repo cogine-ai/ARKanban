@@ -59,6 +59,7 @@ describe("activity projector", () => {
     expect(sessionAgentId({ key: "agent:pm-awb:feishu:group:group-one" })).toBe("pm-awb");
     expect(sessionAgentId({ key: "agent:pm-awb:one", agentId: "explicit-agent" })).toBe("explicit-agent");
     expect(agentIdFromSessionKey("not-an-agent-key")).toBeUndefined();
+    expect(agentIdFromSessionKey("agent:bad/id:one")).toBeUndefined();
     expect(sessionAgentId({ key: "not-an-agent-key" })).toBe("Unattributed");
   });
 });

@@ -142,7 +142,7 @@ export function sessionKey(session: RawSessionRow): string | undefined {
 export function agentIdFromSessionKey(value: unknown): string | undefined {
   const key = stringOrUndefined(value);
   if (!key) return undefined;
-  const match = /^agent:([^:]+):/.exec(key);
+  const match = /^agent:([A-Za-z0-9][A-Za-z0-9._-]*):/.exec(key);
   return stringOrUndefined(match?.[1]);
 }
 

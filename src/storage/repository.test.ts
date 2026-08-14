@@ -90,6 +90,45 @@ describe("CollectorRepository", () => {
     expect(repo.findOpenAttemptsBySessionKey(sessionKey)).toHaveLength(2);
   });
 
+  it("backfills only Unattributed activities with a strict agent session key when reopening storage", () => {
+    const directory = mkdtempSync(path.join(tmpdir(), "collector-repository-backfill-"));
+    const databasePath = path.join(directory, "collector.sqlite");
+    let initial: CollectorRepository | undefined = new CollectorRepository(databasePath);
+    let reopened: CollectorRepository | undefined;
+    const candidate = (id: string, sessionKey: string) => attemptPatch({
+      id,
+      sourceKey: `attempt:${id}`,
+      origin: "online",
+      agentId: "Unattributed",
+      title: id,
+      now: 1_000,
+      sessionKey,
+      state: "terminal",
+      outcome: "unknown",
+      source: "events",
+      eventKind: "agent:lifecycle:end",
+    });
+    try {
+      initial.upsertMany([
+        candidate("repairable", "agent:pm-awb:cron:one"),
+        candidate("malformed", "agent:bad/id:cron:one"),
+        candidate("unknown-format", "external-session"),
+      ], ["fixture"]);
+      initial.close();
+      initial = undefined;
+
+      reopened = new CollectorRepository(databasePath);
+      expect(reopened.detail("repairable")?.item.agentId).toBe("pm-awb");
+      expect(reopened.detail("repairable")?.timeline[0]).toMatchObject({ source: "collector", kind: "session_agent_backfill", status: "pm-awb" });
+      expect(reopened.detail("malformed")?.item.agentId).toBe("Unattributed");
+      expect(reopened.detail("unknown-format")?.item.agentId).toBe("Unattributed");
+    } finally {
+      initial?.close();
+      reopened?.close();
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
   it("aggregates the complete settled range before grouping and preserves low-frequency series", () => {
     const repo = repository();
     const day = 24 * 60 * 60 * 1_000;

@@ -17,7 +17,7 @@ import type {
   SettledSeriesRuns,
   StageCounts,
 } from "../contracts.js";
-import type { ActivityWrite } from "../activity/projector.js";
+import { agentIdFromSessionKey, type ActivityWrite } from "../activity/projector.js";
 
 export type RepositoryChange = {
   epoch: string;
@@ -427,6 +427,7 @@ export class CollectorRepository {
       INSERT INTO observations(activity_id, source, kind, phase, status, tool_name, occurred_at)
       VALUES (?, ?, ?, ?, ?, ?, ?)
     `);
+    this.repairSessionAgentAttribution();
   }
 
   get revision(): number {
@@ -440,6 +441,37 @@ export class CollectorRepository {
   subscribe(listener: (change: RepositoryChange) => void): () => void {
     this.listeners.add(listener);
     return () => this.listeners.delete(listener);
+  }
+
+  private repairSessionAgentAttribution(observedAt = Date.now()): RepositoryChange | null {
+    const candidates = this.db
+      .prepare("SELECT id, session_key FROM activities WHERE agent_id = 'Unattributed' AND session_key IS NOT NULL")
+      .all() as Array<{ id: string; session_key: string }>;
+    const repairs = candidates.flatMap((row) => {
+      const agentId = agentIdFromSessionKey(row.session_key);
+      return agentId ? [{ ...row, agentId }] : [];
+    });
+    if (repairs.length === 0) return null;
+
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const update = this.db.prepare(`
+        UPDATE activities
+        SET agent_id = ?, last_observed_at = MAX(last_observed_at, ?),
+            fingerprint = fingerprint || ':agent-backfill:' || ?
+        WHERE id = ? AND agent_id = 'Unattributed'
+      `);
+      for (const repair of repairs) {
+        update.run(repair.agentId, observedAt, repair.agentId, repair.id);
+        this.insertObservation.run(repair.id, "collector", "session_agent_backfill", null, repair.agentId, null, observedAt);
+      }
+      this.bumpRevision();
+      this.db.exec("COMMIT");
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
+    return this.emit(repairs.map((repair) => repair.id), ["session_agent_backfill"]);
   }
 
   upsertMany(writes: ActivityWrite[], reasons: string[]): RepositoryChange | null {

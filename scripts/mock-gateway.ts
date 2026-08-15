@@ -83,6 +83,41 @@ const sessions = Array.from({ length: 64 }, (_, index) => {
   };
 });
 
+// Transcript bodies deliberately mix scripts, languages and an injection payload:
+// the archive stores untrusted input, and the reader must render all of it as
+// text. The CJK lines are what exercise the trigram index and its LIKE fallback.
+const transcriptTurns = [
+  { role: "user", content: "登录接口最近的失败率有点高，帮我看一下是不是超时导致的。" },
+  { role: "assistant", content: "我先拉取最近 24 小时的 登录接口 调用日志，再按错误码分组。" },
+  { role: "tool", toolName: "query_logs", content: '{"window":"24h","group_by":"error_code","rows":1842}' },
+  { role: "assistant", content: "超时占 63%，其余是凭证错误。建议把上游超时从 2s 调到 5s。" },
+  { role: "user", content: "Can you also check whether the retry budget is being exhausted?" },
+  { role: "assistant", content: "Retry budget peaks at 78% during the 09:00 burst; it is not exhausted." },
+  { role: "user", content: "<script>alert('xss')</script> **bold** [link](javascript:void 0)" },
+  { role: "assistant", content: "Recorded verbatim. The payload above is stored as text and never executed." },
+];
+
+function transcriptLength(sessionKey: string): number {
+  // Deterministic per session so repeated pulls are stable and pagination is
+  // reproducible across restarts.
+  let hash = 0;
+  for (const character of sessionKey) hash = (hash * 31 + character.charCodeAt(0)) % 997;
+  return 4 + (hash % (transcriptTurns.length * 2));
+}
+
+function mockMessage(sessionKey: string, sessionId: string | undefined, index: number): Record<string, unknown> {
+  const turn = transcriptTurns[index % transcriptTurns.length]!;
+  return {
+    id: `${sessionKey}#${index}`,
+    seq: index,
+    role: turn.role,
+    ...(turn.toolName ? { toolName: turn.toolName } : {}),
+    ...(sessionId ? { sessionId } : {}),
+    content: turn.content,
+    createdAt: now - (200 - index) * 30_000,
+  };
+}
+
 const server = new WebSocketServer({ host: "127.0.0.1", port });
 let frameSequence = 1;
 
@@ -109,7 +144,7 @@ server.on("connection", (socket) => {
           type: "hello-ok",
           protocol: 4,
           server: { version: "2026.8.1-demo", connId: `demo-${Date.now()}` },
-          features: { methods: ["tasks.list", "sessions.list", "sessions.subscribe", "cron.status", "cron.list", "agents.list"], events: ["task", "agent", "sessions.changed", "session.tool"] },
+          features: { methods: ["tasks.list", "sessions.list", "sessions.subscribe", "cron.status", "cron.list", "agents.list", "chat.history"], events: ["task", "agent", "sessions.changed", "session.tool"] },
           snapshot: {},
           auth: { role: "operator", scopes: ["operator.read"] },
           policy: { maxPayload: 1_000_000, maxBufferedBytes: 1_000_000, tickIntervalMs: 30_000 },
@@ -139,6 +174,27 @@ server.on("connection", (socket) => {
           frameSequence += 1;
         });
       }, 120);
+    } else if (request.method === "chat.history") {
+      const params = request.params as { sessionKey?: string; cursor?: string; limit?: number } | undefined;
+      const sessionKey = String(params?.sessionKey ?? "");
+      const session = sessions.find((entry) => entry.key === sessionKey);
+      const offset = Number(params?.cursor ?? 0);
+      const limit = Math.min(Number(params?.limit ?? 200), 200);
+      const total = session ? transcriptLength(sessionKey) : 0;
+      const page = Array.from({ length: Math.max(0, Math.min(limit, total - offset)) }, (_, index) =>
+        mockMessage(sessionKey, session?.sessionId, offset + index),
+      );
+      const nextOffset = offset + page.length;
+      send(socket, {
+        type: "res",
+        id: request.id,
+        ok: true,
+        payload: {
+          messages: page,
+          hasMore: nextOffset < total,
+          ...(nextOffset < total ? { nextCursor: String(nextOffset) } : {}),
+        },
+      });
     } else if (request.method === "agents.list") {
       send(socket, {
         type: "res",

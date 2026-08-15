@@ -47,6 +47,12 @@ import {
 } from "./upcoming-schedules.js";
 import { inferAgents, projectAgent, projectSession } from "../activity/session-projector.js";
 import { CapabilityRegistry, type CapabilityState } from "./capability-probe.js";
+import {
+  classifyHistoryFailure,
+  TRANSCRIPT_SYNC_MS,
+  TranscriptSynchronizer,
+  type TranscriptSyncOutcome,
+} from "./transcript-sync.js";
 import { FieldInventory, type FieldInventoryReport } from "./field-inventory.js";
 
 const REQUIRED_METHODS = ["tasks.list", "sessions.list", "sessions.subscribe"] as const;
@@ -109,13 +115,18 @@ export class CollectorRuntime {
   private scheduleTimer?: NodeJS.Timeout;
   private pruneTimer?: NodeJS.Timeout;
   private agentTimer?: NodeJS.Timeout;
+  private transcriptTimer?: NodeJS.Timeout;
   private taskSyncing = false;
   private sessionSyncing = false;
   private scheduleSyncing = false;
   private agentSyncing = false;
+  private transcriptSyncing = false;
   private readonly capabilities = new CapabilityRegistry();
   private readonly sessionFields = new FieldInventory("sessions.list");
   private readonly agentFields = new FieldInventory("agents.list");
+  private readonly messageFields = new FieldInventory("chat.history");
+  private readonly transcripts: TranscriptSynchronizer;
+  private transcriptStatus: TranscriptSyncOutcome | undefined;
   private sessionArchiveError?: string;
   private syncState: CollectorSyncState = "starting";
   private syncReasons: string[] = ["collector_starting"];
@@ -147,6 +158,13 @@ export class CollectorRuntime {
       onEvent: (event) => this.handleGatewayEvent(event),
       onGap: (gap) => this.handleGap(gap),
     });
+    this.transcripts = new TranscriptSynchronizer({
+      archive: this.repository.transcripts,
+      request: async (method, params) => this.gateway.request(method, params),
+      maxBytes: config.storage.transcriptMaxBytes,
+      enabled: config.storage.transcriptSync === "enabled",
+      inventory: this.messageFields,
+    });
   }
 
   start(): void {
@@ -159,6 +177,7 @@ export class CollectorRuntime {
     // Deliberately not sharing the 8s session tick: a slow roster call must not
     // be able to delay session reconciliation.
     this.agentTimer = setInterval(() => void this.syncAgents("agent_interval"), AGENT_RECONCILE_MS);
+    this.transcriptTimer = setInterval(() => void this.syncTranscripts(), TRANSCRIPT_SYNC_MS);
     this.gateway.start();
   }
 
@@ -169,6 +188,7 @@ export class CollectorRuntime {
     if (this.scheduleTimer) clearInterval(this.scheduleTimer);
     if (this.pruneTimer) clearInterval(this.pruneTimer);
     if (this.agentTimer) clearInterval(this.agentTimer);
+    if (this.transcriptTimer) clearInterval(this.transcriptTimer);
     this.gateway.stop();
     this.repository.close();
   }
@@ -486,6 +506,44 @@ export class CollectorRuntime {
   }
 
   /**
+   * Pulls session transcripts into the local archive.
+   *
+   * Runs behind the primary sources in every sense: its own timer, its own
+   * request budget, and a hard gate on the primary sync being healthy. The
+   * outcome never touches `CollectorSyncState` — a transcript that is behind is
+   * a coverage fact, not a reason to call the collector degraded.
+   */
+  private async syncTranscripts(): Promise<void> {
+    if (this.transcriptSyncing) return;
+    this.transcriptSyncing = true;
+    try {
+      this.transcriptStatus = await this.transcripts.runOnce({
+        now: Date.now(),
+        connected: this.gateway.isConnected,
+        available: new Set(this.gatewayHello?.features.methods ?? []).has("chat.history"),
+        primaryHealthy: this.sources.get("sessions")?.state === "live",
+      });
+    } catch (error) {
+      // Closed-set code only: invariant 2 keeps transcript text out of logs.
+      this.transcriptStatus = {
+        requests: 0,
+        inserted: 0,
+        sessions: 0,
+        capacity: "ok",
+        evictedSessions: 0,
+        errorCode: classifyHistoryFailure(error),
+      };
+    } finally {
+      this.transcriptSyncing = false;
+    }
+  }
+
+  /** Counts and watermarks only; never message text. */
+  getTranscriptStatus(): TranscriptSyncOutcome | undefined {
+    return this.transcriptStatus;
+  }
+
+  /**
    * One read-only probe per non-discoverable method, bound to the current
    * connection generation.
    */
@@ -501,7 +559,7 @@ export class CollectorRuntime {
 
   /** Field-mapping diagnostics for validating the projectors against a real Gateway. */
   getFieldReports(): FieldInventoryReport[] {
-    return [this.sessionFields.report(), this.agentFields.report()];
+    return [this.sessionFields.report(), this.agentFields.report(), this.messageFields.report()];
   }
 
   getCapabilities(): Record<string, CapabilityState> {
@@ -785,5 +843,9 @@ export class CollectorRuntime {
     const day = 24 * 60 * 60 * 1_000;
     this.repository.prune(now - this.config.storage.terminalRetentionDays * day);
     this.repository.pruneSessions(now - this.config.storage.sessionRetentionDays * day);
+    // Transcripts have two gates: age here, and the size ceiling the sync loop
+    // enforces. Age runs first so eviction only ever has to handle real growth.
+    this.repository.transcripts.pruneOlderThan(now - this.config.storage.transcriptRetentionDays * day);
+    this.repository.transcripts.evictOldestSessions(this.config.storage.transcriptMaxBytes);
   }
 }

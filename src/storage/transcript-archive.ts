@@ -41,6 +41,15 @@ export type MessageSearchQuery = {
   limit?: number;
 };
 
+/** A session the sync loop may pull history for, with its stored watermark. */
+export type TranscriptCandidate = {
+  sessionKey: string;
+  sessionId?: string;
+  cursor?: string;
+  lastSeq?: number;
+  complete: boolean;
+};
+
 export type ArchiveUsage = {
   messageCount: number;
   contentBytes: number;
@@ -74,6 +83,16 @@ function rowToMessage(row: Row): ArchivedMessage {
       : {}),
     divergent: Number(row.divergent) === 1,
     createdAt: Number(row.created_at),
+  };
+}
+
+function rowToCandidate(row: Row): TranscriptCandidate {
+  return {
+    sessionKey: String(row.session_key),
+    ...(asString(row.session_id) ? { sessionId: asString(row.session_id) } : {}),
+    ...(asString(row.cursor) ? { cursor: asString(row.cursor) } : {}),
+    ...(asNumber(row.last_seq) !== undefined ? { lastSeq: asNumber(row.last_seq) } : {}),
+    complete: Number(row.complete ?? 0) === 1,
   };
 }
 
@@ -149,6 +168,23 @@ export class TranscriptArchive {
       `)
       .run(newSessionId, sessionKey, newSessionId);
     return Number(result.changes);
+  }
+
+  /**
+   * Second line of defence for the idempotency key.
+   *
+   * `(session_key, seq, session_id)` only makes a re-fetch a no-op when the
+   * Gateway numbers its messages. When it does not, sequence numbers are
+   * synthesised and a repeated page would be handed fresh ones, so the caller
+   * filters on message id instead.
+   */
+  knownMessageIds(sessionKey: string, ids: string[]): Set<string> {
+    if (ids.length === 0) return new Set();
+    const placeholders = ids.map(() => "?").join(", ");
+    const rows = this.db
+      .prepare(`SELECT message_id FROM session_messages WHERE session_key = ? AND message_id IN (${placeholders})`)
+      .all(sessionKey, ...ids) as Row[];
+    return new Set(rows.map((row) => String(row.message_id)));
   }
 
   listMessages(sessionKey: string, options: { afterSeq?: number; limit?: number } = {}): ArchivedMessage[] {
@@ -231,6 +267,48 @@ export class TranscriptArchive {
     return { mode: useFts ? "fts" : "fallback", hits, truncated };
   }
 
+  /**
+   * Sessions worth pulling an increment for: either running now, or touched
+   * recently enough that more messages are likely.
+   */
+  activeCandidates(options: { now: number; withinMs: number; limit: number }): TranscriptCandidate[] {
+    const rows = this.db
+      .prepare(`
+        SELECT s.session_key, s.session_id, t.cursor, t.last_seq, t.complete
+        FROM sessions s
+        LEFT JOIN session_transcript_sync t ON t.session_key = s.session_key
+        WHERE s.has_active_run = 1 OR s.last_activity_at >= ?
+        ORDER BY s.last_activity_at DESC, s.session_key ASC
+        LIMIT ?
+      `)
+      .all(options.now - options.withinMs, options.limit) as Row[];
+    return rows.map(rowToCandidate);
+  }
+
+  /**
+   * Sessions whose history has never been walked to the end. Ordered by recency
+   * because a conversation from this morning is likelier to be reviewed than one
+   * from last quarter.
+   */
+  backfillCandidates(options: { limit: number; exclude?: Set<string> }): TranscriptCandidate[] {
+    const rows = this.db
+      .prepare(`
+        SELECT s.session_key, s.session_id, t.cursor, t.last_seq, t.complete
+        FROM sessions s
+        LEFT JOIN session_transcript_sync t ON t.session_key = s.session_key
+        WHERE COALESCE(t.complete, 0) = 0
+        ORDER BY s.last_activity_at DESC, s.session_key ASC
+        LIMIT ?
+      `)
+      // Over-fetch so that excluding sessions already handled this round does not
+      // silently shrink the backfill quota.
+      .all(options.limit + (options.exclude?.size ?? 0)) as Row[];
+    return rows
+      .map(rowToCandidate)
+      .filter((candidate) => !options.exclude?.has(candidate.sessionKey))
+      .slice(0, options.limit);
+  }
+
   syncState(sessionKey: string): TranscriptSyncState | undefined {
     const row = this.db
       .prepare("SELECT * FROM session_transcript_sync WHERE session_key = ?")
@@ -294,10 +372,16 @@ export class TranscriptArchive {
    * dbstat walks every page, so this belongs in the periodic prune cycle and not
    * on any write path.
    */
-  usage(): ArchiveUsage {
-    const totals = this.db
+  /** Cheap aggregate, safe to call from a request handler. */
+  totals(): { messageCount: number; contentBytes: number } {
+    const row = this.db
       .prepare("SELECT COUNT(*) AS count, COALESCE(SUM(content_bytes), 0) AS bytes FROM session_messages")
       .get() as Row;
+    return { messageCount: Number(row.count), contentBytes: Number(row.bytes) };
+  }
+
+  usage(): ArchiveUsage {
+    const totals = this.totals();
     const stored = this.db
       .prepare(`
         SELECT COALESCE(SUM(pgsize), 0) AS bytes FROM dbstat
@@ -306,11 +390,7 @@ export class TranscriptArchive {
            OR name LIKE 'sqlite_autoindex_session_messages%'
       `)
       .get() as Row;
-    return {
-      messageCount: Number(totals.count),
-      contentBytes: Number(totals.bytes),
-      storedBytes: Number(stored.bytes),
-    };
+    return { ...totals, storedBytes: Number(stored.bytes) };
   }
 
   pruneOlderThan(cutoff: number): number {

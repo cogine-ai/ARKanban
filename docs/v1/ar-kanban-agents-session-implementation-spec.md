@@ -465,6 +465,26 @@ CREATE INDEX idx_activities_session_ref ON activities(session_ref);
 | `GET /api/v1/search/messages` | 跨会话全文检索，见第 7 节 |
 | `GET /api/v1/usage/summary` | 按范围的成本与 token 汇总 |
 
+### 5.1.1 Agent 汇总卡的近期 rollup
+
+`GET /api/v1/agents` 的每一项在 `AgentSummary` 与会话计数之外，带一个终态活动 rollup：
+
+```ts
+recent: Record<"24h" | "7d", {
+  completed: number;                // 窗口内的终态活动总数
+  succeeded / failed / cancelled / timedOut / blocked / unknown: number;
+  successRate?: number;             // completed 为 0 时缺省，不是 0
+  avgDurationMs?: number;           // 无可用样本时缺省，不是 0
+  durationSampleCount: number;      // 同时观测到 started_at 与 ended_at 的运行数
+}>
+```
+
+两个窗口在服务端一次算完。理由是 §6.4 要求卡片同屏展示 24h 与 7d，而 `settled-groups` 一次只覆盖一个区间，让前端拉两次既多一轮往返，也无法给出时长。
+
+`successRate` 与 `avgDurationMs` 可缺省，与 `SessionCoverage` 同一条原则：没跑过任何任务和成功率为 0 是相反的事实，不能塌缩成同一个数。
+
+平均时长只统计同时观测到 `started_at` 与 `ended_at` 的运行，并暴露 `durationSampleCount` 让调用方判断这个均值的代表性。回退到 `updated_at` 会让 reconcile 的节奏而不是运行本身决定这个数字。
+
 ### 5.2 会话列表分页
 
 ```text

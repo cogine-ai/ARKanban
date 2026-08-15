@@ -198,6 +198,40 @@ export type AgentSummary = {
   lastActivityAt?: number;
 };
 
+/** Windows the agent overview rolls terminal activity up over. */
+export type AgentRollupWindow = "24h" | "7d";
+
+/**
+ * Terminal-activity rollup for one agent over one window.
+ *
+ * `successRate` and `avgDurationMs` are optional rather than zero-defaulted:
+ * an agent that completed nothing has no success rate, and reporting 0% would
+ * read as total failure. Same reasoning as SessionCoverage — "no data" and
+ * "measured zero" must not collapse into the same value.
+ */
+export type AgentActivityRollup = {
+  completed: number;
+  succeeded: number;
+  failed: number;
+  cancelled: number;
+  timedOut: number;
+  blocked: number;
+  unknown: number;
+  successRate?: number;
+  avgDurationMs?: number;
+  /** Runs that had both a start and an end observed, so avgDurationMs is readable. */
+  durationSampleCount: number;
+};
+
+export type AgentOverview = AgentSummary & {
+  sessionCount: number;
+  activeSessionCount: number;
+  archivedSessionCount: number;
+  activityCount: number;
+  lastSessionActivityAt?: number;
+  recent: Record<AgentRollupWindow, AgentActivityRollup>;
+};
+
 export type SessionKindHint = "main" | "fork" | "subagent" | "global" | "unknown";
 
 /**

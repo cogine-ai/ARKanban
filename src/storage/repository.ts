@@ -5,9 +5,13 @@ import { DatabaseSync, type StatementSync } from "node:sqlite";
 import type {
   ActivityDetail,
   ActivityItem,
+  ActivityOutcome,
   ActivityRelation,
+  AgentActivityRollup,
   AgentKind,
   AgentOrigin,
+  AgentOverview,
+  AgentRollupWindow,
   AgentSummary,
   ChangeTopic,
   EvidenceState,
@@ -105,15 +109,25 @@ export type SessionPage = {
   nextCursor?: string;
 };
 
-export type AgentOverview = AgentSummary & {
-  sessionCount: number;
-  activeSessionCount: number;
-  archivedSessionCount: number;
-  activityCount: number;
-  lastSessionActivityAt?: number;
+type ActivityRow = Record<string, unknown>;
+
+const AGENT_ROLLUP_WINDOW_MS: Record<AgentRollupWindow, number> = {
+  "24h": 24 * 60 * 60 * 1_000,
+  "7d": 7 * 24 * 60 * 60 * 1_000,
 };
 
-type ActivityRow = Record<string, unknown>;
+function emptyRollup(): AgentActivityRollup {
+  return {
+    completed: 0,
+    succeeded: 0,
+    failed: 0,
+    cancelled: 0,
+    timedOut: 0,
+    blocked: 0,
+    unknown: 0,
+    durationSampleCount: 0,
+  };
+}
 
 const EMPTY_COUNTS: StageCounts = {
   incoming: 0,
@@ -1135,7 +1149,7 @@ export class CollectorRepository {
    * Aggregated in SQL rather than by loading sessions into memory, because the
    * roster is small but the session archive is not bounded by the UI's page size.
    */
-  listAgentOverviews(): AgentOverview[] {
+  listAgentOverviews(rangeEnd = Date.now()): AgentOverview[] {
     const rows = this.db
       .prepare(`
         SELECT a.*,
@@ -1156,20 +1170,93 @@ export class CollectorRepository {
       ),
     );
 
-    return rows.map((row) => ({
-      ...rowToAgent(row),
-      sessionCount: Number(row.session_count ?? 0),
-      activeSessionCount: Number(row.active_count ?? 0),
-      archivedSessionCount: Number(row.archived_count ?? 0),
-      activityCount: activityCounts.get(String(row.id)) ?? 0,
-      ...(asNumber(row.last_session_activity_at) !== undefined
-        ? { lastSessionActivityAt: asNumber(row.last_session_activity_at) }
-        : {}),
-    }));
+    const recent = {
+      "24h": this.agentRollups("24h", rangeEnd),
+      "7d": this.agentRollups("7d", rangeEnd),
+    };
+
+    return rows.map((row) => {
+      const id = String(row.id);
+      return {
+        ...rowToAgent(row),
+        sessionCount: Number(row.session_count ?? 0),
+        activeSessionCount: Number(row.active_count ?? 0),
+        archivedSessionCount: Number(row.archived_count ?? 0),
+        activityCount: activityCounts.get(id) ?? 0,
+        ...(asNumber(row.last_session_activity_at) !== undefined
+          ? { lastSessionActivityAt: asNumber(row.last_session_activity_at) }
+          : {}),
+        recent: {
+          "24h": recent["24h"].get(id) ?? emptyRollup(),
+          "7d": recent["7d"].get(id) ?? emptyRollup(),
+        },
+      };
+    });
   }
 
-  getAgentOverview(agentId: string): AgentOverview | undefined {
-    return this.listAgentOverviews().find((agent) => agent.id === agentId);
+  /**
+   * Terminal-activity rollup per agent for one window.
+   *
+   * Duration is averaged only over runs that reported both a start and an end.
+   * Falling back to `updated_at` would let the reconcile cadence, rather than
+   * the run, decide the number.
+   */
+  private agentRollups(window: AgentRollupWindow, rangeEnd: number): Map<string, AgentActivityRollup> {
+    const rangeStart = rangeEnd - AGENT_ROLLUP_WINDOW_MS[window];
+    const rows = this.db
+      .prepare(`
+        SELECT agent_id,
+               outcome,
+               COUNT(*) AS run_count,
+               SUM(CASE WHEN started_at IS NOT NULL AND ended_at IS NOT NULL AND ended_at >= started_at
+                        THEN 1 ELSE 0 END) AS duration_samples,
+               SUM(CASE WHEN started_at IS NOT NULL AND ended_at IS NOT NULL AND ended_at >= started_at
+                        THEN ended_at - started_at ELSE 0 END) AS duration_total
+        FROM activities
+        WHERE state = 'terminal'
+          AND COALESCE(ended_at, updated_at) >= ?
+          AND COALESCE(ended_at, updated_at) <= ?
+        GROUP BY agent_id, outcome
+      `)
+      .all(rangeStart, rangeEnd) as ActivityRow[];
+
+    const byAgent = new Map<string, AgentActivityRollup>();
+    const durationTotals = new Map<string, number>();
+
+    for (const row of rows) {
+      const agentId = String(row.agent_id);
+      const rollup = byAgent.get(agentId) ?? emptyRollup();
+      const runCount = Number(row.run_count ?? 0);
+      rollup.completed += runCount;
+      switch (row.outcome as ActivityOutcome) {
+        case "succeeded": rollup.succeeded += runCount; break;
+        case "failed": rollup.failed += runCount; break;
+        case "cancelled": rollup.cancelled += runCount; break;
+        case "timed_out": rollup.timedOut += runCount; break;
+        case "blocked": rollup.blocked += runCount; break;
+        case "unknown": rollup.unknown += runCount; break;
+        case "none": break;
+        default: {
+          const exhaustive: never = row.outcome as never;
+          throw new Error(`Unhandled activity outcome: ${String(exhaustive)}`);
+        }
+      }
+      rollup.durationSampleCount += Number(row.duration_samples ?? 0);
+      durationTotals.set(agentId, (durationTotals.get(agentId) ?? 0) + Number(row.duration_total ?? 0));
+      byAgent.set(agentId, rollup);
+    }
+
+    for (const [agentId, rollup] of byAgent) {
+      if (rollup.completed > 0) rollup.successRate = rollup.succeeded / rollup.completed;
+      if (rollup.durationSampleCount > 0) {
+        rollup.avgDurationMs = Math.round((durationTotals.get(agentId) ?? 0) / rollup.durationSampleCount);
+      }
+    }
+    return byAgent;
+  }
+
+  getAgentOverview(agentId: string, rangeEnd = Date.now()): AgentOverview | undefined {
+    return this.listAgentOverviews(rangeEnd).find((agent) => agent.id === agentId);
   }
 
   /** Activity timeline for one session, newest first. */

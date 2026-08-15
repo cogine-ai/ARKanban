@@ -326,6 +326,115 @@ describe("CollectorRepository agent overviews", () => {
   });
 });
 
+describe("CollectorRepository agent recent rollups", () => {
+  const day = 24 * 60 * 60 * 1_000;
+  const rangeEnd = 30 * day;
+  const run = (
+    id: string,
+    status: "completed" | "failed",
+    endedAt: number,
+    extra: { startedAt?: number; agentId?: string } = {},
+  ) => taskToActivity({
+    id,
+    title: id,
+    status,
+    agentId: extra.agentId ?? "builder",
+    endedAt,
+    ...(extra.startedAt !== undefined ? { startedAt: extra.startedAt } : {}),
+  }, rangeEnd)!;
+
+  const overview = (repo: CollectorRepository, agentId = "builder") => repo.getAgentOverview(agentId, rangeEnd)!;
+
+  it("separates the 24h and 7d windows", () => {
+    const repo = repository();
+    repo.upsertAgents([{ id: "builder", displayName: "Builder", kind: "agent", origin: "roster", observedAt: 1 }]);
+    repo.upsertMany(
+      [
+        run("today", "completed", rangeEnd - 60_000),
+        run("three-days-ago", "completed", rangeEnd - 3 * day),
+        run("three-weeks-ago", "completed", rangeEnd - 21 * day),
+      ],
+      ["test"],
+    );
+
+    const agent = overview(repo);
+    expect(agent.recent["24h"].completed).toBe(1);
+    expect(agent.recent["7d"].completed).toBe(2);
+  });
+
+  it("counts outcomes and derives a success rate", () => {
+    const repo = repository();
+    repo.upsertAgents([{ id: "builder", displayName: "Builder", kind: "agent", origin: "roster", observedAt: 1 }]);
+    repo.upsertMany(
+      [
+        run("ok-1", "completed", rangeEnd - 1_000),
+        run("ok-2", "completed", rangeEnd - 2_000),
+        run("ok-3", "completed", rangeEnd - 3_000),
+        run("bad-1", "failed", rangeEnd - 4_000),
+      ],
+      ["test"],
+    );
+
+    expect(overview(repo).recent["24h"]).toMatchObject({ completed: 4, succeeded: 3, failed: 1, successRate: 0.75 });
+  });
+
+  it("leaves the success rate undefined when nothing completed, rather than reporting zero", () => {
+    const repo = repository();
+    repo.upsertAgents([{ id: "quiet", displayName: "Quiet", kind: "agent", origin: "roster", observedAt: 1 }]);
+
+    const agent = overview(repo, "quiet");
+    expect(agent.recent["24h"].completed).toBe(0);
+    expect(agent.recent["24h"].successRate).toBeUndefined();
+    expect(agent.recent["7d"].successRate).toBeUndefined();
+  });
+
+  it("averages duration only over runs that reported both a start and an end", () => {
+    const repo = repository();
+    repo.upsertAgents([{ id: "builder", displayName: "Builder", kind: "agent", origin: "roster", observedAt: 1 }]);
+    repo.upsertMany(
+      [
+        run("timed-1", "completed", rangeEnd - 1_000, { startedAt: rangeEnd - 11_000 }),
+        run("timed-2", "completed", rangeEnd - 2_000, { startedAt: rangeEnd - 22_000 }),
+        run("untimed", "completed", rangeEnd - 3_000),
+      ],
+      ["test"],
+    );
+
+    const rollup = overview(repo).recent["24h"];
+    expect(rollup.completed).toBe(3);
+    expect(rollup.durationSampleCount).toBe(2);
+    expect(rollup.avgDurationMs).toBe(15_000);
+  });
+
+  it("leaves the average duration undefined when no run was timed", () => {
+    const repo = repository();
+    repo.upsertAgents([{ id: "builder", displayName: "Builder", kind: "agent", origin: "roster", observedAt: 1 }]);
+    repo.upsertMany([run("untimed", "completed", rangeEnd - 1_000)], ["test"]);
+
+    expect(overview(repo).recent["24h"].avgDurationMs).toBeUndefined();
+    expect(overview(repo).recent["24h"].durationSampleCount).toBe(0);
+  });
+
+  it("keeps rollups attributed to their own agent", () => {
+    const repo = repository();
+    repo.upsertAgents([
+      { id: "builder", displayName: "Builder", kind: "agent", origin: "roster", observedAt: 1 },
+      { id: "runner", displayName: "Runner", kind: "agent", origin: "roster", observedAt: 1 },
+    ]);
+    repo.upsertMany(
+      [
+        run("b-1", "completed", rangeEnd - 1_000),
+        run("r-1", "failed", rangeEnd - 1_000, { agentId: "runner" }),
+        run("r-2", "failed", rangeEnd - 2_000, { agentId: "runner" }),
+      ],
+      ["test"],
+    );
+
+    expect(overview(repo).recent["24h"]).toMatchObject({ completed: 1, succeeded: 1 });
+    expect(overview(repo, "runner").recent["24h"]).toMatchObject({ completed: 2, failed: 2, successRate: 0 });
+  });
+});
+
 describe("CollectorRepository change topics", () => {
   const session = (sessionKey: string): SessionWrite => ({
     sessionKey,

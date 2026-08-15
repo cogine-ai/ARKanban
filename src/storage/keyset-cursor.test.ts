@@ -38,6 +38,7 @@ describe("keyset cursor", () => {
 
   it("recognises only collected sorts", () => {
     expect(isSessionSort("lastActivity")).toBe(true);
-    expect(isSessionSort("cost")).toBe(false);
+    expect(isSessionSort("cost")).toBe(true);
+    expect(isSessionSort("grade")).toBe(false);
   });
 });

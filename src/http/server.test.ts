@@ -4,6 +4,7 @@ import path from "node:path";
 import type { FastifyInstance } from "fastify";
 import { afterEach, describe, expect, it } from "vitest";
 import { CollectorRuntime } from "../collector/runtime.js";
+import type { AgentOverview } from "../contracts.js";
 import type { ResolvedCollectorConfig } from "../config.js";
 import type { AgentWrite, SessionWrite } from "../storage/repository.js";
 import { createHttpServer } from "./server.js";
@@ -120,11 +121,11 @@ describe("sessions and agents HTTP API", () => {
 
   it("names the phase that will collect a sort it cannot serve yet", async () => {
     const app = await serverWith([]);
-    const response = await app.inject({ method: "GET", url: "/api/v1/sessions?sort=cost" });
+    const response = await app.inject({ method: "GET", url: "/api/v1/sessions?sort=grade" });
 
     expect(response.statusCode).toBe(400);
-    expect(response.json()).toMatchObject({ error: "sort_not_yet_collected", sort: "cost" });
-    expect(response.json().availableIn).toContain("S6");
+    expect(response.json()).toMatchObject({ error: "sort_not_yet_collected", sort: "grade" });
+    expect(response.json().availableIn).toContain("S7");
   });
 
   it("rejects unknown sorts, states and out-of-range limits", async () => {
@@ -329,5 +330,179 @@ describe("transcript HTTP API", () => {
     expect(response.statusCode).toBe(200);
     expect(response.json()).toMatchObject({ enabled: true, retentionDays: 180 });
     expect(response.body).not.toContain("登录接口");
+  });
+});
+
+describe("usage HTTP API", () => {
+  const NOW = 1_800_000_000_000;
+
+  async function serverWithUsage(): Promise<{ app: FastifyInstance; runtime: CollectorRuntime }> {
+    const { runtime, config } = runtimeFixture();
+    runtime.repository.upsertAgents([
+      { id: "builder", displayName: "Builder", kind: "agent", origin: "roster", observedAt: NOW },
+      { id: "quiet", displayName: "Quiet", kind: "agent", origin: "roster", observedAt: NOW },
+    ]);
+    runtime.repository.upsertSessions(
+      [
+        { sessionKey: "agent:builder:cheap", agentId: "builder" },
+        { sessionKey: "agent:builder:pricey", agentId: "builder" },
+        { sessionKey: "agent:quiet:1", agentId: "quiet" },
+      ].map((entry) => ({
+        ...entry,
+        label: entry.sessionKey,
+        kindHint: "main" as const,
+        archived: false,
+        hasActiveRun: false,
+        lineage: {},
+        lastActivityAt: NOW,
+        observedAt: NOW,
+        coverage: {
+          index: "live" as const,
+          detail: "not_observed" as const,
+          usage: "not_observed" as const,
+          messages: "not_observed" as const,
+        },
+      })),
+    );
+    runtime.repository.usage.record([
+      {
+        sessionKey: "agent:builder:cheap",
+        observedAt: NOW,
+        inputTokens: 100,
+        outputTokens: 20,
+        cacheReadTokens: 0,
+        cacheWriteTokens: 0,
+        costMicroUsd: 1_000,
+        hasCost: true,
+        models: ["sonnet"],
+        unpricedModels: [],
+      },
+      {
+        sessionKey: "agent:builder:pricey",
+        observedAt: NOW,
+        inputTokens: 900,
+        outputTokens: 200,
+        cacheReadTokens: 0,
+        cacheWriteTokens: 0,
+        costMicroUsd: 90_000,
+        hasCost: true,
+        models: ["opus"],
+        unpricedModels: [],
+      },
+    ]);
+    runtime.repository.setUsageCoverage("live");
+    const app = await createHttpServer(runtime, config);
+    cleanups.push(() => app.close());
+    return { app, runtime };
+  }
+
+  it("sorts sessions by the most recent cost reading", async () => {
+    const { app } = await serverWithUsage();
+    const response = await app.inject({ method: "GET", url: "/api/v1/sessions?sort=cost" });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json().items.map((row: { sessionKey: string }) => row.sessionKey)).toEqual([
+      "agent:builder:pricey",
+      "agent:builder:cheap",
+      "agent:quiet:1",
+    ]);
+  });
+
+  it("pages a cost sort without repeating the boundary row", async () => {
+    const { app } = await serverWithUsage();
+    const first = await app.inject({ method: "GET", url: "/api/v1/sessions?sort=cost&limit=1" });
+    const second = await app.inject({
+      method: "GET",
+      url: `/api/v1/sessions?sort=cost&limit=1&cursor=${encodeURIComponent(first.json().nextCursor)}`,
+    });
+
+    expect(first.json().items[0].sessionKey).toBe("agent:builder:pricey");
+    expect(second.json().items[0].sessionKey).toBe("agent:builder:cheap");
+  });
+
+  it("distinguishes a measured session from one that was never priced", async () => {
+    const { app } = await serverWithUsage();
+    const response = await app.inject({ method: "GET", url: "/api/v1/sessions?sort=cost" });
+    const rows = response.json().items as Array<{ sessionKey: string; coverage: { usage: string } }>;
+
+    expect(rows.find((row) => row.sessionKey === "agent:builder:cheap")?.coverage.usage).toBe("live");
+    expect(rows.find((row) => row.sessionKey === "agent:quiet:1")?.coverage.usage).toBe("not_observed");
+  });
+
+  it("attaches the latest reading to the session detail", async () => {
+    const { app } = await serverWithUsage();
+    const response = await app.inject({ method: "GET", url: "/api/v1/sessions/agent%3Abuilder%3Apricey" });
+
+    expect(response.json().usage).toMatchObject({ inputTokens: 900, costMicroUsd: 90_000, hasCost: true });
+  });
+
+  it("gives each agent card its own windows and coverage", async () => {
+    const { app } = await serverWithUsage();
+    const response = await app.inject({ method: "GET", url: "/api/v1/agents" });
+    const agents = response.json().agents as Array<{
+      id: string;
+      cost: { coverage: string; windows: Record<string, { costMicroUsd?: number; sessionCount: number }> };
+    }>;
+
+    expect(agents.find((agent) => agent.id === "builder")?.cost).toMatchObject({ coverage: "live" });
+    expect(agents.find((agent) => agent.id === "builder")?.cost.windows["24h"]).toMatchObject({
+      costMicroUsd: 91_000,
+      sessionCount: 2,
+    });
+    // A quiet agent reports zero sessions rather than being dropped, so the card
+    // can say "nothing spent" instead of going blank.
+    expect(agents.find((agent) => agent.id === "quiet")?.cost.windows["24h"].sessionCount).toBe(0);
+  });
+
+  it("takes the Gateway's amount without inheriting a completeness it cannot have", async () => {
+    const { app, runtime } = await serverWithUsage();
+    runtime.repository.usage.record([
+      {
+        sessionKey: "agent:builder:cheap",
+        observedAt: NOW + 1,
+        inputTokens: 100,
+        outputTokens: 20,
+        cacheReadTokens: 0,
+        cacheWriteTokens: 0,
+        hasCost: false,
+        models: ["local-llm"],
+        unpricedModels: ["local-llm"],
+      },
+    ]);
+    // Stands in for a `usage.cost` reply, which prices a range but says nothing
+    // about the models it failed to price.
+    Object.defineProperty(runtime, "getAgentCost", { value: () => 50_000 });
+
+    const response = await app.inject({ method: "GET", url: "/api/v1/agents" });
+    const builder = (response.json().agents as AgentOverview[]).find((agent) => agent.id === "builder");
+
+    expect(builder?.cost.source).toBe("gateway");
+    expect(builder?.cost.windows["24h"]).toMatchObject({
+      costMicroUsd: 50_000,
+      hasCost: false,
+      unpricedModels: ["local-llm"],
+    });
+  });
+
+  it("summarises a range by agent and model", async () => {
+    const { app } = await serverWithUsage();
+    const response = await app.inject({ method: "GET", url: `/api/v1/usage/summary?from=${NOW - 1_000}&to=${NOW}` });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toMatchObject({ coverage: "live", totals: { costMicroUsd: 91_000, sessionCount: 2 } });
+    expect(response.json().byAgent).toEqual([{ agentId: "builder", totals: expect.objectContaining({ costMicroUsd: 91_000 }) }]);
+    expect(response.json().byModel.map((entry: { model: string }) => entry.model).sort()).toEqual(["opus", "sonnet"]);
+  });
+
+  it("defaults the summary to the last day and rejects a reversed range", async () => {
+    const { app } = await serverWithUsage();
+
+    const defaulted = await app.inject({ method: "GET", url: "/api/v1/usage/summary" });
+    expect(defaulted.statusCode).toBe(200);
+    expect(defaulted.json().to - defaulted.json().from).toBe(24 * 60 * 60 * 1_000);
+
+    const reversed = await app.inject({ method: "GET", url: `/api/v1/usage/summary?from=${NOW}&to=${NOW - 1}` });
+    expect(reversed.statusCode).toBe(400);
+    expect((await app.inject({ method: "GET", url: "/api/v1/usage/summary?from=yesterday" })).statusCode).toBe(400);
   });
 });

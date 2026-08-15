@@ -11,7 +11,7 @@
  * nonsense page, so decoding rejects the mismatch instead.
  */
 
-export const SESSION_SORTS = ["lastActivity", "duration"] as const;
+export const SESSION_SORTS = ["lastActivity", "duration", "cost"] as const;
 
 export type SessionSort = (typeof SESSION_SORTS)[number];
 
@@ -21,7 +21,6 @@ export type SessionSort = (typeof SESSION_SORTS)[number];
  * different order, which would look like a working sort returning wrong results.
  */
 export const DEFERRED_SESSION_SORTS: Record<string, string> = {
-  cost: "S6 (sessions.usage collection)",
   grade: "S7 (derived session signals)",
 };
 

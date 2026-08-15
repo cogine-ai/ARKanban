@@ -2,7 +2,13 @@ import { existsSync } from "node:fs";
 import path from "node:path";
 import fastifyStatic from "@fastify/static";
 import Fastify, { LogController, type FastifyInstance } from "fastify";
-import type { CollectorChange, CollectorStatus, SettledRange } from "../contracts.js";
+import type {
+  AgentOverview,
+  CollectorChange,
+  CollectorStatus,
+  SettledRange,
+  UsageSummary,
+} from "../contracts.js";
 import type { CollectorRuntime } from "../collector/runtime.js";
 import type { ResolvedCollectorConfig } from "../config.js";
 import type { SessionStateFilter } from "../storage/repository.js";
@@ -21,6 +27,7 @@ const ACTIVITY_PAGE_LIMIT_MAX = 500;
 const MESSAGE_PAGE_LIMIT_DEFAULT = 200;
 const MESSAGE_PAGE_LIMIT_MAX = 500;
 const MESSAGE_SEARCH_LIMIT_DEFAULT = 50;
+const USAGE_SUMMARY_DEFAULT_MS = 24 * 60 * 60 * 1_000;
 const SESSION_STATES: readonly SessionStateFilter[] = ["active", "terminal", "archived"];
 
 function sseEvent(event: string, data: unknown): string {
@@ -56,6 +63,27 @@ function parseTimestamp(raw: string | undefined): number | undefined | null {
 /** Same three-way contract, for a message sequence number rather than a time. */
 function parseSeq(raw: string | undefined): number | undefined | null {
   return parseTimestamp(raw);
+}
+
+/**
+ * Overlays the Gateway's ranged pricing onto an agent card.
+ *
+ * `usage.cost` prices a whole range at once, so it is the better figure than
+ * one summed from per-session readings taken at different moments. Only the
+ * amount is replaced: whether the total is complete is decided by the models
+ * `sessions.usage` could not price, and a ranged total cannot have priced a
+ * model that the per-session read already reported as unpriced.
+ */
+function withGatewayCost(runtime: CollectorRuntime, agent: AgentOverview): AgentOverview {
+  const windows = { ...agent.cost.windows };
+  let overlaid = false;
+  for (const window of ["24h", "7d"] as const) {
+    const priced = runtime.getAgentCost(window, agent.id);
+    if (priced === undefined) continue;
+    windows[window] = { ...windows[window], costMicroUsd: priced };
+    overlaid = true;
+  }
+  return overlaid ? { ...agent, cost: { ...agent.cost, source: "gateway", windows } } : agent;
 }
 
 function settledRange(value: string | undefined): SettledRange | undefined {
@@ -123,11 +151,14 @@ export async function createHttpServer(
     return detail;
   });
 
-  app.get("/api/v1/agents", async () => ({ agents: runtime.repository.listAgentOverviews() }));
+  app.get("/api/v1/agents", async () => ({
+    agents: runtime.repository.listAgentOverviews().map((agent) => withGatewayCost(runtime, agent)),
+  }));
 
   app.get<{ Params: { id: string } }>("/api/v1/agents/:id", async (request, reply) => {
-    const agent = runtime.repository.getAgentOverview(request.params.id);
-    if (!agent) return reply.code(404).send({ error: "agent_not_found" });
+    const found = runtime.repository.getAgentOverview(request.params.id);
+    if (!found) return reply.code(404).send({ error: "agent_not_found" });
+    const agent = withGatewayCost(runtime, found);
     return {
       agent,
       sessions: runtime.repository.listSessionsPage({
@@ -199,7 +230,8 @@ export async function createHttpServer(
   app.get<{ Params: { key: string } }>("/api/v1/sessions/:key", async (request, reply) => {
     const session = runtime.repository.getSession(request.params.key);
     if (!session) return reply.code(404).send({ error: "session_not_found" });
-    return session;
+    const usage = runtime.repository.usage.latest(request.params.key);
+    return { ...session, ...(usage ? { usage } : {}) };
   });
 
   app.get<{ Params: { key: string }; Querystring: { limit?: string } }>(
@@ -297,6 +329,32 @@ export async function createHttpServer(
     maxBytes: runtime.config.storage.transcriptMaxBytes,
     ...runtime.repository.transcripts.totals(),
   }));
+
+  /**
+   * Ranged token and cost totals.
+   *
+   * Defaults to the last 24 hours because an unbounded default would scan the
+   * whole archive on a page load.
+   */
+  app.get<{ Querystring: { from?: string; to?: string } }>("/api/v1/usage/summary", async (request, reply) => {
+    const from = parseTimestamp(request.query.from);
+    const to = parseTimestamp(request.query.to);
+    if (from === null || to === null) return reply.code(400).send({ error: "invalid_time_range" });
+
+    const rangeEnd = to ?? Date.now();
+    const rangeStart = from ?? rangeEnd - USAGE_SUMMARY_DEFAULT_MS;
+    if (rangeStart > rangeEnd) return reply.code(400).send({ error: "invalid_time_range" });
+
+    const { totals, byAgent, byModel } = runtime.repository.usage.summary(rangeStart, rangeEnd);
+    return {
+      from: rangeStart,
+      to: rangeEnd,
+      coverage: runtime.repository.getUsageCoverage(),
+      totals,
+      byAgent: [...byAgent].map(([agentId, agentTotals]) => ({ agentId, totals: agentTotals })),
+      byModel: [...byModel].map(([model, modelTotals]) => ({ model, totals: modelTotals })),
+    } satisfies UsageSummary;
+  });
 
   app.get("/api/v1/events", async (request, reply) => {
     reply.hijack();

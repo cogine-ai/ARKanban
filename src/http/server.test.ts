@@ -24,6 +24,9 @@ function runtimeFixture(retentionDays = 30): { runtime: CollectorRuntime; config
       terminalRetentionDays: retentionDays,
       usageRetentionDays: 14,
       sessionRetentionDays: 90,
+      transcriptRetentionDays: 180,
+      transcriptMaxBytes: 64 * 1024 * 1024,
+      transcriptSync: "enabled",
     },
     reconcile: { tasksMs: 15_000, sessionsMs: 8_000 },
     ui: { recentLimit: 200 },
@@ -189,5 +192,142 @@ describe("sessions and agents HTTP API", () => {
     expect(response.json().sessions.items).toHaveLength(1);
 
     expect((await app.inject({ method: "GET", url: "/api/v1/agents/ghost" })).statusCode).toBe(404);
+  });
+});
+
+describe("transcript HTTP API", () => {
+  async function serverWithTranscript(): Promise<FastifyInstance> {
+    const { runtime, config } = runtimeFixture();
+    runtime.repository.upsertSessions([
+      {
+        sessionKey: "agent:builder:1",
+        agentId: "builder",
+        label: "Login latency",
+        kindHint: "main",
+        archived: false,
+        hasActiveRun: false,
+        lineage: {},
+        lastActivityAt: 5_000,
+        observedAt: 5_000,
+        coverage: { index: "live", detail: "not_observed", usage: "not_observed", messages: "live" },
+      },
+    ]);
+    runtime.repository.transcripts.append([
+      {
+        sessionKey: "agent:builder:1",
+        seq: 0,
+        role: "user",
+        content: "登录接口最近的失败率有点高",
+        createdAt: 1_000,
+        observedAt: 1_000,
+      },
+      {
+        sessionKey: "agent:builder:1",
+        seq: 1,
+        role: "assistant",
+        content: "Checking the login endpoint timeouts now",
+        createdAt: 2_000,
+        observedAt: 2_000,
+      },
+    ]);
+    runtime.repository.transcripts.recordSync({
+      sessionKey: "agent:builder:1",
+      complete: true,
+      syncedAt: 9_000,
+    });
+    const app = await createHttpServer(runtime, config);
+    cleanups.push(() => app.close());
+    return app;
+  }
+
+  it("serves archived messages together with the sync watermark", async () => {
+    const app = await serverWithTranscript();
+    const response = await app.inject({ method: "GET", url: "/api/v1/sessions/agent%3Abuilder%3A1/messages" });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json().messages).toHaveLength(2);
+    // Without the watermark a stale local copy would read as live content.
+    expect(response.json().sync).toMatchObject({ syncedCount: 2, complete: true, syncedAt: 9_000 });
+  });
+
+  it("still reports the watermark when a sequence bound excludes every message", async () => {
+    const app = await serverWithTranscript();
+    const response = await app.inject({
+      method: "GET",
+      url: "/api/v1/sessions/agent%3Abuilder%3A1/messages?afterSeq=1",
+    });
+
+    expect(response.json().messages).toHaveLength(0);
+    expect(response.json().sync).toMatchObject({ sessionKey: "agent:builder:1" });
+  });
+
+  it("404s for a session the archive has never seen", async () => {
+    const app = await serverWithTranscript();
+    expect((await app.inject({ method: "GET", url: "/api/v1/sessions/ghost/messages" })).statusCode).toBe(404);
+  });
+
+  it("rejects a malformed sequence bound rather than ignoring it", async () => {
+    const app = await serverWithTranscript();
+    const response = await app.inject({
+      method: "GET",
+      url: "/api/v1/sessions/agent%3Abuilder%3A1/messages?afterSeq=start",
+    });
+
+    expect(response.statusCode).toBe(400);
+    expect(response.json()).toMatchObject({ error: "invalid_after_seq" });
+  });
+
+  it("matches a Chinese phrase through the trigram index", async () => {
+    const app = await serverWithTranscript();
+    const response = await app.inject({
+      method: "GET",
+      url: `/api/v1/search/messages?q=${encodeURIComponent("登录接口")}`,
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json().mode).toBe("fts");
+    expect(response.json().hits).toHaveLength(1);
+    expect(response.json().hits[0]).toMatchObject({ agentId: "builder", sessionLabel: "Login latency" });
+  });
+
+  it("falls back to a scan for a short query once a filter has narrowed it", async () => {
+    const app = await serverWithTranscript();
+    const response = await app.inject({
+      method: "GET",
+      url: `/api/v1/search/messages?q=${encodeURIComponent("登录")}&agentId=builder`,
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json().mode).toBe("fallback");
+    expect(response.json().hits).toHaveLength(1);
+  });
+
+  it("refuses a short query with nothing to narrow it instead of scanning everything", async () => {
+    const app = await serverWithTranscript();
+    const response = await app.inject({
+      method: "GET",
+      url: `/api/v1/search/messages?q=${encodeURIComponent("登录")}`,
+    });
+
+    expect(response.statusCode).toBe(400);
+    expect(response.json()).toMatchObject({ error: "query_too_short", minLength: 3 });
+  });
+
+  it("rejects an empty query and an unparseable time bound", async () => {
+    const app = await serverWithTranscript();
+
+    expect((await app.inject({ method: "GET", url: "/api/v1/search/messages?q=%20" })).statusCode).toBe(400);
+    expect(
+      (await app.inject({ method: "GET", url: "/api/v1/search/messages?q=login&from=yesterday" })).statusCode,
+    ).toBe(400);
+  });
+
+  it("reports archive settings without exposing any message text", async () => {
+    const app = await serverWithTranscript();
+    const response = await app.inject({ method: "GET", url: "/api/v1/transcripts/status" });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toMatchObject({ enabled: true, retentionDays: 180 });
+    expect(response.body).not.toContain("登录接口");
   });
 });

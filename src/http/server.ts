@@ -12,11 +12,15 @@ import {
   isSessionSort,
   SESSION_SORTS,
 } from "../storage/keyset-cursor.js";
+import { MIN_FTS_QUERY_LENGTH } from "../storage/transcript-archive.js";
 
 const SESSION_PAGE_LIMIT_DEFAULT = 50;
 const SESSION_PAGE_LIMIT_MAX = 200;
 const ACTIVITY_PAGE_LIMIT_DEFAULT = 100;
 const ACTIVITY_PAGE_LIMIT_MAX = 500;
+const MESSAGE_PAGE_LIMIT_DEFAULT = 200;
+const MESSAGE_PAGE_LIMIT_MAX = 500;
+const MESSAGE_SEARCH_LIMIT_DEFAULT = 50;
 const SESSION_STATES: readonly SessionStateFilter[] = ["active", "terminal", "archived"];
 
 function sseEvent(event: string, data: unknown): string {
@@ -47,6 +51,11 @@ function parseTimestamp(raw: string | undefined): number | undefined | null {
   if (raw === undefined) return undefined;
   const parsed = Number(raw);
   return Number.isSafeInteger(parsed) && parsed >= 0 ? parsed : null;
+}
+
+/** Same three-way contract, for a message sequence number rather than a time. */
+function parseSeq(raw: string | undefined): number | undefined | null {
+  return parseTimestamp(raw);
 }
 
 function settledRange(value: string | undefined): SettledRange | undefined {
@@ -206,6 +215,88 @@ export async function createHttpServer(
       return { activities: runtime.repository.listSessionActivities(request.params.key, limit) };
     },
   );
+
+  /**
+   * Reads the local archive only. It never falls back to the Gateway, which is
+   * what lets the transcript stay readable while the connection is down — and
+   * why the sync watermark ships with every page instead of being optional.
+   */
+  app.get<{ Params: { key: string }; Querystring: { afterSeq?: string; limit?: string } }>(
+    "/api/v1/sessions/:key/messages",
+    async (request, reply) => {
+      if (!runtime.repository.getSession(request.params.key)) {
+        return reply.code(404).send({ error: "session_not_found" });
+      }
+      const limit = parseLimit(request.query.limit, MESSAGE_PAGE_LIMIT_MAX, MESSAGE_PAGE_LIMIT_DEFAULT);
+      if (limit === undefined) {
+        return reply.code(400).send({ error: "invalid_limit", min: 1, max: MESSAGE_PAGE_LIMIT_MAX });
+      }
+      const afterSeq = parseSeq(request.query.afterSeq);
+      if (afterSeq === null) return reply.code(400).send({ error: "invalid_after_seq" });
+
+      const messages = runtime.repository.transcripts.listMessages(request.params.key, {
+        ...(afterSeq !== undefined ? { afterSeq } : {}),
+        limit,
+      });
+      return {
+        messages,
+        sync: runtime.repository.transcripts.syncState(request.params.key) ?? {
+          sessionKey: request.params.key,
+          syncedCount: 0,
+          syncedBytes: 0,
+          complete: false,
+        },
+      };
+    },
+  );
+
+  app.get<{
+    Querystring: { q?: string; agentId?: string; sessionKey?: string; from?: string; to?: string; limit?: string };
+  }>("/api/v1/search/messages", async (request, reply) => {
+    const text = request.query.q?.trim();
+    if (!text) return reply.code(400).send({ error: "missing_query" });
+
+    const limit = parseLimit(request.query.limit, MESSAGE_PAGE_LIMIT_MAX, MESSAGE_SEARCH_LIMIT_DEFAULT);
+    if (limit === undefined) {
+      return reply.code(400).send({ error: "invalid_limit", min: 1, max: MESSAGE_PAGE_LIMIT_MAX });
+    }
+    const from = parseTimestamp(request.query.from);
+    const to = parseTimestamp(request.query.to);
+    if (from === null || to === null) return reply.code(400).send({ error: "invalid_time_range" });
+
+    const narrowed = request.query.agentId !== undefined || request.query.sessionKey !== undefined || from !== undefined;
+    // A query too short for the trigram index can only be served by a LIKE scan.
+    // Refusing the unnarrowed case is deliberate: the alternative is a full-archive
+    // scan that looks like a hang.
+    if ([...text].length < MIN_FTS_QUERY_LENGTH && !narrowed) {
+      return reply.code(400).send({
+        error: "query_too_short",
+        minLength: MIN_FTS_QUERY_LENGTH,
+        hint: "Filter by agentId, sessionKey or a time range to search a shorter string",
+      });
+    }
+
+    return runtime.repository.transcripts.search({
+      text,
+      ...(request.query.agentId !== undefined ? { agentId: request.query.agentId } : {}),
+      ...(request.query.sessionKey !== undefined ? { sessionKey: request.query.sessionKey } : {}),
+      ...(from !== undefined ? { from } : {}),
+      ...(to !== undefined ? { to } : {}),
+      limit,
+    });
+  });
+
+  /**
+   * Backs the standing disclosure that full conversation text is stored on this
+   * machine. Counts and settings only — never a fragment of the text itself.
+   */
+  app.get("/api/v1/transcripts/status", async () => ({
+    sync: runtime.getTranscriptStatus() ?? null,
+    enabled: runtime.config.storage.transcriptSync === "enabled",
+    retentionDays: runtime.config.storage.transcriptRetentionDays,
+    maxBytes: runtime.config.storage.transcriptMaxBytes,
+    ...runtime.repository.transcripts.totals(),
+  }));
 
   app.get("/api/v1/events", async (request, reply) => {
     reply.hijack();

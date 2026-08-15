@@ -309,6 +309,13 @@ button { color: inherit; }
 .agent-rollup tbody td { color: var(--ink); font-size: 10px; }
 .agent-rollup tbody tr + tr th, .agent-rollup tbody tr + tr td { border-top: 1px solid var(--line); }
 .agent-next span:last-child { color: var(--secondary); font-size: 10px; }
+.cost-note { color: var(--tertiary); font-weight: 600; letter-spacing: 0; text-transform: none; }
+.cost-empty { font-size: 10px; }
+.agent-cost .muted { color: var(--tertiary); }
+.cost-windows { display: flex; gap: 18px; font-variant-numeric: tabular-nums; }
+.cost-window { display: grid; gap: 1px; }
+.cost-window small { color: var(--tertiary); font-size: 9px; }
+.cost-window b { color: var(--ink); font-size: 13px; font-weight: 640; }
 .agent-card-foot { margin-top: auto; padding-top: 9px; display: flex; align-items: center; justify-content: space-between; gap: 10px; border-top: 1px solid var(--line); font-size: 9px; }
 .agent-card-foot .muted { color: var(--tertiary); }
 .agent-seen { color: var(--secondary); }

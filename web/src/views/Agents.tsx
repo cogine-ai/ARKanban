@@ -1,8 +1,23 @@
 import { useMemo, useState } from "react";
-import type { ActivitySnapshot, AgentOverview, AgentRollupWindow, UpcomingSchedule } from "../../../src/contracts";
+import type {
+  ActivitySnapshot,
+  AgentOverview,
+  AgentRollupWindow,
+  SessionUsageCoverage,
+  UpcomingSchedule,
+} from "../../../src/contracts";
 import { useScheduleNow } from "../hooks/use-schedule-now";
 import { AGENT_COLORS } from "../lib/board";
-import { formatDuration, formatPercent, formatRelative, formatScheduleRelative, hash, shortAgent } from "../lib/format";
+import {
+  formatCost,
+  formatDuration,
+  formatPercent,
+  formatRelative,
+  formatScheduleRelative,
+  formatTokens,
+  hash,
+  shortAgent,
+} from "../lib/format";
 import { useAgents } from "../state/use-agents";
 import { useCollector } from "../state/collector-context";
 
@@ -26,6 +41,57 @@ function liveCountsByAgent(snapshot: ActivitySnapshot | undefined): Map<string, 
   }
   for (const schedule of snapshot?.schedule.items ?? []) of(schedule.agentId).schedules.push(schedule);
   return byAgent;
+}
+
+/**
+ * Why a card has no cost to show. Each state is a different instruction to the
+ * reader, so none of them may render as `$0`.
+ */
+const COST_UNAVAILABLE: Partial<Record<SessionUsageCoverage, string>> = {
+  not_observed: "Usage not collected yet",
+  unavailable: "Gateway does not report usage",
+  unauthorized: "Token lacks usage scope",
+  error: "Usage read failed",
+};
+
+function AgentCost({ cost }: { cost: AgentOverview["cost"] }) {
+  const blocked = COST_UNAVAILABLE[cost.coverage];
+  const measured = ROLLUP_WINDOWS.some((window) => cost.windows[window].sessionCount > 0);
+
+  return (
+    <div className="agent-section agent-cost" data-coverage={cost.coverage}>
+      <span className="eyebrow">
+        COST
+        {cost.coverage === "snapshot" ? (
+          <span className="cost-note" title="More sessions were due than one round could read; some figures are from an earlier reading">
+            {" "}snapshot
+          </span>
+        ) : null}
+      </span>
+      {blocked && !measured ? (
+        <span className="cost-empty muted">{blocked}</span>
+      ) : (
+        <div className="cost-windows">
+          {ROLLUP_WINDOWS.map((window) => {
+            const totals = cost.windows[window];
+            const tokens = totals.inputTokens + totals.outputTokens;
+            return (
+              <span key={window} className="cost-window" data-window={window}>
+                <small>{window}</small>
+                <b title={totals.hasCost ? undefined : `At least this much; no price for ${totals.unpricedModels.join(", ") || "some models"}`}>
+                  {formatCost(totals.costMicroUsd)}
+                  {totals.hasCost ? "" : "+"}
+                </b>
+                <small title={`${tokens.toLocaleString()} tokens across ${totals.sessionCount} sessions`}>
+                  {formatTokens(tokens)} tok
+                </small>
+              </span>
+            );
+          })}
+        </div>
+      )}
+    </div>
+  );
 }
 
 function AgentCard({ agent, live }: { agent: AgentOverview; live: LiveCounts }) {
@@ -98,10 +164,9 @@ function AgentCard({ agent, live }: { agent: AgentOverview; live: LiveCounts }) 
         </span>
       </div>
 
+      <AgentCost cost={agent.cost} />
+
       <footer className="agent-card-foot">
-        {/* Usage collection lands with the cost view; showing 0 here would read
-            as "this agent cost nothing", which is a different claim. */}
-        <span className="agent-cost muted">Usage not collected</span>
         <span className="agent-seen">{agent.lastSessionActivityAt ? `Active ${formatRelative(agent.lastSessionActivityAt)}` : "No session observed"}</span>
       </footer>
     </article>

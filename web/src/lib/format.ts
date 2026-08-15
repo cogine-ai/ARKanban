@@ -69,6 +69,29 @@ export function formatBytes(value: number): string {
   return `${scaled < 10 ? scaled.toFixed(1) : Math.round(scaled)} ${units[unit]}`;
 }
 
+/**
+ * Renders integer micro-USD as money.
+ *
+ * Sub-cent amounts keep more decimals rather than rounding to $0.00, since a
+ * cheap run and a free one are different facts and the card is where the
+ * difference is read.
+ */
+export function formatCost(microUsd?: number): string {
+  if (microUsd === undefined) return "—";
+  const usd = microUsd / 1_000_000;
+  if (usd === 0) return "$0";
+  if (usd < 0.01) return `$${usd.toFixed(4)}`;
+  if (usd < 100) return `$${usd.toFixed(2)}`;
+  return `$${Math.round(usd).toLocaleString()}`;
+}
+
+/** Compact token counts; the exact figure belongs in a tooltip, not the card. */
+export function formatTokens(value: number): string {
+  if (value < 1_000) return String(value);
+  if (value < 1_000_000) return `${(value / 1_000).toFixed(value < 10_000 ? 1 : 0)}k`;
+  return `${(value / 1_000_000).toFixed(value < 10_000_000 ? 1 : 0)}M`;
+}
+
 /** Renders an em dash for "not measured", which is not the same as 0%. */
 export function formatPercent(value?: number): string {
   if (value === undefined) return "—";

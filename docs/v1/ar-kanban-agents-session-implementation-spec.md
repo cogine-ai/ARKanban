@@ -211,6 +211,15 @@ sessions.list 分页
 
 会话进入 terminal 且已采过一次用量后，不再定期刷新，只在用户打开详情时按需刷新一次。
 
+实现补充（S6）：
+
+- 每个候选发一次 `sessions.usage`，与 §9.1 的开销模型一致；投影器同时接受单行、列表与「以 sessionKey 为键」三种回包形状，字段走 `USAGE_FIELD_ALIASES` 别名表。
+- 补采（`stale`）单独限额 20 个，与 100 的总限额分开算。否则几千个闲置会话的长尾会把用户正在看的活跃会话挤出本轮。
+- coverage 由本轮结果决定：全部请求失败才是 `error`，只要有一个成功就按 `demand > limit ? "snapshot" : "live"` 取值。单个会话抖动不应该把整张成本卡涂成故障。
+- §2.2 的 `SessionCoverage.usage` 联合类型原本没有 `snapshot`，与本节要求矛盾，已按本节补齐。
+- 快照是**累计读数**而非增量，因此任何聚合都取每个会话的最新一行，绝不对多行求和。
+- `usage.cost` 按 300s 独立节奏刷新，结果只驻内存：它是对某个区间的交叉校验，落库会造出第二份可能与快照冲突的成本口径。重连即失效。
+
 ### 3.4 能力探测
 
 `sessions.usage`、`sessions.usage.timeseries`、`usage.cost` 不在 hello 的发现列表中，按 v1.1 修订 §4.3 处理：
@@ -452,6 +461,13 @@ CREATE INDEX idx_activities_session_ref ON activities(session_ref);
 
 `sessionRetentionDays` 必须显著大于 `terminalRetentionDays`，否则会话档案会跟着 Activity 一起断片。配置校验强制 `sessionRetentionDays >= terminalRetentionDays`。
 
+用量 rollup 的实现细节（S6）：
+
+- 顺序上用量必须先折叠再删会话。rollup 要通过 session 行拿到 `agent_id`，先删会话会让这段花费变成无归属的孤儿。
+- 每个「会话 × 天」只折叠当天最后一条快照，同样因为快照是累计值。rollup 行按 `(day, agent_id, model)` 覆盖写入，同一天重复折叠是幂等的。
+- 一个会话可能跨多个模型，而累计读数无法拆分到单个模型，因此多模型会话在 rollup 里落在一个合并标签（`a+b`）下，不做重复计数。
+- `usage_daily_rollup` 没有 `has_cost` 列，所以「这一桶从未定价」只能用 `cost_micro_usd IS NULL` 表达。日内部分定价的细节会在跨过折叠地平线后丢失，总额退化为下界。
+
 正文按时间与容量双闸门裁剪。容量驱逐以整个会话为单位而不是单条消息，避免留下一半的对话——半截 transcript 在回顾场景里几乎没有价值，还会让搜索结果产生误导。
 
 ## 5. HTTP API
@@ -467,7 +483,7 @@ CREATE INDEX idx_activities_session_ref ON activities(session_ref);
 | `GET /api/v1/sessions/:key/activities` | 该会话下的 Activity 时间线 |
 | `GET /api/v1/sessions/:key/messages` | 本地归档的会话正文，带同步水位，见第 7 节 |
 | `GET /api/v1/search/messages` | 跨会话全文检索，见第 7 节 |
-| `GET /api/v1/usage/summary` | 按范围的成本与 token 汇总 |
+| `GET /api/v1/usage/summary` | 按范围的成本与 token 汇总，默认最近 24h，按 agent 与 model 分组 |
 
 ### 5.1.1 Agent 汇总卡的近期 rollup
 
@@ -489,6 +505,20 @@ recent: Record<"24h" | "7d", {
 
 平均时长只统计同时观测到 `started_at` 与 `ended_at` 的运行，并暴露 `durationSampleCount` 让调用方判断这个均值的代表性。回退到 `updated_at` 会让 reconcile 的节奏而不是运行本身决定这个数字。
 
+### 5.1.2 Agent 汇总卡的成本段（S6）
+
+```ts
+cost: {
+  coverage: SessionUsageCoverage;
+  source: "gateway" | "snapshots";
+  windows: Record<"24h" | "7d", UsageTotals>;
+}
+```
+
+`source` 必须暴露，因为同一笔花费有两个来源：`usage.cost` 按区间一次定价，`sessions.usage` 按会话逐个定价。卡片优先用前者（一次定价整个区间，比把不同时刻的读数相加更准），`/api/v1/usage/summary` 只报后者。两者不一致时，`source` 是唯一能解释差异的线索。
+
+但覆盖只替换金额，不替换 `hasCost`。区间定价不可能定出 `sessions.usage` 自己都报为未定价的模型，把 `hasCost` 一并设成 true 会让一个下界读起来像完整值——这正是 §2.3 禁止的那种塌缩。
+
 ### 5.2 会话列表分页
 
 ```text
@@ -509,6 +539,8 @@ GET /api/v1/sessions
 游标内嵌它被签发时的排序键。把 `lastActivity` 的游标喂给 `duration` 扫描会比较两个不同量纲的值，静默产出一页错乱结果，因此解码时直接拒绝这种错配，返回 `invalid_cursor` 而不是从第一页重来——后者会在无限滚动中重复用户已经看过的行。
 
 `cost` 与 `grade` 的排序在 S3 阶段返回 400 `sort_not_yet_collected`，并在响应里注明数据将由哪个分片采集（分别是 S6、S7）。不做静默降级到 `lastActivity`：那会让调用方以为排序生效了，只是结果不对。
+
+S6 起 `cost` 已可用，取每个会话最新快照的 `cost_micro_usd`。倒序扫描要求每行都有数值，因此从未定价的会话按 0 参与排序、落在末尾；该行自己的 `coverage.usage` 才是「这个 0 不是测量值」的依据。`grade` 仍然被拒绝。
 
 **会话列表不进入 `ActivitySnapshot`。** 现有 snapshot 是全量下发模型，把上千会话塞进去会让每次 SSE invalidate 都产生一次全量传输。
 

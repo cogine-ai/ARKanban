@@ -9,6 +9,7 @@ import type {
   AgentKind,
   AgentOrigin,
   AgentSummary,
+  ChangeTopic,
   EvidenceState,
   LaneSummary,
   ObservationView,
@@ -27,11 +28,13 @@ import type {
 } from "../contracts.js";
 import { agentIdFromSessionKey, type ActivityWrite } from "../activity/projector.js";
 import { applyMigrations, type MigrationResult } from "./migrations.js";
+import { encodeCursor, type KeysetCursor, type SessionSort } from "./keyset-cursor.js";
 import { TranscriptArchive } from "./transcript-archive.js";
 
 export type RepositoryChange = {
   epoch: string;
   revision: number;
+  topics: ChangeTopic[];
   ids: string[];
   reasons: string[];
 };
@@ -78,6 +81,36 @@ export type SessionListQuery = {
   agentId?: string;
   includeArchived?: boolean;
   limit?: number;
+};
+
+/**
+ * `active` and `archived` are read straight off the row. `terminal` is the
+ * remainder — observed, not archived, nothing running — which is a real state
+ * the schema stores no column for.
+ */
+export type SessionStateFilter = "active" | "terminal" | "archived";
+
+export type SessionPageQuery = {
+  agentId?: string;
+  state?: SessionStateFilter;
+  since?: number;
+  until?: number;
+  sort: SessionSort;
+  limit: number;
+  cursor?: KeysetCursor;
+};
+
+export type SessionPage = {
+  items: SessionSummary[];
+  nextCursor?: string;
+};
+
+export type AgentOverview = AgentSummary & {
+  sessionCount: number;
+  activeSessionCount: number;
+  archivedSessionCount: number;
+  activityCount: number;
+  lastSessionActivityAt?: number;
 };
 
 type ActivityRow = Record<string, unknown>;
@@ -888,6 +921,10 @@ export class CollectorRepository {
       this.db.exec("ROLLBACK");
       throw error;
     }
+    if (changed > 0) {
+      this.bumpRevision();
+      this.emit([], ["agents_upserted"], ["agents"]);
+    }
     return changed;
   }
 
@@ -983,6 +1020,12 @@ export class CollectorRepository {
       this.db.exec("ROLLBACK");
       throw error;
     }
+    // Reconciles run every few seconds and are usually no-ops, so only a real
+    // fingerprint change earns a revision bump and an invalidate frame.
+    if (changed > 0) {
+      this.bumpRevision();
+      this.emit([], ["sessions_upserted"], ["sessions"]);
+    }
     return changed;
   }
 
@@ -1016,6 +1059,130 @@ export class CollectorRepository {
       `)
       .all(...parameters) as ActivityRow[];
     return rows.map(rowToSessionSummary);
+  }
+
+  /**
+   * Keyset-paginated session list.
+   *
+   * Fetches one row beyond the limit to decide whether a next page exists,
+   * which avoids a second COUNT query whose answer would already be stale by
+   * the time the page is served.
+   */
+  listSessionsPage(query: SessionPageQuery): SessionPage {
+    const conditions: string[] = [];
+    const parameters: Array<string | number> = [];
+
+    if (query.agentId !== undefined) {
+      conditions.push("s.agent_id = ?");
+      parameters.push(query.agentId);
+    }
+    if (query.state === "active") conditions.push("s.archived = 0 AND s.has_active_run = 1");
+    else if (query.state === "terminal") conditions.push("s.archived = 0 AND s.has_active_run = 0");
+    else if (query.state === "archived") conditions.push("s.archived = 1");
+    if (query.since !== undefined) {
+      conditions.push("s.last_activity_at >= ?");
+      parameters.push(query.since);
+    }
+    if (query.until !== undefined) {
+      conditions.push("s.last_activity_at <= ?");
+      parameters.push(query.until);
+    }
+
+    // Sorting on an expression requires the cursor comparison to repeat that
+    // exact expression, so both are derived from one definition.
+    const sortExpression =
+      query.sort === "duration" ? "(s.last_activity_at - COALESCE(s.created_at, s.last_activity_at))" : "s.last_activity_at";
+
+    if (query.cursor) {
+      // Strict inequality on the tiebreaker prevents re-emitting the boundary row.
+      conditions.push(`(${sortExpression} < ? OR (${sortExpression} = ? AND s.session_key > ?))`);
+      parameters.push(query.cursor.value, query.cursor.value, query.cursor.sessionKey);
+    }
+
+    const where = conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : "";
+    parameters.push(query.limit + 1);
+
+    const rows = this.db
+      .prepare(`
+        SELECT s.*, ${sortExpression} AS sort_value,
+               (SELECT COUNT(*) FROM activities a WHERE a.session_ref = s.session_key) AS activity_count
+        FROM sessions s
+        ${where}
+        ORDER BY sort_value DESC, s.session_key ASC
+        LIMIT ?
+      `)
+      .all(...parameters) as ActivityRow[];
+
+    const hasMore = rows.length > query.limit;
+    const page = hasMore ? rows.slice(0, query.limit) : rows;
+    const items = page.map(rowToSessionSummary);
+    const last = page.at(-1);
+    if (!hasMore || !last) return { items };
+
+    return {
+      items,
+      nextCursor: encodeCursor({
+        sort: query.sort,
+        value: Number(last.sort_value ?? 0),
+        sessionKey: String(last.session_key),
+      }),
+    };
+  }
+
+  /**
+   * Roster joined with per-agent session counts.
+   *
+   * Aggregated in SQL rather than by loading sessions into memory, because the
+   * roster is small but the session archive is not bounded by the UI's page size.
+   */
+  listAgentOverviews(): AgentOverview[] {
+    const rows = this.db
+      .prepare(`
+        SELECT a.*,
+               COUNT(s.session_key) AS session_count,
+               COALESCE(SUM(CASE WHEN s.has_active_run = 1 AND s.archived = 0 THEN 1 ELSE 0 END), 0) AS active_count,
+               COALESCE(SUM(CASE WHEN s.archived = 1 THEN 1 ELSE 0 END), 0) AS archived_count,
+               MAX(s.last_activity_at) AS last_session_activity_at
+        FROM agents a
+        LEFT JOIN sessions s ON s.agent_id = a.id
+        GROUP BY a.id
+        ORDER BY COALESCE(MAX(s.last_activity_at), a.last_activity_at, a.first_observed_at) DESC, a.id ASC
+      `)
+      .all() as ActivityRow[];
+
+    const activityCounts = new Map<string, number>(
+      (this.db.prepare("SELECT agent_id, COUNT(*) AS c FROM activities GROUP BY agent_id").all() as ActivityRow[]).map(
+        (row) => [String(row.agent_id), Number(row.c ?? 0)],
+      ),
+    );
+
+    return rows.map((row) => ({
+      ...rowToAgent(row),
+      sessionCount: Number(row.session_count ?? 0),
+      activeSessionCount: Number(row.active_count ?? 0),
+      archivedSessionCount: Number(row.archived_count ?? 0),
+      activityCount: activityCounts.get(String(row.id)) ?? 0,
+      ...(asNumber(row.last_session_activity_at) !== undefined
+        ? { lastSessionActivityAt: asNumber(row.last_session_activity_at) }
+        : {}),
+    }));
+  }
+
+  getAgentOverview(agentId: string): AgentOverview | undefined {
+    return this.listAgentOverviews().find((agent) => agent.id === agentId);
+  }
+
+  /** Activity timeline for one session, newest first. */
+  listSessionActivities(sessionKey: string, limit = 200): StoredActivity[] {
+    const rows = this.db
+      .prepare(`
+        SELECT * FROM activities
+        WHERE session_ref = ? OR session_key = ?
+        ORDER BY last_observed_at DESC, id ASC
+        LIMIT ?
+      `)
+      .all(sessionKey, sessionKey, limit) as ActivityRow[];
+    return rows.map(rowToStored);
   }
 
   /**
@@ -1084,8 +1251,8 @@ export class CollectorRepository {
     this.db.prepare("UPDATE meta SET value = ? WHERE key = 'revision'").run(String(this.currentRevision));
   }
 
-  private emit(ids: string[], reasons: string[]): RepositoryChange {
-    const change = { epoch: this.epoch, revision: this.currentRevision, ids, reasons };
+  private emit(ids: string[], reasons: string[], topics: ChangeTopic[] = ["activities"]): RepositoryChange {
+    const change = { epoch: this.epoch, revision: this.currentRevision, topics, ids, reasons };
     for (const listener of this.listeners) listener(change);
     return change;
   }

@@ -355,10 +355,19 @@ export type SettledSeriesRuns = {
   runs: SettledRunSummary[];
 };
 
+export type ChangeTopic = "activities" | "sessions" | "usage" | "agents";
+
 export type CollectorChange = {
   epoch: string;
   revision: number;
   full: boolean;
+  /**
+   * Which surfaces the change affects. The existing invalidate frame is
+   * coarse-grained, so a session-only refresh currently makes clients refetch
+   * every endpoint. Absent on frames from older collectors, where clients must
+   * assume `["activities"]` to preserve today's behaviour.
+   */
+  topics?: ChangeTopic[];
   ids: string[];
   reasons: string[];
   syncState: CollectorSyncState;

@@ -5,9 +5,48 @@ import Fastify, { LogController, type FastifyInstance } from "fastify";
 import type { CollectorChange, CollectorStatus, SettledRange } from "../contracts.js";
 import type { CollectorRuntime } from "../collector/runtime.js";
 import type { ResolvedCollectorConfig } from "../config.js";
+import type { SessionStateFilter } from "../storage/repository.js";
+import {
+  decodeCursor,
+  DEFERRED_SESSION_SORTS,
+  isSessionSort,
+  SESSION_SORTS,
+} from "../storage/keyset-cursor.js";
+
+const SESSION_PAGE_LIMIT_DEFAULT = 50;
+const SESSION_PAGE_LIMIT_MAX = 200;
+const ACTIVITY_PAGE_LIMIT_DEFAULT = 100;
+const ACTIVITY_PAGE_LIMIT_MAX = 500;
+const SESSION_STATES: readonly SessionStateFilter[] = ["active", "terminal", "archived"];
 
 function sseEvent(event: string, data: unknown): string {
   return `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
+}
+
+function isSessionState(value: string): value is SessionStateFilter {
+  return (SESSION_STATES as readonly string[]).includes(value);
+}
+
+/** Returns undefined for an out-of-range or non-integer limit so callers can 400. */
+function parseLimit(
+  raw: string | undefined,
+  max: number = SESSION_PAGE_LIMIT_MAX,
+  fallback: number = SESSION_PAGE_LIMIT_DEFAULT,
+): number | undefined {
+  if (raw === undefined) return fallback;
+  const parsed = Number(raw);
+  if (!Number.isSafeInteger(parsed) || parsed < 1 || parsed > max) return undefined;
+  return parsed;
+}
+
+/**
+ * Three-way result: undefined means absent, null means present but invalid.
+ * Collapsing those would turn a typo'd timestamp into an unfiltered query.
+ */
+function parseTimestamp(raw: string | undefined): number | undefined | null {
+  if (raw === undefined) return undefined;
+  const parsed = Number(raw);
+  return Number.isSafeInteger(parsed) && parsed >= 0 ? parsed : null;
 }
 
 function settledRange(value: string | undefined): SettledRange | undefined {
@@ -74,6 +113,100 @@ export async function createHttpServer(
     if (!detail) return reply.code(404).send({ error: "activity_not_found" });
     return detail;
   });
+
+  app.get("/api/v1/agents", async () => ({ agents: runtime.repository.listAgentOverviews() }));
+
+  app.get<{ Params: { id: string } }>("/api/v1/agents/:id", async (request, reply) => {
+    const agent = runtime.repository.getAgentOverview(request.params.id);
+    if (!agent) return reply.code(404).send({ error: "agent_not_found" });
+    return {
+      agent,
+      sessions: runtime.repository.listSessionsPage({
+        agentId: agent.id,
+        sort: "lastActivity",
+        limit: SESSION_PAGE_LIMIT_DEFAULT,
+      }),
+    };
+  });
+
+  app.get<{
+    Querystring: {
+      agentId?: string;
+      state?: string;
+      since?: string;
+      until?: string;
+      sort?: string;
+      limit?: string;
+      cursor?: string;
+    };
+  }>("/api/v1/sessions", async (request, reply) => {
+    const { sort, state, limit, since, until } = request.query;
+
+    if (sort !== undefined && DEFERRED_SESSION_SORTS[sort]) {
+      // Named explicitly so a client does not read a silent fallback ordering as
+      // a working sort returning wrong rows.
+      return reply.code(400).send({
+        error: "sort_not_yet_collected",
+        sort,
+        availableIn: DEFERRED_SESSION_SORTS[sort],
+        supported: SESSION_SORTS,
+      });
+    }
+    const resolvedSort = sort ?? "lastActivity";
+    if (!isSessionSort(resolvedSort)) {
+      return reply.code(400).send({ error: "invalid_sort", supported: SESSION_SORTS });
+    }
+    if (state !== undefined && !isSessionState(state)) {
+      return reply.code(400).send({ error: "invalid_state", supported: SESSION_STATES });
+    }
+    const resolvedLimit = parseLimit(limit);
+    if (resolvedLimit === undefined) {
+      return reply.code(400).send({ error: "invalid_limit", min: 1, max: SESSION_PAGE_LIMIT_MAX });
+    }
+    const sinceMs = parseTimestamp(since);
+    const untilMs = parseTimestamp(until);
+    if (sinceMs === null || untilMs === null) return reply.code(400).send({ error: "invalid_time_range" });
+
+    let cursor;
+    if (request.query.cursor !== undefined) {
+      cursor = decodeCursor(request.query.cursor, resolvedSort);
+      // A cursor issued for another sort would compare unrelated magnitudes.
+      // Restarting from page one instead would silently repeat rows the user
+      // already scrolled past, so this is reported rather than absorbed.
+      if (!cursor) return reply.code(400).send({ error: "invalid_cursor", sort: resolvedSort });
+    }
+
+    return runtime.repository.listSessionsPage({
+      ...(request.query.agentId !== undefined ? { agentId: request.query.agentId } : {}),
+      ...(state !== undefined ? { state } : {}),
+      ...(sinceMs !== undefined ? { since: sinceMs } : {}),
+      ...(untilMs !== undefined ? { until: untilMs } : {}),
+      sort: resolvedSort,
+      limit: resolvedLimit,
+      ...(cursor ? { cursor } : {}),
+    });
+  });
+
+  app.get<{ Params: { key: string } }>("/api/v1/sessions/:key", async (request, reply) => {
+    const session = runtime.repository.getSession(request.params.key);
+    if (!session) return reply.code(404).send({ error: "session_not_found" });
+    return session;
+  });
+
+  app.get<{ Params: { key: string }; Querystring: { limit?: string } }>(
+    "/api/v1/sessions/:key/activities",
+    async (request, reply) => {
+      if (!runtime.repository.getSession(request.params.key)) {
+        return reply.code(404).send({ error: "session_not_found" });
+      }
+      const limit = parseLimit(request.query.limit, ACTIVITY_PAGE_LIMIT_MAX, ACTIVITY_PAGE_LIMIT_DEFAULT);
+      if (limit === undefined) {
+        return reply.code(400).send({ error: "invalid_limit", min: 1, max: ACTIVITY_PAGE_LIMIT_MAX });
+      }
+      return { activities: runtime.repository.listSessionActivities(request.params.key, limit) };
+    },
+  );
+
   app.get("/api/v1/events", async (request, reply) => {
     reply.hijack();
     const response = reply.raw;
@@ -89,6 +222,9 @@ export async function createHttpServer(
         epoch: runtime.repository.epoch,
         revision: runtime.repository.revision,
         full: true,
+        // A fresh connection has no client state to reconcile against, so every
+        // surface is stale regardless of what changed server-side.
+        topics: ["activities", "sessions", "usage", "agents"],
         ids: [],
         reasons: ["sse_connected"],
         syncState: runtime.getStatus().syncState,

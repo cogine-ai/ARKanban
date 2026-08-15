@@ -3,7 +3,13 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { attemptPatch, taskToActivity } from "../activity/projector.js";
-import { CollectorRepository, type SessionWrite } from "./repository.js";
+import { decodeCursor } from "./keyset-cursor.js";
+import {
+  CollectorRepository,
+  type SessionPage,
+  type SessionPageQuery,
+  type SessionWrite,
+} from "./repository.js";
 
 const cleanups: Array<() => void> = [];
 afterEach(() => {
@@ -115,6 +121,251 @@ describe("CollectorRepository agents and sessions", () => {
 
     expect(repo.listSessions().map((row) => row.sessionKey)).toEqual(["live"]);
     expect(repo.listSessions({ includeArchived: true })).toHaveLength(2);
+  });
+});
+
+describe("CollectorRepository session pagination", () => {
+  const session = (overrides: Partial<SessionWrite> & Pick<SessionWrite, "sessionKey">): SessionWrite => ({
+    agentId: "builder",
+    label: "Session",
+    kindHint: "main",
+    archived: false,
+    hasActiveRun: false,
+    lineage: {},
+    lastActivityAt: 5_000,
+    observedAt: 5_000,
+    coverage: { index: "live", detail: "not_observed", usage: "not_observed", messages: "not_observed" },
+    ...overrides,
+  });
+
+  /** Walks every page, returning the keys in order plus the number of pages taken. */
+  function drain(
+    repo: CollectorRepository,
+    query: Omit<SessionPageQuery, "cursor">,
+  ): { keys: string[]; pages: number } {
+    const keys: string[] = [];
+    let cursor: string | undefined;
+    let pages = 0;
+    do {
+      const page: SessionPage = repo.listSessionsPage({
+        ...query,
+        ...(cursor ? { cursor: decodeCursor(cursor, query.sort)! } : {}),
+      });
+      keys.push(...page.items.map((item) => item.sessionKey));
+      cursor = page.nextCursor;
+      pages += 1;
+      if (pages > 50) throw new Error("pagination did not terminate");
+    } while (cursor);
+    return { keys, pages };
+  }
+
+  it("walks every session exactly once across pages", () => {
+    const repo = repository();
+    repo.upsertSessions(
+      Array.from({ length: 25 }, (_, index) => session({ sessionKey: `s-${index}`, lastActivityAt: 1_000 + index })),
+    );
+
+    const { keys, pages } = drain(repo, { sort: "lastActivity", limit: 10 });
+    expect(pages).toBe(3);
+    expect(keys).toHaveLength(25);
+    expect(new Set(keys).size).toBe(25);
+  });
+
+  it("does not skip or repeat rows that share one timestamp", () => {
+    const repo = repository();
+    // The tiebreaker carries the whole ordering here, which is where a keyset
+    // scan comparing only the sort value would loop or drop rows.
+    repo.upsertSessions(
+      Array.from({ length: 12 }, (_, index) => session({ sessionKey: `same-${index}`, lastActivityAt: 7_000 })),
+    );
+
+    const { keys } = drain(repo, { sort: "lastActivity", limit: 5 });
+    expect(keys).toHaveLength(12);
+    expect(new Set(keys).size).toBe(12);
+  });
+
+  it("orders by last activity descending with the session key as tiebreaker", () => {
+    const repo = repository();
+    repo.upsertSessions([
+      session({ sessionKey: "b", lastActivityAt: 100 }),
+      session({ sessionKey: "a", lastActivityAt: 100 }),
+      session({ sessionKey: "c", lastActivityAt: 200 }),
+    ]);
+
+    expect(repo.listSessionsPage({ sort: "lastActivity", limit: 10 }).items.map((row) => row.sessionKey)).toEqual([
+      "c",
+      "a",
+      "b",
+    ]);
+  });
+
+  it("omits the cursor on the final page", () => {
+    const repo = repository();
+    repo.upsertSessions([session({ sessionKey: "only" })]);
+    expect(repo.listSessionsPage({ sort: "lastActivity", limit: 10 }).nextCursor).toBeUndefined();
+  });
+
+  it("issues a cursor when a further page exists", () => {
+    const repo = repository();
+    repo.upsertSessions([session({ sessionKey: "a", lastActivityAt: 1 }), session({ sessionKey: "b", lastActivityAt: 2 })]);
+    expect(repo.listSessionsPage({ sort: "lastActivity", limit: 1 }).nextCursor).toBeDefined();
+  });
+
+  it("separates active, terminal and archived sessions", () => {
+    const repo = repository();
+    repo.upsertSessions([
+      session({ sessionKey: "running", hasActiveRun: true }),
+      session({ sessionKey: "idle", hasActiveRun: false }),
+      session({ sessionKey: "gone", archived: true }),
+    ]);
+
+    const keysFor = (state: SessionPageQuery["state"]): string[] =>
+      repo.listSessionsPage({ sort: "lastActivity", limit: 10, ...(state ? { state } : {}) }).items.map((r) => r.sessionKey);
+
+    expect(keysFor("active")).toEqual(["running"]);
+    expect(keysFor("terminal")).toEqual(["idle"]);
+    expect(keysFor("archived")).toEqual(["gone"]);
+    // Unfiltered includes archived, unlike the legacy listSessions default.
+    expect(keysFor(undefined)).toHaveLength(3);
+  });
+
+  it("filters by agent and time window", () => {
+    const repo = repository();
+    repo.upsertSessions([
+      session({ sessionKey: "old", agentId: "builder", lastActivityAt: 1_000 }),
+      session({ sessionKey: "new", agentId: "builder", lastActivityAt: 9_000 }),
+      session({ sessionKey: "other", agentId: "writer", lastActivityAt: 9_000 }),
+    ]);
+
+    expect(
+      repo.listSessionsPage({ sort: "lastActivity", limit: 10, agentId: "builder", since: 5_000 }).items.map((r) => r.sessionKey),
+    ).toEqual(["new"]);
+    expect(
+      repo.listSessionsPage({ sort: "lastActivity", limit: 10, until: 5_000 }).items.map((r) => r.sessionKey),
+    ).toEqual(["old"]);
+  });
+
+  it("sorts by duration independently of recency", () => {
+    const repo = repository();
+    repo.upsertSessions([
+      session({ sessionKey: "brief", createdAt: 9_000, lastActivityAt: 9_100 }),
+      session({ sessionKey: "long", createdAt: 1_000, lastActivityAt: 8_000 }),
+    ]);
+
+    expect(repo.listSessionsPage({ sort: "duration", limit: 10 }).items.map((r) => r.sessionKey)).toEqual([
+      "long",
+      "brief",
+    ]);
+  });
+
+  it("paginates a duration scan without repeating rows", () => {
+    const repo = repository();
+    repo.upsertSessions(
+      Array.from({ length: 9 }, (_, index) =>
+        session({ sessionKey: `d-${index}`, createdAt: 1_000, lastActivityAt: 1_000 + index * 100 }),
+      ),
+    );
+
+    const { keys } = drain(repo, { sort: "duration", limit: 4 });
+    expect(new Set(keys).size).toBe(9);
+  });
+});
+
+describe("CollectorRepository agent overviews", () => {
+  const session = (overrides: Partial<SessionWrite> & Pick<SessionWrite, "sessionKey">): SessionWrite => ({
+    agentId: "builder",
+    label: "Session",
+    kindHint: "main",
+    archived: false,
+    hasActiveRun: false,
+    lineage: {},
+    lastActivityAt: 5_000,
+    observedAt: 5_000,
+    coverage: { index: "live", detail: "not_observed", usage: "not_observed", messages: "not_observed" },
+    ...overrides,
+  });
+
+  it("counts sessions per agent by state", () => {
+    const repo = repository();
+    repo.upsertAgents([
+      { id: "builder", displayName: "Builder", kind: "agent", origin: "roster", observedAt: 1_000 },
+    ]);
+    repo.upsertSessions([
+      session({ sessionKey: "a", hasActiveRun: true }),
+      session({ sessionKey: "b", hasActiveRun: false }),
+      session({ sessionKey: "c", archived: true }),
+    ]);
+
+    expect(repo.getAgentOverview("builder")).toMatchObject({
+      sessionCount: 3,
+      activeSessionCount: 1,
+      archivedSessionCount: 1,
+    });
+  });
+
+  it("keeps a roster agent that has no sessions yet", () => {
+    const repo = repository();
+    repo.upsertAgents([{ id: "idle", displayName: "Idle", kind: "agent", origin: "roster", observedAt: 1_000 }]);
+
+    expect(repo.getAgentOverview("idle")).toMatchObject({ sessionCount: 0, activeSessionCount: 0 });
+  });
+
+  it("returns undefined for an unknown agent", () => {
+    expect(repository().getAgentOverview("nobody")).toBeUndefined();
+  });
+
+  it("reports the most recent session activity per agent", () => {
+    const repo = repository();
+    repo.upsertAgents([{ id: "builder", displayName: "Builder", kind: "agent", origin: "roster", observedAt: 1 }]);
+    repo.upsertSessions([
+      session({ sessionKey: "a", lastActivityAt: 4_000 }),
+      session({ sessionKey: "b", lastActivityAt: 8_000 }),
+    ]);
+
+    expect(repo.getAgentOverview("builder")?.lastSessionActivityAt).toBe(8_000);
+  });
+});
+
+describe("CollectorRepository change topics", () => {
+  const session = (sessionKey: string): SessionWrite => ({
+    sessionKey,
+    agentId: "builder",
+    label: "Session",
+    kindHint: "main",
+    archived: false,
+    hasActiveRun: false,
+    lineage: {},
+    lastActivityAt: 5_000,
+    observedAt: 5_000,
+    coverage: { index: "live", detail: "not_observed", usage: "not_observed", messages: "not_observed" },
+  });
+
+  it("tags session writes with the sessions topic", () => {
+    const repo = repository();
+    const topics: string[][] = [];
+    repo.subscribe((change) => topics.push(change.topics));
+    repo.upsertSessions([session("s-1")]);
+
+    expect(topics).toEqual([["sessions"]]);
+  });
+
+  it("tags roster writes with the agents topic", () => {
+    const repo = repository();
+    const topics: string[][] = [];
+    repo.subscribe((change) => topics.push(change.topics));
+    repo.upsertAgents([{ id: "a", displayName: "A", kind: "agent", origin: "roster", observedAt: 1 }]);
+
+    expect(topics).toEqual([["agents"]]);
+  });
+
+  it("stays silent when a reconcile changes nothing", () => {
+    const repo = repository();
+    repo.upsertSessions([session("s-1")]);
+    const topics: string[][] = [];
+    repo.subscribe((change) => topics.push(change.topics));
+    repo.upsertSessions([session("s-1")]);
+
+    expect(topics).toEqual([]);
   });
 });
 

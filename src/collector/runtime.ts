@@ -766,7 +766,14 @@ export class CollectorRuntime {
     }
 
     this.schedule = { ...next, revision: this.schedule.revision + 1 };
-    this.emitChange({ epoch: this.repository.epoch, revision: this.repository.revision, ids: [], reasons: [reason] });
+    this.emitChange({
+      epoch: this.repository.epoch,
+      revision: this.repository.revision,
+      // The upcoming-schedule forecast is rendered by the activities surface.
+      topics: ["activities"],
+      ids: [],
+      reasons: [reason],
+    });
   }
 
   private prune(): void {

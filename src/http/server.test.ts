@@ -1,9 +1,11 @@
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import type { FastifyInstance } from "fastify";
 import { afterEach, describe, expect, it } from "vitest";
 import { CollectorRuntime } from "../collector/runtime.js";
 import type { ResolvedCollectorConfig } from "../config.js";
+import type { AgentWrite, SessionWrite } from "../storage/repository.js";
 import { createHttpServer } from "./server.js";
 
 const cleanups: Array<() => Promise<void> | void> = [];
@@ -53,5 +55,139 @@ describe("settled group HTTP API", () => {
 
     expect((await app.inject({ method: "GET", url: "/api/v1/settled-groups?range=1y" })).statusCode).toBe(400);
     expect((await app.inject({ method: "GET", url: "/api/v1/settled-groups?rangeEnd=not-a-time" })).statusCode).toBe(400);
+  });
+});
+
+describe("sessions and agents HTTP API", () => {
+  async function serverWith(sessions: SessionWrite[], agents: AgentWrite[] = []): Promise<FastifyInstance> {
+    const { runtime, config } = runtimeFixture();
+    if (agents.length > 0) runtime.repository.upsertAgents(agents);
+    if (sessions.length > 0) runtime.repository.upsertSessions(sessions);
+    const app = await createHttpServer(runtime, config);
+    cleanups.push(() => app.close());
+    return app;
+  }
+
+  const session = (overrides: Partial<SessionWrite> & Pick<SessionWrite, "sessionKey">): SessionWrite => ({
+    agentId: "builder",
+    label: "Session",
+    kindHint: "main",
+    archived: false,
+    hasActiveRun: false,
+    lineage: {},
+    lastActivityAt: 5_000,
+    observedAt: 5_000,
+    coverage: { index: "live", detail: "not_observed", usage: "not_observed", messages: "not_observed" },
+    ...overrides,
+  });
+
+  it("returns a page and a cursor that fetches the remainder", async () => {
+    const app = await serverWith([
+      session({ sessionKey: "a", lastActivityAt: 1_000 }),
+      session({ sessionKey: "b", lastActivityAt: 2_000 }),
+    ]);
+
+    const first = await app.inject({ method: "GET", url: "/api/v1/sessions?limit=1" });
+    expect(first.statusCode).toBe(200);
+    const firstBody = first.json();
+    expect(firstBody.items.map((row: { sessionKey: string }) => row.sessionKey)).toEqual(["b"]);
+
+    const second = await app.inject({
+      method: "GET",
+      url: `/api/v1/sessions?limit=1&cursor=${encodeURIComponent(firstBody.nextCursor)}`,
+    });
+    expect(second.json().items.map((row: { sessionKey: string }) => row.sessionKey)).toEqual(["a"]);
+  });
+
+  it("rejects a cursor replayed against a different sort", async () => {
+    const app = await serverWith([
+      session({ sessionKey: "a", lastActivityAt: 1_000 }),
+      session({ sessionKey: "b", lastActivityAt: 2_000 }),
+    ]);
+
+    const cursor = (await app.inject({ method: "GET", url: "/api/v1/sessions?limit=1" })).json().nextCursor;
+    const response = await app.inject({
+      method: "GET",
+      url: `/api/v1/sessions?limit=1&sort=duration&cursor=${encodeURIComponent(cursor)}`,
+    });
+
+    expect(response.statusCode).toBe(400);
+    expect(response.json()).toMatchObject({ error: "invalid_cursor" });
+  });
+
+  it("names the phase that will collect a sort it cannot serve yet", async () => {
+    const app = await serverWith([]);
+    const response = await app.inject({ method: "GET", url: "/api/v1/sessions?sort=cost" });
+
+    expect(response.statusCode).toBe(400);
+    expect(response.json()).toMatchObject({ error: "sort_not_yet_collected", sort: "cost" });
+    expect(response.json().availableIn).toContain("S6");
+  });
+
+  it("rejects unknown sorts, states and out-of-range limits", async () => {
+    const app = await serverWith([]);
+
+    expect((await app.inject({ method: "GET", url: "/api/v1/sessions?sort=nonsense" })).statusCode).toBe(400);
+    expect((await app.inject({ method: "GET", url: "/api/v1/sessions?state=paused" })).statusCode).toBe(400);
+    expect((await app.inject({ method: "GET", url: "/api/v1/sessions?limit=0" })).statusCode).toBe(400);
+    expect((await app.inject({ method: "GET", url: "/api/v1/sessions?limit=500" })).statusCode).toBe(400);
+  });
+
+  it("treats an unparseable time bound as an error rather than no filter", async () => {
+    const app = await serverWith([session({ sessionKey: "a" })]);
+    const response = await app.inject({ method: "GET", url: "/api/v1/sessions?since=yesterday" });
+
+    expect(response.statusCode).toBe(400);
+    expect(response.json()).toMatchObject({ error: "invalid_time_range" });
+  });
+
+  it("serves a single session archive and 404s for an unknown key", async () => {
+    const app = await serverWith([session({ sessionKey: "agent:builder:1", lineage: { spawnDepth: 2 } })]);
+
+    const found = await app.inject({ method: "GET", url: "/api/v1/sessions/agent%3Abuilder%3A1" });
+    expect(found.statusCode).toBe(200);
+    expect(found.json()).toMatchObject({ sessionKey: "agent:builder:1", lineage: { spawnDepth: 2 } });
+
+    expect((await app.inject({ method: "GET", url: "/api/v1/sessions/missing" })).statusCode).toBe(404);
+  });
+
+  it("serves a session activity timeline and 404s before the session is observed", async () => {
+    const app = await serverWith([session({ sessionKey: "s-1" })]);
+
+    const response = await app.inject({ method: "GET", url: "/api/v1/sessions/s-1/activities" });
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toEqual({ activities: [] });
+
+    expect((await app.inject({ method: "GET", url: "/api/v1/sessions/nope/activities" })).statusCode).toBe(404);
+  });
+
+  it("returns the roster with per-agent session counts", async () => {
+    const app = await serverWith(
+      [session({ sessionKey: "a", hasActiveRun: true }), session({ sessionKey: "b", archived: true })],
+      [{ id: "builder", displayName: "Builder", kind: "agent", origin: "roster", observedAt: 1_000 }],
+    );
+
+    const response = await app.inject({ method: "GET", url: "/api/v1/agents" });
+    expect(response.statusCode).toBe(200);
+    expect(response.json().agents[0]).toMatchObject({
+      id: "builder",
+      sessionCount: 2,
+      activeSessionCount: 1,
+      archivedSessionCount: 1,
+    });
+  });
+
+  it("serves agent detail with its sessions and 404s for an unknown agent", async () => {
+    const app = await serverWith(
+      [session({ sessionKey: "a" })],
+      [{ id: "builder", displayName: "Builder", kind: "agent", origin: "roster", observedAt: 1_000 }],
+    );
+
+    const response = await app.inject({ method: "GET", url: "/api/v1/agents/builder" });
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toMatchObject({ agent: { id: "builder" } });
+    expect(response.json().sessions.items).toHaveLength(1);
+
+    expect((await app.inject({ method: "GET", url: "/api/v1/agents/ghost" })).statusCode).toBe(404);
   });
 });

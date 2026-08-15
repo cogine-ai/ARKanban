@@ -482,6 +482,10 @@ GET /api/v1/sessions
 
 固定使用 keyset 游标，不使用 offset。排序键必须与游标键一致，且始终以 `session_key` 作为最后一级 tiebreaker，保证稳定。
 
+游标内嵌它被签发时的排序键。把 `lastActivity` 的游标喂给 `duration` 扫描会比较两个不同量纲的值，静默产出一页错乱结果，因此解码时直接拒绝这种错配，返回 `invalid_cursor` 而不是从第一页重来——后者会在无限滚动中重复用户已经看过的行。
+
+`cost` 与 `grade` 的排序在 S3 阶段返回 400 `sort_not_yet_collected`，并在响应里注明数据将由哪个分片采集（分别是 S6、S7）。不做静默降级到 `lastActivity`：那会让调用方以为排序生效了，只是结果不对。
+
 **会话列表不进入 `ActivitySnapshot`。** 现有 snapshot 是全量下发模型，把上千会话塞进去会让每次 SSE invalidate 都产生一次全量传输。
 
 ### 5.3 SSE topic
@@ -692,8 +696,6 @@ openclaw-collector purge-transcripts --config <path>
 
 ## 10. 分片顺序
 
-| 分片 | 内容 | 产出 |
-|---|---|---|
 | 分片 | 内容 | 产出 |
 |---|---|---|
 | S1 | 迁移框架 + Agent/Session/Message 实体 + schema version 2 | 无 UI 变化 |

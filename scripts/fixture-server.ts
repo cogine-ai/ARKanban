@@ -15,6 +15,7 @@ import path from "node:path";
 type Fixtures = {
   meta: unknown;
   snapshot: unknown;
+  agents: unknown;
   settled: Record<string, unknown>;
   detail: Record<string, unknown>;
   seriesRuns: Record<string, unknown>;
@@ -43,9 +44,12 @@ if (mode === "capture") {
   for (const item of snapshot.items) {
     detail[item.id] = await getJson(`${collectorUrl}/api/v1/activities/${encodeURIComponent(item.id)}`);
   }
-  const fixtures: Fixtures = { meta, snapshot, settled, detail, seriesRuns: {} };
+  const agents = (await getJson(`${collectorUrl}/api/v1/agents`)) as { agents: unknown[] };
+  const fixtures: Fixtures = { meta, snapshot, agents, settled, detail, seriesRuns: {} };
   writeFileSync(path.join(dir, "fixtures.json"), JSON.stringify(fixtures));
-  process.stdout.write(`captured ${snapshot.items.length} items, ${Object.keys(detail).length} details\n`);
+  process.stdout.write(
+    `captured ${snapshot.items.length} items, ${Object.keys(detail).length} details, ${agents.agents.length} agents\n`,
+  );
 } else if (mode === "serve") {
   const [dir, webDir, rawPort] = rest;
   const port = Number(rawPort ?? 47901);
@@ -81,6 +85,7 @@ if (mode === "capture") {
     }
     if (route === "/api/v1/meta") return json(response, fixtures.meta);
     if (route === "/api/v1/snapshot") return json(response, fixtures.snapshot);
+    if (route === "/api/v1/agents") return json(response, fixtures.agents);
     if (route === "/api/v1/settled-groups") {
       return json(response, fixtures.settled[url.searchParams.get("range") ?? "7d"] ?? fixtures.settled["7d"]);
     }

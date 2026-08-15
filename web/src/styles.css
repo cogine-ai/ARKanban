@@ -283,6 +283,39 @@ button { color: inherit; }
 .relation-cards i { color: var(--tertiary); font-style: normal; }
 .relation-cards small { grid-column: 1 / -1; color: var(--secondary); font-size: 8px; }
 .simple-empty { grid-column: 1 / -1; min-height: 180px; padding: 30px; display: grid; place-items: center; border: 1px dashed rgba(0,0,0,.1); border-radius: 14px; color: var(--secondary); text-align: center; font-size: 11px; }
+.sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
+
+.agent-grid { display: grid; grid-template-columns: repeat(auto-fill,minmax(288px,1fr)); gap: 11px; }
+.agent-card { padding: 14px; display: flex; flex-direction: column; gap: 11px; border: 1px solid var(--line); border-radius: 14px; background: #fff; }
+.agent-card[data-kind="system"] { background: #fcfcfd; }
+.agent-card-head { display: grid; grid-template-columns: 34px minmax(0,1fr) auto; align-items: center; gap: 10px; }
+.agent-card-head .agent-avatar { width: 34px; height: 34px; }
+.agent-identity { min-width: 0; display: block; }
+.agent-identity b { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12px; font-weight: 650; }
+.agent-identity small { display: block; margin-top: 2px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--secondary); font-size: 9px; }
+.agent-badges { display: flex; gap: 4px; }
+.agent-badge { padding: 2px 6px; border-radius: 6px; font-size: 7px; font-weight: 740; letter-spacing: .06em; }
+.agent-badge.system { background: rgba(118,118,128,.12); color: var(--secondary); }
+.agent-badge.inferred { background: rgba(191,116,20,.1); color: #8a520a; }
+.agent-section { display: grid; gap: 5px; }
+.agent-section .eyebrow { margin-bottom: 0; font-size: 8px; }
+.agent-inline-metrics { display: flex; flex-wrap: wrap; gap: 12px; color: var(--secondary); font-size: 10px; font-variant-numeric: tabular-nums; }
+.agent-inline-metrics b { color: var(--ink); font-weight: 650; }
+.agent-inline-metrics .wait b { color: #a75d00; }
+.agent-rollup { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
+.agent-rollup th, .agent-rollup td { padding: 3px 0; text-align: right; font-weight: 500; }
+.agent-rollup thead th { color: var(--tertiary); font-size: 8px; font-weight: 700; letter-spacing: .06em; text-transform: uppercase; }
+.agent-rollup tbody th { color: var(--secondary); font-size: 9px; font-weight: 640; text-align: left; }
+.agent-rollup tbody td { color: var(--ink); font-size: 10px; }
+.agent-rollup tbody tr + tr th, .agent-rollup tbody tr + tr td { border-top: 1px solid var(--line); }
+.agent-next span:last-child { color: var(--secondary); font-size: 10px; }
+.agent-card-foot { margin-top: auto; padding-top: 9px; display: flex; align-items: center; justify-content: space-between; gap: 10px; border-top: 1px solid var(--line); font-size: 9px; }
+.agent-card-foot .muted { color: var(--tertiary); }
+.agent-seen { color: var(--secondary); }
+.agent-system-group { margin-top: 18px; display: grid; gap: 11px; }
+.agent-system-toggle { justify-self: start; padding: 0; border: 0; background: none; color: var(--secondary); font-size: 10px; font-weight: 620; cursor: pointer; }
+.agent-system-toggle:hover { color: var(--ink); }
+
 .archive-table { overflow: auto; border: 1px solid var(--line); border-radius: 14px; background: #fff; }
 .archive-head, .archive-table > button { min-width: 820px; display: grid; grid-template-columns: minmax(280px,2fr) minmax(120px,1fr) 90px 110px 110px; align-items: center; gap: 14px; }
 .archive-head { height: 38px; padding: 0 14px; background: #fafafa; color: var(--tertiary); font-size: 8px; font-weight: 700; letter-spacing: .07em; text-transform: uppercase; }

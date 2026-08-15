@@ -10,6 +10,8 @@ import {
 } from "react";
 import type {
   ActivitySnapshot,
+  ChangeTopic,
+  CollectorChange,
   CollectorStatus,
   SettledGroupSnapshot,
   SettledRange,
@@ -36,7 +38,17 @@ export type CollectorContextValue = {
   range: SettledRange;
   setRange: (range: SettledRange) => void;
   refresh: () => Promise<void>;
+  /**
+   * Notifies when the server reports a change touching any of `topics`.
+   *
+   * Lets a page refetch only its own resource: the agent roster changing must
+   * not drag the whole activity snapshot down the wire, and the live board must
+   * not refetch the roster it never displays.
+   */
+  subscribeTopics: (topics: readonly ChangeTopic[], listener: () => void) => () => void;
 };
+
+const ALL_TOPICS: ChangeTopic[] = ["activities", "sessions", "usage", "agents"];
 
 const CollectorContext = createContext<CollectorContextValue | undefined>(undefined);
 
@@ -64,10 +76,34 @@ export function CollectorProvider({ children }: { children: ReactNode }) {
     }
   }, [range]);
 
-  const scheduleRefresh = useCallback(() => {
-    if (refreshTimer.current !== undefined) window.clearTimeout(refreshTimer.current);
-    refreshTimer.current = window.setTimeout(() => void refresh(), 90);
+  const topicListeners = useRef(new Set<{ topics: readonly ChangeTopic[]; listener: () => void }>());
+  const pendingTopics = useRef(new Set<ChangeTopic>());
+
+  const subscribeTopics = useCallback((topics: readonly ChangeTopic[], listener: () => void) => {
+    const entry = { topics, listener };
+    topicListeners.current.add(entry);
+    return () => {
+      topicListeners.current.delete(entry);
+    };
+  }, []);
+
+  const flushInvalidation = useCallback(() => {
+    const topics = new Set(pendingTopics.current);
+    pendingTopics.current.clear();
+    if (topics.has("activities")) void refresh();
+    for (const entry of topicListeners.current) {
+      if (entry.topics.some((topic) => topics.has(topic))) entry.listener();
+    }
   }, [refresh]);
+
+  const scheduleInvalidation = useCallback(
+    (topics: readonly ChangeTopic[]) => {
+      for (const topic of topics) pendingTopics.current.add(topic);
+      if (refreshTimer.current !== undefined) window.clearTimeout(refreshTimer.current);
+      refreshTimer.current = window.setTimeout(flushInvalidation, 90);
+    },
+    [flushInvalidation],
+  );
 
   useEffect(() => {
     void refresh();
@@ -76,16 +112,26 @@ export function CollectorProvider({ children }: { children: ReactNode }) {
       try {
         setStatus(JSON.parse((event as MessageEvent<string>).data) as CollectorStatus);
       } catch {
-        scheduleRefresh();
+        scheduleInvalidation(ALL_TOPICS);
       }
     });
-    events.addEventListener("invalidate", scheduleRefresh);
+    events.addEventListener("invalidate", (event) => {
+      try {
+        const change = JSON.parse((event as MessageEvent<string>).data) as CollectorChange;
+        // A server that cannot say what changed is treated as changing
+        // everything, so an older collector degrades to the previous behaviour
+        // instead of silently never refreshing.
+        scheduleInvalidation(change.topics?.length ? change.topics : ALL_TOPICS);
+      } catch {
+        scheduleInvalidation(ALL_TOPICS);
+      }
+    });
     events.onerror = () => setError("Live updates disconnected; retrying automatically");
     return () => {
       events.close();
       if (refreshTimer.current !== undefined) window.clearTimeout(refreshTimer.current);
     };
-  }, [refresh, scheduleRefresh]);
+  }, [refresh, scheduleInvalidation]);
 
   useEffect(() => {
     try {
@@ -106,8 +152,9 @@ export function CollectorProvider({ children }: { children: ReactNode }) {
       range,
       setRange,
       refresh,
+      subscribeTopics,
     }),
-    [status, snapshot, settled, error, range, refresh],
+    [status, snapshot, settled, error, range, refresh, subscribeTopics],
   );
 
   return <CollectorContext.Provider value={value}>{children}</CollectorContext.Provider>;

@@ -6,6 +6,7 @@ import type { KindFilter } from "./lib/board";
 import { statusLabel } from "./lib/format";
 import { Link, matchPath, useLocation, useNavigate } from "./router";
 import { useCollector } from "./state/collector-context";
+import { AgentsView } from "./views/Agents";
 import { ArchiveView } from "./views/Archive";
 import { ConnectionsView } from "./views/Connections";
 import { LiveFlowView } from "./views/LiveFlow";
@@ -13,6 +14,7 @@ import { RelationsView } from "./views/Relations";
 
 const NAV_ITEMS = [
   { path: "/", key: "live", label: "Live flow" },
+  { path: "/agents", key: "agents", label: "Agents" },
   { path: "/relations", key: "relations", label: "Relations" },
   { path: "/archive", key: "archive", label: "Archive" },
   { path: "/connections", key: "connections", label: "Connections" },
@@ -91,6 +93,7 @@ export function App() {
         />
       ) : (
         <main className="content-shell">
+          {matchPath("/agents", pathname) ? <AgentsView /> : null}
           {matchPath("/relations", pathname) ? <RelationsView snapshot={snapshot} onSelect={openItem} /> : null}
           {matchPath("/archive", pathname) ? <ArchiveView items={snapshot?.items ?? []} onSelect={openItem} /> : null}
           {matchPath("/connections", pathname) ? <ConnectionsView status={status} /> : null}

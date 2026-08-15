@@ -86,6 +86,41 @@ try {
     await page.waitForTimeout(400);
   };
 
+  const hasAgentsNav = await page.locator(`${navSelector}:text-is("Agents")`).count() > 0;
+  const agents = hasAgentsNav
+    ? await (async () => {
+        await gotoView("Agents");
+        const cards = page.locator(".agent-card");
+        const first = cards.first();
+        const systemToggle = page.locator(".agent-system-toggle");
+        const hasSystemGroup = await systemToggle.count() > 0;
+        const collapsedCount = await cards.count();
+        if (hasSystemGroup) await systemToggle.click();
+        await page.waitForTimeout(250);
+        return {
+          heading: normalise(await page.locator(".view-heading h1").textContent()),
+          eyebrow: normalise(await page.locator(".view-heading .eyebrow").textContent()),
+          chip: normalise(await page.locator(".count-chip").textContent()),
+          visibleCards: collapsedCount,
+          cardsWithSystemExpanded: await cards.count(),
+          systemCollapsedByDefault: hasSystemGroup ? collapsedCount < (await cards.count()) : "no system agents",
+          sectionLabels: (await first.locator(".eyebrow").allTextContents()).map(normalise),
+          rollupWindows: await first.locator(".agent-rollup tbody th").allTextContents(),
+          rollupColumns: (await first.locator(".agent-rollup thead th").allTextContents()).map(normalise),
+          firstCardRollup: (await first.locator(".agent-rollup tbody td").allTextContents()).map(normalise),
+          costLine: normalise(await first.locator(".agent-cost").textContent()),
+          // The roster must be ordered busiest-first; capture enough to see it.
+          order: (await page.locator(".agent-card .agent-identity b").allTextContents()).slice(0, 8),
+        };
+      })()
+    : { present: false };
+
+  if (hasAgentsNav) {
+    await gotoView("Agents");
+    await page.waitForTimeout(300);
+    await page.screenshot({ path: "/tmp/agents-view.png", fullPage: false });
+  }
+
   await gotoView("Relations");
   const relations = {
     heading: normalise(await page.locator(".view-heading h1").textContent()),
@@ -155,6 +190,7 @@ try {
     navLabels,
     live,
     inspector,
+    agents,
     relations,
     archive,
     connections,

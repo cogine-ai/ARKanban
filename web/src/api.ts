@@ -1,6 +1,7 @@
 import type {
   ActivityDetail,
   ActivitySnapshot,
+  AgentOverview,
   CollectorStatus,
   SettledGroupSnapshot,
   SettledRange,
@@ -21,4 +22,5 @@ export const collectorApi = {
     `/api/v1/settled-groups/${encodeURIComponent(seriesKey)}/runs?range=${range}&rangeEnd=${rangeEnd}`,
   ),
   detail: (id: string) => getJson<ActivityDetail>(`/api/v1/activities/${encodeURIComponent(id)}`),
+  agents: () => getJson<{ agents: AgentOverview[] }>("/api/v1/agents"),
 };

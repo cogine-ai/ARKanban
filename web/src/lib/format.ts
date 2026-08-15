@@ -57,6 +57,24 @@ export function formatScheduleRelative(nextRunAt: number, now: number): string {
   return minutes <= 1 ? "in <1m" : `in ${minutes}m`;
 }
 
+/** Renders an em dash for "not measured", which is not the same as 0%. */
+export function formatPercent(value?: number): string {
+  if (value === undefined) return "—";
+  return `${Math.round(value * 100)}%`;
+}
+
+/** Renders an em dash for "not measured", which is not the same as an instant run. */
+export function formatDuration(value?: number): string {
+  if (value === undefined) return "—";
+  if (value < 1_000) return `${value}ms`;
+  const seconds = Math.round(value / 1_000);
+  if (seconds < 60) return `${seconds}s`;
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `${minutes}m ${seconds % 60}s`;
+  const hours = Math.floor(minutes / 60);
+  return `${hours}h ${minutes % 60}m`;
+}
+
 export function scheduleTone(schedule: UpcomingScheduleSnapshot | undefined): "good" | "warn" | "bad" | "quiet" {
   if (!schedule) return "warn";
   if (schedule.state === "live") return schedule.schedulerEnabled ? "good" : "quiet";

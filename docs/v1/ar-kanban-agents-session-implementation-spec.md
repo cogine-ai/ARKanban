@@ -635,6 +635,13 @@ web/src/state/use-paged-query.ts      （新增，供会话列表使用）
 2. 主同步失败时正文同步整轮跳过。正文是次要目标，不得拖累 Live Flow。
 3. 达到 `transcriptMaxBytes` 时停止空闲回填，仅保留活跃会话增量，并按会话最后活动时间从最旧一端驱逐。
 
+实现补充（`src/collector/transcript-sync.ts`）：
+
+- 每个会话每轮只拉一页。长回填跨轮推进，而不是一次占满请求预算。
+- 容量判定不在写路径上做。`usage()` 依赖 `dbstat`，会遍历全部页，因此权威测量最多每 5 分钟一次，其间用本轮写入字节数递增估算；越线时立即重新测量再驱逐。
+- `chat.history` 的字段名与 `sessions.list` 一样来自协议文档而非实测，经 `MESSAGE_FIELD_ALIASES` 声明式读取，未命中项由 `/api/v1/diagnostics/field-coverage` 的 `chat.history` 报告列出。
+- 幂等键要求 Gateway 给出消息序号。若未给出，序号由本地水位续编，此时改以 `messageId` 去重——否则重复拉取同一页会拿到一批新序号，绕过唯一约束。
+
 ### 7.2 幂等与代际
 
 `(session_key, seq)` 是幂等键。重复拉取同一段历史必须是无操作而不是产生重复行。
@@ -646,9 +653,14 @@ Gateway 侧若重写了已同步区间的内容，本地保留先到的版本并
 ### 7.3 读取与搜索
 
 ```text
-GET /api/v1/sessions/:key/messages?cursor=&limit=      读本地归档
-GET /api/v1/search/messages?q=&agentId=&from=&to=      全文检索
+GET /api/v1/sessions/:key/messages?afterSeq=&limit=    读本地归档
+GET /api/v1/search/messages?q=&agentId=&sessionKey=&from=&to=  全文检索
+GET /api/v1/transcripts/status                         归档体量与同步状态（无正文）
 ```
+
+翻页参数落地为 `afterSeq` 而非不透明 cursor：归档内的 `seq` 在单个会话代际内本就单调，再包一层游标只是多一层编解码。
+
+`/api/v1/transcripts/status` 支撑不变量 10 的常态告知，只回计数、水位与配置，不含任何片段。
 
 两个端点都只读本地表，不回源 Gateway，因此在 Gateway 断线时照常工作。响应必须携带该会话的同步水位（`syncedAt`、`syncedCount`、`complete`），前端据此显示归档状态而不是假装实时。
 
@@ -665,6 +677,10 @@ openclaw-collector purge-transcripts --config <path>
 ```
 
 删除 `session_messages` 与 FTS 索引全部内容、保留会话与用量元数据、执行 `VACUUM` 使数据不可从空闲页恢复，并删除 `*.bak` 迁移备份文件（备份同样含正文）。命令必须在非交互环境下要求 `--yes` 显式确认。
+
+该命令不要求 Gateway token。抹除是纯本机操作，而需要抹除正文的场景往往正是 token 已被吊销之后；要求先恢复 token 才能删除本机数据是本末倒置。`loadConfig` 因此对这一条命令放开 token 校验，其余校验不变。
+
+不变量 10 要求「持续明示、不得静默开启」。正文视图属于 S7，因此常态告知先落在 Connections 页的归档面板上：存了多少条、占多少空间、保留多久、上一轮同步结果，以及抹除命令本身。
 
 ## 8. 性能边界
 

@@ -57,6 +57,18 @@ export function formatScheduleRelative(nextRunAt: number, now: number): string {
   return minutes <= 1 ? "in <1m" : `in ${minutes}m`;
 }
 
+export function formatBytes(value: number): string {
+  if (value < 1024) return `${value} B`;
+  const units = ["KiB", "MiB", "GiB", "TiB"];
+  let scaled = value / 1024;
+  let unit = 0;
+  while (scaled >= 1024 && unit < units.length - 1) {
+    scaled /= 1024;
+    unit += 1;
+  }
+  return `${scaled < 10 ? scaled.toFixed(1) : Math.round(scaled)} ${units[unit]}`;
+}
+
 /** Renders an em dash for "not measured", which is not the same as 0%. */
 export function formatPercent(value?: number): string {
   if (value === undefined) return "—";

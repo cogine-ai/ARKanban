@@ -2,8 +2,10 @@
 import { CollectorRuntime } from "./collector/runtime.js";
 import { loadConfig, redactEndpoint } from "./config.js";
 import { createHttpServer } from "./http/server.js";
+import { purgeTranscripts } from "./storage/purge-transcripts.js";
 
-type Command = "start" | "check" | "version";
+const COMMANDS = ["start", "check", "version", "purge-transcripts"] as const;
+type Command = (typeof COMMANDS)[number];
 
 function usage(): string {
   return [
@@ -12,17 +14,18 @@ function usage(): string {
     "Usage:",
     "  openclaw-collector start [--config path]",
     "  openclaw-collector check [--config path]",
+    "  openclaw-collector purge-transcripts [--config path] --yes",
     "  openclaw-collector version",
   ].join("\n");
 }
 
-function parseArguments(argv: string[]): { command: Command; configPath: string } {
+function parseArguments(argv: string[]): { command: Command; configPath: string; confirmed: boolean } {
   const command = (argv[0] ?? "start") as Command;
-  if (!(["start", "check", "version"] as const).includes(command)) throw new Error(usage());
+  if (!COMMANDS.includes(command)) throw new Error(usage());
   const configIndex = argv.indexOf("--config");
   const configPath = configIndex >= 0 ? argv[configIndex + 1] : "collector.config.json";
   if (!configPath) throw new Error("--config requires a path");
-  return { command, configPath };
+  return { command, configPath, confirmed: argv.includes("--yes") };
 }
 
 async function run(): Promise<void> {
@@ -32,7 +35,21 @@ async function run(): Promise<void> {
     return;
   }
 
-  const config = loadConfig(args.configPath);
+  const config = loadConfig(args.configPath, process.env, {
+    requireToken: args.command !== "purge-transcripts",
+  });
+
+  if (args.command === "purge-transcripts") {
+    // Irreversible and unprompted-for: without an explicit flag this would be a
+    // one-keystroke way to destroy the archive from a script.
+    if (!args.confirmed) {
+      throw new Error("purge-transcripts deletes every archived transcript. Re-run with --yes to confirm.");
+    }
+    const result = purgeTranscripts(config.storage.path);
+    process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
+    return;
+  }
+
   const runtime = new CollectorRuntime(config);
   if (args.command === "check") {
     try {

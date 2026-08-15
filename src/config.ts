@@ -76,7 +76,20 @@ function numberValue(value: unknown, fallback: number, label: string, min: numbe
   return value as number;
 }
 
-export function loadConfig(configPath: string, env: NodeJS.ProcessEnv = process.env): ResolvedCollectorConfig {
+export type LoadConfigOptions = {
+  /**
+   * Skips the Gateway token requirement for commands that never connect.
+   * Purging transcripts is a local, offline operation, and an operator doing it
+   * after revoking the token should not have to restore the token first.
+   */
+  requireToken?: boolean;
+};
+
+export function loadConfig(
+  configPath: string,
+  env: NodeJS.ProcessEnv = process.env,
+  options: LoadConfigOptions = {},
+): ResolvedCollectorConfig {
   const absoluteConfigPath = path.resolve(configPath);
   const parsed = JSON.parse(readFileSync(absoluteConfigPath, "utf8")) as unknown;
   const root = asRecord(parsed, "config");
@@ -88,7 +101,7 @@ export function loadConfig(configPath: string, env: NodeJS.ProcessEnv = process.
 
   const tokenEnv = stringValue(gateway.tokenEnv, DEFAULTS.gateway.tokenEnv, "gateway.tokenEnv");
   const token = env[tokenEnv]?.trim();
-  if (!token) {
+  if (!token && options.requireToken !== false) {
     throw new Error(`Gateway token is missing. Set ${tokenEnv} before starting Collector.`);
   }
 
@@ -148,7 +161,7 @@ export function loadConfig(configPath: string, env: NodeJS.ProcessEnv = process.
       name: stringValue(gateway.name, DEFAULTS.gateway.name, "gateway.name"),
       url: stringValue(gateway.url, DEFAULTS.gateway.url, "gateway.url"),
       tokenEnv,
-      token,
+      token: token ?? "",
     },
     server: {
       host,

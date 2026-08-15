@@ -582,6 +582,14 @@ export class CollectorRepository {
     this.db.close();
   }
 
+  /**
+   * Rewrites the database file so pages freed by a delete stop holding their old
+   * contents. Cannot run inside a transaction, so it is never part of one.
+   */
+  vacuum(): void {
+    this.db.exec("VACUUM");
+  }
+
   subscribe(listener: (change: RepositoryChange) => void): () => void {
     this.listeners.add(listener);
     return () => this.listeners.delete(listener);

@@ -22,6 +22,8 @@
     "mock:gateway": "tsx scripts/mock-gateway.ts",
     "demo": "OPENCLAW_GATEWAY_TOKEN=collector-dev-token tsx src/main.ts start --config scripts/mock.config.json",
     "capture:ui": "tsx scripts/capture-ui.ts",
+    "fixtures": "tsx scripts/fixture-server.ts",
+    "verify:views": "tsx scripts/verify-views.ts",
     "build": "pnpm build:server && pnpm build:web",
     "build:server": "tsc -p tsconfig.server.json",
     "build:web": "vite build",

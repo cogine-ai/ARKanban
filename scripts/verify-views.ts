@@ -49,7 +49,10 @@ try {
   await page.locator(".app-shell").waitFor({ state: "visible" });
   await page.waitForTimeout(600);
 
-  const navLabels = await page.locator("nav[aria-label='Primary'] button").allTextContents();
+  // Tolerates the nav being buttons or links so one harness can compare a
+  // build from before a routing change against one from after it.
+  const navSelector = "nav[aria-label='Primary'] :is(a, button)";
+  const navLabels = await page.locator(navSelector).allTextContents();
 
   const live = {
     heading: normalise(await page.locator(".summary-copy h1").textContent()),
@@ -79,7 +82,7 @@ try {
   }
 
   const gotoView = async (label: string) => {
-    await page.locator(`nav[aria-label='Primary'] button:text-is("${label}")`).click();
+    await page.locator(`${navSelector}:text-is("${label}")`).click();
     await page.waitForTimeout(400);
   };
 
@@ -121,6 +124,33 @@ try {
 
   const eventSourceCount = await page.evaluate(() => (window as unknown as { __eventSourceCount: number }).__eventSourceCount);
 
+  // The point of routing is that a view has an address. Clicking must change
+  // it, the address alone must be enough to land on the view, and Back must
+  // return where it came from.
+  const pathAfterNav = async (label: string) => {
+    await gotoView(label);
+    return new URL(page.url()).pathname;
+  };
+  const routing = {
+    liveIsRoot: await pathAfterNav("Live flow"),
+    archivePath: await pathAfterNav("Archive"),
+    connectionsPath: await pathAfterNav("Connections"),
+    backReturnsToArchive: await (async () => {
+      await page.goBack();
+      await page.waitForTimeout(400);
+      return { path: new URL(page.url()).pathname, heading: normalise(await page.locator(".view-heading h1").textContent()) };
+    })(),
+    deepLinkRendersView: await (async () => {
+      await page.goto(`${baseUrl}/relations`, { waitUntil: "networkidle" });
+      await page.locator(".view-heading h1").waitFor({ state: "visible" });
+      return normalise(await page.locator(".view-heading h1").textContent());
+    })(),
+    unknownPathFallsBackToShell: await (async () => {
+      await page.goto(`${baseUrl}/not-a-route`, { waitUntil: "networkidle" });
+      return page.locator(".app-shell").isVisible();
+    })(),
+  };
+
   const report = {
     navLabels,
     live,
@@ -130,6 +160,7 @@ try {
     connections,
     searchSurvivesViewSwitch,
     eventSourceCount,
+    routing,
     consoleErrors,
   };
   writeFileSync(output, `${JSON.stringify(report, null, 2)}\n`);

@@ -97,8 +97,11 @@ if (mode === "capture") {
       return json(response, fixtures.seriesRuns[route] ?? { apiVersion: 1, seriesKey: "", range: "7d", runs: [] });
     }
 
+    // Unknown non-asset paths fall back to index.html so history-API routes are
+    // reachable by direct navigation, matching how the collector serves the app.
     const relative = route === "/" ? "index.html" : route.replace(/^\//, "");
-    const file = path.join(webDir, relative);
+    const candidate = path.join(webDir, relative);
+    const file = existsSync(candidate) ? candidate : path.join(webDir, "index.html");
     if (!existsSync(file)) {
       response.writeHead(404);
       return response.end("not found");

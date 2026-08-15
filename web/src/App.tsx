@@ -4,24 +4,24 @@ import { IncomingOverflowDialog, OverflowDialog, SeriesRunDialog } from "./compo
 import { Inspector } from "./components/Inspector";
 import type { KindFilter } from "./lib/board";
 import { statusLabel } from "./lib/format";
+import { Link, matchPath, useLocation, useNavigate } from "./router";
 import { useCollector } from "./state/collector-context";
 import { ArchiveView } from "./views/Archive";
 import { ConnectionsView } from "./views/Connections";
 import { LiveFlowView } from "./views/LiveFlow";
 import { RelationsView } from "./views/Relations";
 
-type View = "live" | "relations" | "archive" | "connections";
-
-const VIEW_LABELS: Record<View, string> = {
-  live: "Live flow",
-  relations: "Relations",
-  archive: "Archive",
-  connections: "Connections",
-};
+const NAV_ITEMS = [
+  { path: "/", key: "live", label: "Live flow" },
+  { path: "/relations", key: "relations", label: "Relations" },
+  { path: "/archive", key: "archive", label: "Archive" },
+  { path: "/connections", key: "connections", label: "Connections" },
+] as const;
 
 export function App() {
   const { status, snapshot, settled, range, setRange } = useCollector();
-  const [view, setView] = useState<View>("live");
+  const { pathname } = useLocation();
+  const navigateTo = useNavigate();
   const [kind, setKind] = useState<KindFilter>("all");
   const [query, setQuery] = useState("");
   const [selectedId, setSelectedId] = useState<string>();
@@ -53,17 +53,29 @@ export function App() {
     setSelectedSeriesKey(seriesKey);
   };
 
+  const isLive = matchPath("/", pathname) !== undefined;
+
   return (
     <div className="app-shell">
       <header className="topbar">
-        <button className="brand" onClick={() => setView("live")}><span className="mark">AR</span><span>AR Kanban</span></button>
+        <Link className="brand" to="/"><span className="mark">AR</span><span>AR Kanban</span></Link>
         <nav aria-label="Primary">
-          {(Object.keys(VIEW_LABELS) as View[]).map((item) => <button className={view === item ? "active" : ""} key={item} onClick={() => setView(item)}>{VIEW_LABELS[item]}</button>)}
+          {NAV_ITEMS.map((item) => (
+            <Link
+              key={item.key}
+              to={item.path}
+              data-nav={item.key}
+              className={matchPath(item.path, pathname) ? "active" : ""}
+              aria-current={matchPath(item.path, pathname) ? "page" : undefined}
+            >
+              {item.label}
+            </Link>
+          ))}
         </nav>
-        <button className={`gateway-button ${status?.gateway.connected ? "live" : ""}`} onClick={() => setView("connections")}><span />{status?.gateway.name ?? "Gateway"}<small>{statusLabel(status)}</small></button>
+        <button className={`gateway-button ${status?.gateway.connected ? "live" : ""}`} onClick={() => navigateTo("/connections")}><span />{status?.gateway.name ?? "Gateway"}<small>{statusLabel(status)}</small></button>
       </header>
 
-      {view === "live" ? (
+      {isLive ? (
         <LiveFlowView
           kind={kind}
           query={query}
@@ -79,9 +91,9 @@ export function App() {
         />
       ) : (
         <main className="content-shell">
-          {view === "relations" ? <RelationsView snapshot={snapshot} onSelect={openItem} /> : null}
-          {view === "archive" ? <ArchiveView items={snapshot?.items ?? []} onSelect={openItem} /> : null}
-          {view === "connections" ? <ConnectionsView status={status} /> : null}
+          {matchPath("/relations", pathname) ? <RelationsView snapshot={snapshot} onSelect={openItem} /> : null}
+          {matchPath("/archive", pathname) ? <ArchiveView items={snapshot?.items ?? []} onSelect={openItem} /> : null}
+          {matchPath("/connections", pathname) ? <ConnectionsView status={status} /> : null}
         </main>
       )}
 

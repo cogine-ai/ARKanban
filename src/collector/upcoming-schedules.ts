@@ -18,6 +18,23 @@ function numberValue(value: unknown): number | undefined {
   return typeof value === "number" && Number.isFinite(value) ? value : undefined;
 }
 
+/**
+ * Agents that own an enabled cron job, regardless of when it next runs.
+ *
+ * Deliberately not derived from the upcoming window: an agent that entered the
+ * roster only while its job was within the next hour would appear and vanish on
+ * a timer.
+ */
+export function scheduleAgentIds(jobs: Array<Record<string, unknown>>, defaultAgentId?: string): string[] {
+  const ids = new Set<string>();
+  for (const job of jobs) {
+    if (job.enabled !== true) continue;
+    const agentId = stringValue(job.agentId) ?? stringValue(defaultAgentId);
+    if (agentId) ids.add(agentId);
+  }
+  return [...ids];
+}
+
 export function selectUpcomingSchedules(
   jobs: Array<Record<string, unknown>>,
   options: { now: number; defaultAgentId?: string },

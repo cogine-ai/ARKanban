@@ -63,6 +63,10 @@ export type AgentSummary = {
 
 `origin` 区分「来自 `agents.list` 的权威名册」与「从已观测 `agentId` 反推」。反推得到的 Agent 必须在 UI 上可辨认，不能与权威名册混为一谈。
 
+写入优先级：反推写入携带的是占位 `displayName`（等于 id）与 `kind: "unknown"`，它们是真实值而非 null，因此 COALESCE 保护不到。名册刷新周期（`AGENT_RECONCILE_MS`）远长于会话对账周期，若不额外约束，权威名册会在数秒内被占位值覆盖。约束为：**当已存行 `origin = "roster"` 而本次写入不是 roster 时，`displayName`、`kind` 与指纹一律保留已存值**；此类写入不得触发 revision 变更。roster 写入之间仍以后写为准，Gateway 才能改名。
+
+反推来源除会话外还包括 cron 作业的 `agentId`（含 `defaultId` 兜底）。取自完整作业列表而非「未来一小时」窗口——否则 Agent 会随 cron 临近而在名册中忽隐忽现。缺此反推时，`agents.list` 未列出的 Agent 其排期将渲染在不存在的卡片上。
+
 ### 2.2 Session
 
 ```ts

@@ -47,7 +47,50 @@ describe("CollectorRepository agents and sessions", () => {
     ]);
     repo.upsertAgents([{ id: "builder", displayName: "builder", kind: "unknown", origin: "observed", observedAt: 2_000 }]);
 
-    expect(repo.listAgents()[0]).toMatchObject({ origin: "roster", model: "sonnet", firstObservedAt: 1_000 });
+    // Inference supplies a placeholder name and an unknown kind as real values,
+    // so they would overwrite the roster unless the write is held subordinate.
+    expect(repo.listAgents()[0]).toMatchObject({
+      origin: "roster",
+      displayName: "Builder",
+      kind: "agent",
+      model: "sonnet",
+      firstObservedAt: 1_000,
+    });
+  });
+
+  it("does not bump the revision when inference repeats against a roster entry", () => {
+    const repo = repository();
+    repo.upsertAgents([
+      { id: "builder", displayName: "Builder", kind: "agent", origin: "roster", observedAt: 1_000 },
+    ]);
+    const revision = repo.revision;
+    repo.upsertAgents([{ id: "builder", displayName: "builder", kind: "unknown", origin: "observed", observedAt: 2_000 }]);
+    repo.upsertAgents([{ id: "builder", displayName: "builder", kind: "unknown", origin: "observed", observedAt: 3_000 }]);
+
+    expect(repo.revision).toBe(revision);
+  });
+
+  it("upgrades an inferred entry when the roster finally arrives", () => {
+    const repo = repository();
+    repo.upsertAgents([{ id: "builder", displayName: "builder", kind: "unknown", origin: "observed", observedAt: 1_000 }]);
+    repo.upsertAgents([
+      { id: "builder", displayName: "Builder", kind: "system", runtime: "openclaw", origin: "roster", observedAt: 2_000 },
+    ]);
+
+    expect(repo.listAgents()[0]).toMatchObject({
+      origin: "roster",
+      displayName: "Builder",
+      kind: "system",
+      runtime: "openclaw",
+    });
+  });
+
+  it("lets a later roster write correct an earlier roster value", () => {
+    const repo = repository();
+    repo.upsertAgents([{ id: "builder", displayName: "Builder", kind: "agent", origin: "roster", observedAt: 1_000 }]);
+    repo.upsertAgents([{ id: "builder", displayName: "Build Bot", kind: "system", origin: "roster", observedAt: 2_000 }]);
+
+    expect(repo.listAgents()[0]).toMatchObject({ displayName: "Build Bot", kind: "system" });
   });
 
   it("keeps lineage facts that a later partial observation omits", () => {

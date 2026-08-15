@@ -41,6 +41,7 @@ import {
 } from "../storage/repository.js";
 import {
   DUE_GRACE_MINUTES,
+  scheduleAgentIds,
   selectUpcomingSchedules,
   UPCOMING_WINDOW_MINUTES,
 } from "./upcoming-schedules.js";
@@ -547,6 +548,9 @@ export class CollectorRuntime {
 
       const now = Date.now();
       const selected = selectUpcomingSchedules(jobs, { now, ...(this.defaultAgentId ? { defaultAgentId: this.defaultAgentId } : {}) });
+      // A cron job proves its agent exists even when the roster call omits it,
+      // and without this its schedule would render against no Agent card.
+      this.repository.upsertAgents(inferAgents(scheduleAgentIds(jobs, this.defaultAgentId), now));
       this.updateSchedule(
         {
           state: selected.omittedAgentCount > 0 ? "partial" : "live",

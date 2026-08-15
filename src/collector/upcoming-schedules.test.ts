@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { selectUpcomingSchedules } from "./upcoming-schedules.js";
+import { scheduleAgentIds, selectUpcomingSchedules } from "./upcoming-schedules.js";
 
 describe("upcoming schedule selection", () => {
   it("returns one enabled occurrence inside the due-now and next-hour boundaries", () => {
@@ -76,5 +76,36 @@ describe("upcoming schedule selection", () => {
       ],
       omittedAgentCount: 1,
     });
+  });
+});
+
+describe("schedule agent ids", () => {
+  const now = 1_000_000_000;
+
+  it("collects owners of enabled jobs regardless of when they next run", () => {
+    const ids = scheduleAgentIds([
+      { id: "soon", enabled: true, agentId: "scheduler", nextRunAtMs: now + 1_000 },
+      { id: "far", enabled: true, agentId: "ops", nextRunAtMs: now + 30 * 24 * 3_600_000 },
+      { id: "undated", enabled: true, agentId: "archivist" },
+      { id: "repeat", enabled: true, agentId: "scheduler", nextRunAtMs: now + 2_000 },
+    ]);
+
+    expect(ids.sort()).toEqual(["archivist", "ops", "scheduler"]);
+  });
+
+  it("attributes unowned jobs to the default agent and skips disabled ones", () => {
+    const ids = scheduleAgentIds(
+      [
+        { id: "inherits", enabled: true, nextRunAtMs: now + 1_000 },
+        { id: "off", enabled: false, agentId: "retired", nextRunAtMs: now + 1_000 },
+      ],
+      "main",
+    );
+
+    expect(ids).toEqual(["main"]);
+  });
+
+  it("yields nothing when a job has no owner and there is no default", () => {
+    expect(scheduleAgentIds([{ id: "orphan", enabled: true, nextRunAtMs: now + 1_000 }])).toEqual([]);
   });
 });

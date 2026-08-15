@@ -316,6 +316,31 @@ function agentFingerprint(write: AgentWrite): string {
   return JSON.stringify([write.displayName, write.kind, write.runtime, write.model, write.origin]);
 }
 
+/**
+ * `identity` selects where the descriptive columns come from on conflict:
+ * `excluded` lets the incoming write win, `agents` keeps the stored row.
+ */
+function agentUpsertSql(identity: "excluded" | "agents"): string {
+  return `
+    INSERT INTO agents (
+      id, display_name, kind, runtime, model, origin, first_observed_at, last_activity_at, fingerprint
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(id) DO UPDATE SET
+      display_name = ${identity}.display_name,
+      kind = ${identity}.kind,
+      fingerprint = ${identity}.fingerprint,
+      runtime = COALESCE(excluded.runtime, agents.runtime),
+      model = COALESCE(excluded.model, agents.model),
+      origin = CASE WHEN excluded.origin = 'roster' THEN 'roster' ELSE agents.origin END,
+      first_observed_at = MIN(excluded.first_observed_at, agents.first_observed_at),
+      last_activity_at = CASE
+        WHEN excluded.last_activity_at IS NULL THEN agents.last_activity_at
+        WHEN agents.last_activity_at IS NULL THEN excluded.last_activity_at
+        ELSE MAX(excluded.last_activity_at, agents.last_activity_at)
+      END
+  `;
+}
+
 function sessionFingerprint(write: SessionWrite): string {
   return JSON.stringify([
     write.sessionId,
@@ -892,33 +917,23 @@ export class CollectorRepository {
    */
   upsertAgents(writes: AgentWrite[]): number {
     if (writes.length === 0) return 0;
-    const statement = this.db.prepare(`
-      INSERT INTO agents (
-        id, display_name, kind, runtime, model, origin, first_observed_at, last_activity_at, fingerprint
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-      ON CONFLICT(id) DO UPDATE SET
-        display_name = excluded.display_name,
-        kind = excluded.kind,
-        runtime = COALESCE(excluded.runtime, agents.runtime),
-        model = COALESCE(excluded.model, agents.model),
-        origin = CASE WHEN excluded.origin = 'roster' THEN 'roster' ELSE agents.origin END,
-        first_observed_at = MIN(excluded.first_observed_at, agents.first_observed_at),
-        last_activity_at = CASE
-          WHEN excluded.last_activity_at IS NULL THEN agents.last_activity_at
-          WHEN agents.last_activity_at IS NULL THEN excluded.last_activity_at
-          ELSE MAX(excluded.last_activity_at, agents.last_activity_at)
-        END,
-        fingerprint = excluded.fingerprint
-    `);
-    const findFingerprint = this.db.prepare("SELECT fingerprint FROM agents WHERE id = ?");
+    const authoritative = this.db.prepare(agentUpsertSql("excluded"));
+    const subordinate = this.db.prepare(agentUpsertSql("agents"));
+    const findExisting = this.db.prepare("SELECT origin, fingerprint FROM agents WHERE id = ?");
     let changed = 0;
     this.db.exec("BEGIN IMMEDIATE");
     try {
       for (const write of writes) {
         const fingerprint = agentFingerprint(write);
-        const existing = findFingerprint.get(write.id) as { fingerprint?: string } | undefined;
-        if (existing?.fingerprint !== fingerprint) changed += 1;
-        statement.run(
+        const existing = findExisting.get(write.id) as { origin?: string; fingerprint?: string } | undefined;
+        // An inferred write carries a placeholder display name and an unknown
+        // kind. Those are real values, not nulls, so COALESCE cannot protect the
+        // authoritative row — and inference runs far more often than the roster
+        // refresh, so without this guard the roster is clobbered within seconds.
+        const held = existing?.origin === "roster" && write.origin !== "roster";
+        const stored = held ? existing.fingerprint : fingerprint;
+        if (existing?.fingerprint !== stored) changed += 1;
+        (held ? subordinate : authoritative).run(
           write.id,
           write.displayName,
           write.kind,

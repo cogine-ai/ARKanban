@@ -3,6 +3,9 @@ import { WebSocketServer, type WebSocket } from "ws";
 const port = Number(process.env.MOCK_GATEWAY_PORT ?? 18_790);
 const expectedToken = process.env.OPENCLAW_GATEWAY_TOKEN ?? "collector-dev-token";
 const agents = ["researcher", "writer", "ops", "analyst", "planner", "builder", "qa", "deployer", "reviewer", "scheduler", "publisher", "monitor", "crawler", "triage", "orchestrator"];
+// The Gateway roster mixes operator-facing agents with internal ones. These
+// carry no sessions, so they only ever surface through agents.list.
+const systemAgents = ["memory-keeper", "gateway-supervisor"];
 const titles = ["Competitive scan", "Source review", "Publish release", "Deploy monitor", "Dependency map", "Regression check", "Audit backfill", "Draft narrative", "Policy check", "Index refresh", "Summarize session", "Health probe", "Tool analysis", "Schedule report", "Approval request", "Plan rollout", "Fetch sources", "Compare builds", "Validate output", "Write brief"];
 const now = Date.now();
 
@@ -143,13 +146,21 @@ server.on("connection", (socket) => {
         ok: true,
         payload: {
           defaultId: "main",
-          agents: agents.map((id, index) => ({
-            id,
-            displayName: `${id[0]!.toUpperCase()}${id.slice(1)}`,
-            kind: "agent",
-            runtime: "openclaw",
-            model: models[index % models.length]!,
-          })),
+          agents: [
+            ...agents.map((id, index) => ({
+              id,
+              displayName: `${id[0]!.toUpperCase()}${id.slice(1)}`,
+              kind: "agent",
+              runtime: "openclaw",
+              model: models[index % models.length]!,
+            })),
+            ...systemAgents.map((id) => ({
+              id,
+              displayName: id.split("-").map((part) => `${part[0]!.toUpperCase()}${part.slice(1)}`).join(" "),
+              kind: "system",
+              runtime: "openclaw",
+            })),
+          ],
         },
       });
     } else if (request.method === "cron.status") {

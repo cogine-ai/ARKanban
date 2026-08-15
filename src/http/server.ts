@@ -38,6 +38,18 @@ export async function createHttpServer(
   });
   app.get("/api/v1/meta", async () => runtime.getStatus());
   app.get("/api/v1/snapshot", async () => runtime.getSnapshot());
+  /**
+   * Reports how the session and agent projectors matched the connected Gateway:
+   * `unknown` keys were returned but consumed by nothing, `missing` aliases were
+   * looked for and never seen. Both indicate a mapping that needs correcting for
+   * this Gateway build. Field names only — no session content.
+   */
+  app.get("/api/v1/diagnostics/field-coverage", async () => ({
+    gateway: runtime.getStatus().gateway,
+    capabilities: runtime.getCapabilities(),
+    fields: runtime.getFieldReports(),
+    ...runtime.getArchiveDiagnostics(),
+  }));
   app.get<{ Querystring: { range?: string; rangeEnd?: string } }>("/api/v1/settled-groups", async (request, reply) => {
     const range = settledRange(request.query.range);
     if (!range) return reply.code(400).send({ error: "invalid_settled_range", allowed: ["24h", "7d", "30d"] });

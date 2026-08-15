@@ -44,10 +44,14 @@ import {
   selectUpcomingSchedules,
   UPCOMING_WINDOW_MINUTES,
 } from "./upcoming-schedules.js";
+import { inferAgents, projectAgent, projectSession } from "../activity/session-projector.js";
+import { CapabilityRegistry, type CapabilityState } from "./capability-probe.js";
+import { FieldInventory, type FieldInventoryReport } from "./field-inventory.js";
 
 const REQUIRED_METHODS = ["tasks.list", "sessions.list", "sessions.subscribe"] as const;
 const SCHEDULE_RECONCILE_MS = 60_000;
 const CRON_PAGE_LIMIT = 200;
+const AGENT_RECONCILE_MS = 300_000;
 
 type StatusListener = (status: CollectorStatus) => void;
 type ChangeListener = (change: RepositoryChange) => void;
@@ -103,9 +107,15 @@ export class CollectorRuntime {
   private sessionTimer?: NodeJS.Timeout;
   private scheduleTimer?: NodeJS.Timeout;
   private pruneTimer?: NodeJS.Timeout;
+  private agentTimer?: NodeJS.Timeout;
   private taskSyncing = false;
   private sessionSyncing = false;
   private scheduleSyncing = false;
+  private agentSyncing = false;
+  private readonly capabilities = new CapabilityRegistry();
+  private readonly sessionFields = new FieldInventory("sessions.list");
+  private readonly agentFields = new FieldInventory("agents.list");
+  private sessionArchiveError?: string;
   private syncState: CollectorSyncState = "starting";
   private syncReasons: string[] = ["collector_starting"];
   private gatewayHello?: GatewayHello;
@@ -145,6 +155,9 @@ export class CollectorRuntime {
     this.sessionTimer = setInterval(() => void this.syncSessions("session_interval"), this.config.reconcile.sessionsMs);
     this.scheduleTimer = setInterval(() => void this.syncSchedules("schedule_interval"), SCHEDULE_RECONCILE_MS);
     this.pruneTimer = setInterval(() => this.prune(), 6 * 60 * 60 * 1_000);
+    // Deliberately not sharing the 8s session tick: a slow roster call must not
+    // be able to delay session reconciliation.
+    this.agentTimer = setInterval(() => void this.syncAgents("agent_interval"), AGENT_RECONCILE_MS);
     this.gateway.start();
   }
 
@@ -154,6 +167,7 @@ export class CollectorRuntime {
     if (this.sessionTimer) clearInterval(this.sessionTimer);
     if (this.scheduleTimer) clearInterval(this.scheduleTimer);
     if (this.pruneTimer) clearInterval(this.pruneTimer);
+    if (this.agentTimer) clearInterval(this.agentTimer);
     this.gateway.stop();
     this.repository.close();
   }
@@ -245,6 +259,11 @@ export class CollectorRuntime {
     } else if (state.state === "connected") {
       this.gatewayHello = state.hello;
       this.defaultAgentId = undefined;
+      // A reconnect may land on a different Gateway build, so probe verdicts and
+      // field observations from the previous connection are discarded.
+      this.capabilities.newGeneration();
+      this.sessionFields.reset();
+      this.agentFields.reset();
       this.connectedAt = state.connectedAt;
       this.syncState = "reconciling";
       this.syncReasons = ["initial_snapshot"];
@@ -263,6 +282,9 @@ export class CollectorRuntime {
         this.setSource("events", { state: "unavailable", code: "sessions_subscribe_missing" });
       }
       await Promise.all([this.syncTasks("gateway_connected"), this.syncSessions("gateway_connected"), this.syncSchedules("gateway_connected")]);
+      // Roster and capability probing trail the required sources so they can
+      // never delay the first authoritative snapshot.
+      await Promise.all([this.syncAgents("gateway_connected"), this.probeCapabilities()]);
       this.deriveSyncState();
     } else if (state.state === "unauthorized") {
       this.syncState = "unauthorized";
@@ -349,6 +371,11 @@ export class CollectorRuntime {
         offset = nextOffset;
       }
       const now = Date.now();
+      // The session archive must record every row, including archived and idle
+      // ones that the Activity projection below deliberately skips. Failing here
+      // must not cost us the Live Flow projection, so it gets its own boundary.
+      this.archiveSessions(sessions, now);
+
       const writes: ActivityWrite[] = [];
       const activeSourceKeys = new Set<string>();
       for (const session of sessions) {
@@ -402,6 +429,86 @@ export class CollectorRuntime {
       this.deriveSyncState();
       this.emitStatus();
     }
+  }
+
+  /**
+   * Persists the session archive from a `sessions.list` page set.
+   *
+   * Isolated from the Activity projection on purpose: the archive is a secondary
+   * product, and a failure here must leave Live Flow untouched rather than fail
+   * the whole session sync.
+   */
+  private archiveSessions(rows: Record<string, unknown>[], now: number): void {
+    try {
+      const writes = rows.flatMap((row) => {
+        const projected = projectSession(row, now, this.sessionFields);
+        return projected ? [projected] : [];
+      });
+      if (writes.length === 0) return;
+      this.repository.upsertSessions(writes);
+      this.repository.linkActivitySessions();
+      // Sessions carry agent ids even when agents.list is unavailable, so the
+      // roster stays populated either way. `observed` entries never overwrite
+      // authoritative ones.
+      this.repository.upsertAgents(inferAgents(writes.map((write) => write.agentId), now));
+      this.sessionArchiveError = undefined;
+    } catch (error) {
+      // Recorded as a diagnostic rather than through setSource: source states feed
+      // deriveSyncState, and the archive is not allowed to change sync state.
+      this.sessionArchiveError = error instanceof Error ? error.message : String(error);
+    }
+  }
+
+  /**
+   * Refreshes the Agent roster. Runs on its own timer and swallows its own
+   * failures: an absent roster degrades Agent metadata to what sessions imply,
+   * which is a coverage question rather than a sync-state one.
+   */
+  private async syncAgents(reason: string): Promise<void> {
+    if (this.agentSyncing || !this.gateway.isConnected) return;
+    if (!new Set(this.gatewayHello?.features.methods ?? []).has("agents.list")) return;
+    this.agentSyncing = true;
+    try {
+      const response = record(await this.gateway.request("agents.list", {}));
+      this.defaultAgentId ??= stringField(response, "defaultId");
+      const now = Date.now();
+      const writes = arrayRecords(response.agents).flatMap((row) => {
+        const projected = projectAgent(row, now, this.agentFields);
+        return projected ? [projected] : [];
+      });
+      if (writes.length > 0) this.repository.upsertAgents(writes);
+    } catch {
+      // Roster stays at whatever sessions already implied; see inferAgents.
+    } finally {
+      this.agentSyncing = false;
+    }
+  }
+
+  /**
+   * One read-only probe per non-discoverable method, bound to the current
+   * connection generation.
+   */
+  private async probeCapabilities(): Promise<void> {
+    if (!this.gateway.isConnected) return;
+    try {
+      await this.capabilities.probeAll(async (method, params) => this.gateway.request(method, params));
+    } catch {
+      // probeAll already classifies per-method outcomes; a throw here would only
+      // come from the caller itself and must not affect sync state.
+    }
+  }
+
+  /** Field-mapping diagnostics for validating the projectors against a real Gateway. */
+  getFieldReports(): FieldInventoryReport[] {
+    return [this.sessionFields.report(), this.agentFields.report()];
+  }
+
+  getCapabilities(): Record<string, CapabilityState> {
+    return this.capabilities.snapshot();
+  }
+
+  getArchiveDiagnostics(): { sessionArchiveError?: string } {
+    return this.sessionArchiveError ? { sessionArchiveError: this.sessionArchiveError } : {};
   }
 
   private async syncSchedules(reason: string): Promise<void> {
@@ -663,11 +770,9 @@ export class CollectorRuntime {
   }
 
   private prune(): void {
-    const day = 24 * 60 * 60 * 1_000;
     const now = Date.now();
+    const day = 24 * 60 * 60 * 1_000;
     this.repository.prune(now - this.config.storage.terminalRetentionDays * day);
-    // Sessions outlive the activities that referenced them, so they prune on
-    // their own, longer retention window.
     this.repository.pruneSessions(now - this.config.storage.sessionRetentionDays * day);
   }
 }

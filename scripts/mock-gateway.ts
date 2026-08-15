@@ -38,19 +38,45 @@ const tasks = Array.from({ length: 170 }, (_, index) => {
   };
 });
 
-const sessions = Array.from({ length: 40 }, (_, index) => {
+const models = ["claude-opus-4", "claude-sonnet-4", "gpt-5"];
+const categories = ["research", "delivery", "ops"];
+const sessionKinds = ["direct", "fork", "subagent"];
+
+// The first 40 rows stay live so Live Flow keeps its previous fixture. The tail
+// is idle and archived, which only the session archive should retain — that
+// asymmetry is what exercises the ordering of archive-before-filter.
+const sessions = Array.from({ length: 64 }, (_, index) => {
   const agentId = agents[(index * 7) % agents.length]!;
+  const live = index < 40;
+  const kind = sessionKinds[index % sessionKinds.length]!;
+  const archived = index >= 52;
   return {
-    key: `agent:${agentId}:demo-live-${index + 1}`,
+    key: `agent:${agentId}:demo-${live ? "live" : "idle"}-${index + 1}`,
     sessionId: `demo-session-${index + 1}`,
-    kind: "direct",
+    kind,
     label: titles[(index + 5) % titles.length]!,
     agentId,
+    agentRuntime: "openclaw",
+    model: models[index % models.length]!,
+    category: categories[index % categories.length]!,
+    placement: index % 5 === 0 ? "workspace" : "inline",
+    archived,
     updatedAt: now - index * 1_200,
-    status: "running",
-    hasActiveRun: true,
-    activeRunIds: [`demo-live-run-${index + 1}`],
+    status: live ? "running" : "idle",
+    hasActiveRun: live,
+    activeRunIds: live ? [`demo-live-run-${index + 1}`] : [],
     startedAt: now - (index + 1) * 11_000,
+    createdAt: now - (index + 1) * 11_000,
+    ...(kind === "fork" ? { forkSource: `agent:${agentId}:demo-live-${Math.max(1, index - 1)}` } : {}),
+    ...(kind === "subagent"
+      ? {
+          parentSessionKey: `agent:${agentId}:demo-live-${Math.max(1, index - 2)}`,
+          spawnedBy: `agent:${agentId}:demo-live-${Math.max(1, index - 2)}`,
+          spawnDepth: 1,
+          subagentRole: "researcher",
+        }
+      : {}),
+    worktree: { branch: `feature/demo-${index % 7}`, repoRoot: "/home/demo/repo" },
   };
 });
 
@@ -111,7 +137,21 @@ server.on("connection", (socket) => {
         });
       }, 120);
     } else if (request.method === "agents.list") {
-      send(socket, { type: "res", id: request.id, ok: true, payload: { defaultId: "main", agents: agents.map((id) => ({ id })) } });
+      send(socket, {
+        type: "res",
+        id: request.id,
+        ok: true,
+        payload: {
+          defaultId: "main",
+          agents: agents.map((id, index) => ({
+            id,
+            displayName: `${id[0]!.toUpperCase()}${id.slice(1)}`,
+            kind: "agent",
+            runtime: "openclaw",
+            model: models[index % models.length]!,
+          })),
+        },
+      });
     } else if (request.method === "cron.status") {
       send(socket, { type: "res", id: request.id, ok: true, payload: { enabled: true, jobs: cronJobs.length, nextWakeAtMs: cronJobs[0]?.state.nextRunAtMs } });
     } else if (request.method === "cron.list") {
@@ -125,9 +165,11 @@ server.on("connection", (socket) => {
   });
 });
 
+const liveSessions = sessions.filter((session) => session.hasActiveRun);
+
 const eventTimer = setInterval(() => {
-  const index = Math.floor(Date.now() / 1_800) % sessions.length;
-  const session = sessions[index]!;
+  const index = Math.floor(Date.now() / 1_800) % liveSessions.length;
+  const session = liveSessions[index]!;
   const payload = {
     runId: session.activeRunIds[0],
     sessionKey: session.key,

@@ -97,6 +97,32 @@ const transcriptTurns = [
   { role: "assistant", content: "Recorded verbatim. The payload above is stored as text and never executed." },
 ];
 
+/**
+ * Deterministic token counts per session.
+ *
+ * Every third session is left unpriced so the cost view is exercised on the
+ * case that matters: a total that is a floor rather than a measurement.
+ */
+function mockUsage(sessionKey: string, model: string, observedAt: number): Record<string, unknown> {
+  let hash = 0;
+  for (const character of sessionKey) hash = (hash * 37 + character.charCodeAt(0)) % 9_973;
+  const inputTokens = 1_200 + hash * 3;
+  const outputTokens = 300 + (hash % 700);
+  const unpriced = hash % 3 === 0;
+  return {
+    sessionKey,
+    inputTokens,
+    outputTokens,
+    cacheReadTokens: hash % 500,
+    cacheWriteTokens: hash % 90,
+    peakContextTokens: 8_000 + (hash % 24_000),
+    ...(unpriced ? {} : { costUsd: Number(((inputTokens * 3 + outputTokens * 15) / 1_000_000).toFixed(6)) }),
+    models: [model],
+    ...(unpriced ? { unpricedModels: [model] } : {}),
+    observedAt,
+  };
+}
+
 function transcriptLength(sessionKey: string): number {
   // Deterministic per session so repeated pulls are stable and pagination is
   // reproducible across restarts.
@@ -193,6 +219,49 @@ server.on("connection", (socket) => {
           messages: page,
           hasMore: nextOffset < total,
           ...(nextOffset < total ? { nextCursor: String(nextOffset) } : {}),
+        },
+      });
+    } else if (request.method === "sessions.usage") {
+      const params = request.params as { sessionKey?: string; limit?: number } | undefined;
+      const observedAt = Date.now();
+      if (params?.sessionKey) {
+        const session = sessions.find((entry) => entry.key === params.sessionKey);
+        if (!session) {
+          send(socket, { type: "res", id: request.id, ok: false, error: { code: "NOT_FOUND", message: "unknown session" } });
+        } else {
+          send(socket, { type: "res", id: request.id, ok: true, payload: mockUsage(session.key, session.model, observedAt) });
+        }
+      } else {
+        // The capability probe calls this with only a limit, so the batch shape
+        // has to answer too.
+        const limit = Math.min(Number(params?.limit ?? 50), 100);
+        send(socket, {
+          type: "res",
+          id: request.id,
+          ok: true,
+          payload: { sessions: sessions.slice(0, limit).map((entry) => mockUsage(entry.key, entry.model, observedAt)) },
+        });
+      }
+    } else if (request.method === "usage.cost") {
+      const params = request.params as { from?: number; to?: number } | undefined;
+      const from = Number(params?.from ?? 0);
+      const to = Number(params?.to ?? Date.now());
+      const byAgent = new Map<string, number>();
+      for (const session of sessions) {
+        if (session.updatedAt < from || session.updatedAt > to) continue;
+        const usage = mockUsage(session.key, session.model, to);
+        const costUsd = usage.costUsd;
+        if (typeof costUsd !== "number") continue;
+        byAgent.set(session.agentId, (byAgent.get(session.agentId) ?? 0) + Math.round(costUsd * 1_000_000));
+      }
+      send(socket, {
+        type: "res",
+        id: request.id,
+        ok: true,
+        payload: {
+          from,
+          to,
+          agents: [...byAgent].map(([agentId, costMicroUsd]) => ({ agentId, costMicroUsd })),
         },
       });
     } else if (request.method === "agents.list") {

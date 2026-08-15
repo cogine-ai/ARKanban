@@ -2,6 +2,7 @@ import type {
   ActivityDetail,
   ActivityPhase,
   ActivitySnapshot,
+  AgentRollupWindow,
   CollectorStatus,
   CollectorSyncState,
   SettledGroupSnapshot,
@@ -39,6 +40,7 @@ import {
   type RepositoryChange,
   type StoredActivity,
 } from "../storage/repository.js";
+import { USAGE_ROLLUP_AFTER_DAYS } from "../storage/usage-store.js";
 import {
   DUE_GRACE_MINUTES,
   scheduleAgentIds,
@@ -47,6 +49,12 @@ import {
 } from "./upcoming-schedules.js";
 import { inferAgents, projectAgent, projectSession } from "../activity/session-projector.js";
 import { CapabilityRegistry, type CapabilityState } from "./capability-probe.js";
+import {
+  classifyUsageFailure,
+  USAGE_SYNC_MS,
+  UsageSynchronizer,
+  type UsageSyncOutcome,
+} from "./usage-sync.js";
 import {
   classifyHistoryFailure,
   TRANSCRIPT_SYNC_MS,
@@ -116,17 +124,23 @@ export class CollectorRuntime {
   private pruneTimer?: NodeJS.Timeout;
   private agentTimer?: NodeJS.Timeout;
   private transcriptTimer?: NodeJS.Timeout;
+  private usageTimer?: NodeJS.Timeout;
   private taskSyncing = false;
   private sessionSyncing = false;
   private scheduleSyncing = false;
   private agentSyncing = false;
   private transcriptSyncing = false;
+  private usageSyncing = false;
   private readonly capabilities = new CapabilityRegistry();
   private readonly sessionFields = new FieldInventory("sessions.list");
   private readonly agentFields = new FieldInventory("agents.list");
   private readonly messageFields = new FieldInventory("chat.history");
+  private readonly usageFields = new FieldInventory("sessions.usage");
+  private readonly costFields = new FieldInventory("usage.cost");
   private readonly transcripts: TranscriptSynchronizer;
+  private readonly usage: UsageSynchronizer;
   private transcriptStatus: TranscriptSyncOutcome | undefined;
+  private usageStatus: UsageSyncOutcome | undefined;
   private sessionArchiveError?: string;
   private syncState: CollectorSyncState = "starting";
   private syncReasons: string[] = ["collector_starting"];
@@ -165,6 +179,12 @@ export class CollectorRuntime {
       enabled: config.storage.transcriptSync === "enabled",
       inventory: this.messageFields,
     });
+    this.usage = new UsageSynchronizer({
+      store: this.repository.usage,
+      request: async (method, params) => this.gateway.request(method, params),
+      inventory: this.usageFields,
+      costInventory: this.costFields,
+    });
   }
 
   start(): void {
@@ -178,6 +198,7 @@ export class CollectorRuntime {
     // be able to delay session reconciliation.
     this.agentTimer = setInterval(() => void this.syncAgents("agent_interval"), AGENT_RECONCILE_MS);
     this.transcriptTimer = setInterval(() => void this.syncTranscripts(), TRANSCRIPT_SYNC_MS);
+    this.usageTimer = setInterval(() => void this.syncUsage(), USAGE_SYNC_MS);
     this.gateway.start();
   }
 
@@ -189,6 +210,7 @@ export class CollectorRuntime {
     if (this.pruneTimer) clearInterval(this.pruneTimer);
     if (this.agentTimer) clearInterval(this.agentTimer);
     if (this.transcriptTimer) clearInterval(this.transcriptTimer);
+    if (this.usageTimer) clearInterval(this.usageTimer);
     this.gateway.stop();
     this.repository.close();
   }
@@ -285,6 +307,11 @@ export class CollectorRuntime {
       this.capabilities.newGeneration();
       this.sessionFields.reset();
       this.agentFields.reset();
+      this.usageFields.reset();
+      this.costFields.reset();
+      // Prices are held in memory against a specific Gateway's pricing table,
+      // so they do not survive a reconnect either.
+      this.usage.resetCost();
       this.connectedAt = state.connectedAt;
       this.syncState = "reconciling";
       this.syncReasons = ["initial_snapshot"];
@@ -544,6 +571,56 @@ export class CollectorRuntime {
   }
 
   /**
+   * Pulls token counts and cost.
+   *
+   * Isolated the same way transcripts are: own timer, own try boundary, no
+   * influence on `CollectorSyncState`. A Gateway that cannot price work is a
+   * coverage fact for the cost view, not a degraded collector.
+   */
+  private async syncUsage(): Promise<void> {
+    if (this.usageSyncing) return;
+    this.usageSyncing = true;
+    try {
+      this.usageStatus = await this.usage.runOnce({
+        now: Date.now(),
+        connected: this.gateway.isConnected,
+        usageState: this.capabilities.stateOf("sessions.usage"),
+        costState: this.capabilities.stateOf("usage.cost"),
+      });
+    } catch (error) {
+      this.usageStatus = {
+        requests: 0,
+        recorded: 0,
+        sessions: 0,
+        coverage: "error",
+        errorCode: classifyUsageFailure(error),
+        costRefreshed: false,
+      };
+    } finally {
+      this.usageSyncing = false;
+      this.repository.setUsageCoverage(this.usageStatus?.coverage ?? "not_observed");
+      if ((this.usageStatus?.recorded ?? 0) > 0 || this.usageStatus?.costRefreshed) {
+        this.emitChange({
+          epoch: this.repository.epoch,
+          revision: this.repository.revision,
+          topics: ["usage"],
+          ids: [],
+          reasons: ["usage_sync"],
+        });
+      }
+    }
+  }
+
+  getUsageStatus(): UsageSyncOutcome | undefined {
+    return this.usageStatus;
+  }
+
+  /** Gateway-priced cost per agent, absent when `usage.cost` never answered. */
+  getAgentCost(window: AgentRollupWindow, agentId: string): number | undefined {
+    return this.usage.costFor(window, agentId);
+  }
+
+  /**
    * One read-only probe per non-discoverable method, bound to the current
    * connection generation.
    */
@@ -559,7 +636,13 @@ export class CollectorRuntime {
 
   /** Field-mapping diagnostics for validating the projectors against a real Gateway. */
   getFieldReports(): FieldInventoryReport[] {
-    return [this.sessionFields.report(), this.agentFields.report(), this.messageFields.report()];
+    return [
+      this.sessionFields.report(),
+      this.agentFields.report(),
+      this.messageFields.report(),
+      this.usageFields.report(),
+      this.costFields.report(),
+    ];
   }
 
   getCapabilities(): Record<string, CapabilityState> {
@@ -841,6 +924,11 @@ export class CollectorRuntime {
   private prune(): void {
     const now = Date.now();
     const day = 24 * 60 * 60 * 1_000;
+    // Usage folds before sessions age out: rollup reads the agent through the
+    // session row, so deleting sessions first would strand the spend as
+    // unattributable.
+    this.repository.usage.rollupOlderThan(now - USAGE_ROLLUP_AFTER_DAYS * day);
+    this.repository.usage.pruneSnapshots(now - this.config.storage.usageRetentionDays * day);
     this.repository.prune(now - this.config.storage.terminalRetentionDays * day);
     this.repository.pruneSessions(now - this.config.storage.sessionRetentionDays * day);
     // Transcripts have two gates: age here, and the size ceiling the sync loop

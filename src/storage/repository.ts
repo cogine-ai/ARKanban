@@ -22,6 +22,7 @@ import type {
   SessionLineage,
   SessionRecord,
   SessionSummary,
+  SessionUsageCoverage,
   SettledGroupSnapshot,
   SettledGroupSummary,
   SettledOutcomeCounts,
@@ -29,11 +30,13 @@ import type {
   SettledRange,
   SettledSeriesRuns,
   StageCounts,
+  UsageTotals,
 } from "../contracts.js";
 import { agentIdFromSessionKey, type ActivityWrite } from "../activity/projector.js";
 import { applyMigrations, type MigrationResult } from "./migrations.js";
 import { encodeCursor, type KeysetCursor, type SessionSort } from "./keyset-cursor.js";
 import { TranscriptArchive } from "./transcript-archive.js";
+import { UsageStore } from "./usage-store.js";
 
 export type RepositoryChange = {
   epoch: string;
@@ -126,6 +129,18 @@ function emptyRollup(): AgentActivityRollup {
     blocked: 0,
     unknown: 0,
     durationSampleCount: 0,
+  };
+}
+
+function emptyUsageTotals(): UsageTotals {
+  return {
+    inputTokens: 0,
+    outputTokens: 0,
+    cacheReadTokens: 0,
+    cacheWriteTokens: 0,
+    hasCost: true,
+    sessionCount: 0,
+    unpricedModels: [],
   };
 }
 
@@ -509,6 +524,7 @@ export class CollectorRepository {
   readonly migration: MigrationResult;
   /** The only permitted write path for session transcripts. */
   readonly transcripts: TranscriptArchive;
+  readonly usage: UsageStore;
   private readonly db: DatabaseSync;
   private readonly listeners = new Set<(change: RepositoryChange) => void>();
   private readonly findFingerprint: StatementSync;
@@ -522,6 +538,7 @@ export class CollectorRepository {
     this.db.exec("PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL; PRAGMA busy_timeout = 3000;");
     this.migration = applyMigrations(this.db, databasePath);
     this.transcripts = new TranscriptArchive(this.db);
+    this.usage = new UsageStore(this.db);
     this.db.prepare("INSERT OR REPLACE INTO meta(key, value) VALUES ('epoch', ?)").run(this.epoch);
     this.db.prepare("INSERT OR REPLACE INTO meta(key, value) VALUES ('revision', '0')").run();
 
@@ -1069,11 +1086,12 @@ export class CollectorRepository {
   getSession(sessionKey: string): SessionRecord | undefined {
     const row = this.db
       .prepare(`
-        SELECT s.*, (SELECT COUNT(*) FROM activities a WHERE a.session_ref = s.session_key) AS activity_count
+        SELECT s.*, (SELECT COUNT(*) FROM activities a WHERE a.session_ref = s.session_key) AS activity_count,
+               EXISTS(SELECT 1 FROM session_usage_snapshots u WHERE u.session_key = s.session_key) AS has_usage
         FROM sessions s WHERE s.session_key = ?
       `)
       .get(sessionKey) as ActivityRow | undefined;
-    return row ? rowToSessionRecord(row) : undefined;
+    return row ? this.withUsageCoverage(rowToSessionRecord(row), row) : undefined;
   }
 
   listSessions(query: SessionListQuery = {}): SessionSummary[] {
@@ -1127,8 +1145,27 @@ export class CollectorRepository {
 
     // Sorting on an expression requires the cursor comparison to repeat that
     // exact expression, so both are derived from one definition.
-    const sortExpression =
-      query.sort === "duration" ? "(s.last_activity_at - COALESCE(s.created_at, s.last_activity_at))" : "s.last_activity_at";
+    const sortExpression = ((): string => {
+      switch (query.sort) {
+        case "lastActivity":
+          return "s.last_activity_at";
+        case "duration":
+          return "(s.last_activity_at - COALESCE(s.created_at, s.last_activity_at))";
+        case "cost":
+          // A descending scan needs a number for every row, so a session that
+          // was never priced sorts as zero and lands at the bottom. Its usage
+          // coverage is what tells the reader that zero is not a measurement.
+          return `COALESCE((
+            SELECT u.cost_micro_usd FROM session_usage_snapshots u
+            WHERE u.session_key = s.session_key
+            ORDER BY u.observed_at DESC LIMIT 1
+          ), 0)`;
+        default: {
+          const exhaustive: never = query.sort;
+          throw new Error(`Unhandled session sort: ${String(exhaustive)}`);
+        }
+      }
+    })();
 
     if (query.cursor) {
       // Strict inequality on the tiebreaker prevents re-emitting the boundary row.
@@ -1142,7 +1179,8 @@ export class CollectorRepository {
     const rows = this.db
       .prepare(`
         SELECT s.*, ${sortExpression} AS sort_value,
-               (SELECT COUNT(*) FROM activities a WHERE a.session_ref = s.session_key) AS activity_count
+               (SELECT COUNT(*) FROM activities a WHERE a.session_ref = s.session_key) AS activity_count,
+               EXISTS(SELECT 1 FROM session_usage_snapshots u WHERE u.session_key = s.session_key) AS has_usage
         FROM sessions s
         ${where}
         ORDER BY sort_value DESC, s.session_key ASC
@@ -1152,7 +1190,7 @@ export class CollectorRepository {
 
     const hasMore = rows.length > query.limit;
     const page = hasMore ? rows.slice(0, query.limit) : rows;
-    const items = page.map(rowToSessionSummary);
+    const items = page.map((row) => this.withUsageCoverage(rowToSessionSummary(row), row));
     const last = page.at(-1);
     if (!hasMore || !last) return { items };
 
@@ -1197,6 +1235,9 @@ export class CollectorRepository {
       "24h": this.agentRollups("24h", rangeEnd),
       "7d": this.agentRollups("7d", rangeEnd),
     };
+    const agentIds = rows.map((row) => String(row.id));
+    const costWindows = this.usage.agentWindows(agentIds, rangeEnd);
+    const usageCoverage = this.usageCoverage;
 
     return rows.map((row) => {
       const id = String(row.id);
@@ -1213,8 +1254,52 @@ export class CollectorRepository {
           "24h": recent["24h"].get(id) ?? emptyRollup(),
           "7d": recent["7d"].get(id) ?? emptyRollup(),
         },
+        cost: {
+          coverage: usageCoverage,
+          source: "snapshots" as const,
+          windows: costWindows.get(id) ?? { "24h": emptyUsageTotals(), "7d": emptyUsageTotals() },
+        },
       };
     });
+  }
+
+  /**
+   * Coverage for the usage panes, set by the collection loop.
+   *
+   * Held here rather than derived from the rows because "no usage stored" and
+   * "usage could not be collected" look identical in the table and mean
+   * opposite things on a cost view.
+   */
+  private usageCoverage: SessionUsageCoverage = "not_observed";
+
+  /**
+   * Replaces the coverage the session projector wrote with what the usage loop
+   * actually achieved for this row.
+   *
+   * The stored value comes from `sessions.list`, which knows nothing about
+   * usage, so it would report `not_observed` forever. A session that has a
+   * stored reading but has not been refreshed this run reads as `snapshot`
+   * rather than `live`, which is the honest description after a restart.
+   */
+  private withUsageCoverage<T extends SessionSummary>(session: T, row: ActivityRow): T {
+    const hasSnapshot = Number(row.has_usage ?? 0) === 1;
+    const usage: SessionUsageCoverage =
+      this.usageCoverage === "unavailable" || this.usageCoverage === "unauthorized"
+        ? this.usageCoverage
+        : !hasSnapshot
+          ? "not_observed"
+          : this.usageCoverage === "not_observed"
+            ? "snapshot"
+            : this.usageCoverage;
+    return { ...session, coverage: { ...session.coverage, usage } };
+  }
+
+  setUsageCoverage(coverage: SessionUsageCoverage): void {
+    this.usageCoverage = coverage;
+  }
+
+  getUsageCoverage(): SessionUsageCoverage {
+    return this.usageCoverage;
   }
 
   /**

@@ -230,6 +230,19 @@ export type AgentOverview = AgentSummary & {
   activityCount: number;
   lastSessionActivityAt?: number;
   recent: Record<AgentRollupWindow, AgentActivityRollup>;
+  /**
+   * Carries its own coverage so the card can say "not collected" instead of
+   * rendering a confident zero for an agent whose usage was never observed.
+   *
+   * `source` names where the amount came from, because a card priced by
+   * `usage.cost` can legitimately differ from `/usage/summary`, which only ever
+   * reports stored per-session readings.
+   */
+  cost: {
+    coverage: SessionUsageCoverage;
+    source: "gateway" | "snapshots";
+    windows: Record<AgentRollupWindow, UsageTotals>;
+  };
 };
 
 export type SessionKindHint = "main" | "fork" | "subagent" | "global" | "unknown";
@@ -239,10 +252,24 @@ export type SessionKindHint = "main" | "fork" | "subagent" | "global" | "unknown
  * separate on purpose: "usage unavailable" and "usage is zero" mean opposite
  * things on a cost view and must never collapse into one flag.
  */
+/**
+ * `snapshot` means the session was pushed past the per-round candidate ceiling
+ * and is carrying an older observation. The spec's §2.2 type omitted it while
+ * §3.3 requires it; without it, a deferred session would be indistinguishable
+ * from a freshly measured one.
+ */
+export type SessionUsageCoverage =
+  | "live"
+  | "snapshot"
+  | "not_observed"
+  | "unavailable"
+  | "unauthorized"
+  | "error";
+
 export type SessionCoverage = {
   index: "live" | "snapshot" | "stale" | "unavailable";
   detail: "live" | "not_observed" | "unavailable";
-  usage: "live" | "not_observed" | "unavailable" | "unauthorized" | "error";
+  usage: SessionUsageCoverage;
   messages: "live" | "not_observed" | "unavailable";
 };
 
@@ -277,6 +304,50 @@ export type SessionSummary = {
 
 export type SessionRecord = SessionSummary & {
   lineage: SessionLineage;
+};
+
+/**
+ * Cost is an integer count of micro-USD; floats are banned because summing
+ * rounded fractions of a cent across thousands of sessions drifts.
+ *
+ * `hasCost` is not the same as `costMicroUsd === 0`. The first says the price
+ * of at least one model was unknown, the second says the work was genuinely
+ * free — a cost view that conflates them is lying about spend.
+ */
+export type SessionUsage = {
+  sessionKey: string;
+  observedAt: number;
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadTokens: number;
+  cacheWriteTokens: number;
+  peakContextTokens?: number;
+  costMicroUsd?: number;
+  hasCost: boolean;
+  models: string[];
+  unpricedModels: string[];
+};
+
+/** Aggregated usage over a window, for an agent or the whole collector. */
+export type UsageTotals = {
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadTokens: number;
+  cacheWriteTokens: number;
+  costMicroUsd?: number;
+  /** False when any contributing model had no price, making the cost a floor. */
+  hasCost: boolean;
+  sessionCount: number;
+  unpricedModels: string[];
+};
+
+export type UsageSummary = {
+  from: number;
+  to: number;
+  coverage: SessionUsageCoverage;
+  totals: UsageTotals;
+  byAgent: Array<{ agentId: string; totals: UsageTotals }>;
+  byModel: Array<{ model: string; totals: UsageTotals }>;
 };
 
 export type MessageRole = "user" | "assistant" | "system" | "tool";

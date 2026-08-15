@@ -36,7 +36,12 @@ describe("CollectorRuntime", () => {
     const config: ResolvedCollectorConfig = {
       gateway: { name: "test", url: `ws://127.0.0.1:${address.port}`, tokenEnv: "TEST_GATEWAY_TOKEN", token: "test-token" },
       server: { host: "127.0.0.1", port: 47_123 },
-      storage: { path: path.join(directory, "collector.sqlite"), terminalRetentionDays: 1 },
+      storage: {
+        path: path.join(directory, "collector.sqlite"),
+        terminalRetentionDays: 1,
+        usageRetentionDays: 14,
+        sessionRetentionDays: 90,
+      },
       reconcile: { tasksMs: 60_000, sessionsMs: 60_000 },
       ui: { recentLimit: 200 },
       configPath: path.join(directory, "config.json"),
@@ -84,7 +89,12 @@ describe("CollectorRuntime", () => {
     const config: ResolvedCollectorConfig = {
       gateway: { name: "test", url: `ws://127.0.0.1:${address.port}`, tokenEnv: "TEST_GATEWAY_TOKEN", token: "test-token" },
       server: { host: "127.0.0.1", port: 47_124 },
-      storage: { path: path.join(directory, "collector.sqlite"), terminalRetentionDays: 1 },
+      storage: {
+        path: path.join(directory, "collector.sqlite"),
+        terminalRetentionDays: 1,
+        usageRetentionDays: 14,
+        sessionRetentionDays: 90,
+      },
       reconcile: { tasksMs: 60_000, sessionsMs: 60_000 },
       ui: { recentLimit: 200 },
       configPath: path.join(directory, "config.json"),
@@ -154,7 +164,12 @@ describe("CollectorRuntime", () => {
     const config: ResolvedCollectorConfig = {
       gateway: { name: "test", url: `ws://127.0.0.1:${address.port}`, tokenEnv: "TEST_GATEWAY_TOKEN", token: "test-token" },
       server: { host: "127.0.0.1", port: 47_125 },
-      storage: { path: path.join(directory, "collector.sqlite"), terminalRetentionDays: 1 },
+      storage: {
+        path: path.join(directory, "collector.sqlite"),
+        terminalRetentionDays: 1,
+        usageRetentionDays: 14,
+        sessionRetentionDays: 90,
+      },
       reconcile: { tasksMs: 60_000, sessionsMs: 60_000 },
       ui: { recentLimit: 200 },
       configPath: path.join(directory, "config.json"),

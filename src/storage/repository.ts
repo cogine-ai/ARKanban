@@ -6,9 +6,17 @@ import type {
   ActivityDetail,
   ActivityItem,
   ActivityRelation,
+  AgentKind,
+  AgentOrigin,
+  AgentSummary,
   EvidenceState,
   LaneSummary,
   ObservationView,
+  SessionCoverage,
+  SessionKindHint,
+  SessionLineage,
+  SessionRecord,
+  SessionSummary,
   SettledGroupSnapshot,
   SettledGroupSummary,
   SettledOutcomeCounts,
@@ -18,6 +26,8 @@ import type {
   StageCounts,
 } from "../contracts.js";
 import { agentIdFromSessionKey, type ActivityWrite } from "../activity/projector.js";
+import { applyMigrations, type MigrationResult } from "./migrations.js";
+import { TranscriptArchive } from "./transcript-archive.js";
 
 export type RepositoryChange = {
   epoch: string;
@@ -32,6 +42,42 @@ export type StoredActivity = ActivityItem & {
   runRef?: string;
   sessionKey?: string;
   parentTaskId?: string;
+};
+
+export type AgentWrite = {
+  id: string;
+  displayName: string;
+  kind: AgentKind;
+  runtime?: string;
+  model?: string;
+  origin: AgentOrigin;
+  observedAt: number;
+  lastActivityAt?: number;
+};
+
+export type SessionWrite = {
+  sessionKey: string;
+  sessionId?: string;
+  agentId: string;
+  label: string;
+  runtime?: string;
+  model?: string;
+  category?: string;
+  kindHint: SessionKindHint;
+  archived: boolean;
+  hasActiveRun: boolean;
+  placement?: string;
+  lineage: SessionLineage;
+  createdAt?: number;
+  lastActivityAt: number;
+  observedAt: number;
+  coverage: SessionCoverage;
+};
+
+export type SessionListQuery = {
+  agentId?: string;
+  includeArchived?: boolean;
+  limit?: number;
 };
 
 type ActivityRow = Record<string, unknown>;
@@ -212,6 +258,84 @@ function publicItem(item: StoredActivity): ActivityItem {
   return view;
 }
 
+const DEFAULT_SESSION_COVERAGE: SessionCoverage = {
+  index: "unavailable",
+  detail: "not_observed",
+  usage: "not_observed",
+  messages: "not_observed",
+};
+
+function agentFingerprint(write: AgentWrite): string {
+  return JSON.stringify([write.displayName, write.kind, write.runtime, write.model, write.origin]);
+}
+
+function sessionFingerprint(write: SessionWrite): string {
+  return JSON.stringify([
+    write.sessionId,
+    write.agentId,
+    write.label,
+    write.runtime,
+    write.model,
+    write.category,
+    write.kindHint,
+    write.archived,
+    write.hasActiveRun,
+    write.placement,
+    write.lineage,
+    write.createdAt,
+    write.coverage,
+  ]);
+}
+
+function rowToAgent(row: ActivityRow): AgentSummary {
+  return {
+    id: String(row.id),
+    displayName: String(row.display_name),
+    kind: row.kind as AgentSummary["kind"],
+    ...(asString(row.runtime) ? { runtime: asString(row.runtime) } : {}),
+    ...(asString(row.model) ? { model: asString(row.model) } : {}),
+    origin: row.origin as AgentSummary["origin"],
+    firstObservedAt: Number(row.first_observed_at),
+    ...(asNumber(row.last_activity_at) !== undefined ? { lastActivityAt: asNumber(row.last_activity_at) } : {}),
+  };
+}
+
+function rowToSessionSummary(row: ActivityRow): SessionSummary {
+  return {
+    sessionKey: String(row.session_key),
+    ...(asString(row.session_id) ? { sessionId: asString(row.session_id) } : {}),
+    agentId: String(row.agent_id),
+    label: String(row.label),
+    ...(asString(row.runtime) ? { runtime: asString(row.runtime) } : {}),
+    ...(asString(row.model) ? { model: asString(row.model) } : {}),
+    ...(asString(row.category) ? { category: asString(row.category) } : {}),
+    kindHint: row.kind_hint as SessionKindHint,
+    archived: Number(row.archived) === 1,
+    hasActiveRun: Number(row.has_active_run) === 1,
+    ...(asString(row.placement) ? { placement: asString(row.placement) } : {}),
+    ...(asNumber(row.created_at) !== undefined ? { createdAt: asNumber(row.created_at) } : {}),
+    lastActivityAt: Number(row.last_activity_at),
+    lastObservedAt: Number(row.last_observed_at),
+    activityCount: Number(row.activity_count ?? 0),
+    coverage: parseJson(row.coverage_json, DEFAULT_SESSION_COVERAGE),
+  };
+}
+
+function rowToSessionRecord(row: ActivityRow): SessionRecord {
+  return {
+    ...rowToSessionSummary(row),
+    lineage: {
+      ...(asString(row.parent_session_key) ? { parentSessionKey: asString(row.parent_session_key) } : {}),
+      ...(asString(row.previous_session_id) ? { previousSessionId: asString(row.previous_session_id) } : {}),
+      ...(asString(row.fork_source_key) ? { forkSourceKey: asString(row.fork_source_key) } : {}),
+      ...(asString(row.spawned_by) ? { spawnedBy: asString(row.spawned_by) } : {}),
+      ...(asNumber(row.spawn_depth) !== undefined ? { spawnDepth: asNumber(row.spawn_depth) } : {}),
+      ...(asString(row.subagent_role) ? { subagentRole: asString(row.subagent_role) } : {}),
+      ...(asString(row.worktree_branch) ? { worktreeBranch: asString(row.worktree_branch) } : {}),
+    },
+  };
+}
+
 function coreFingerprint(item: ActivityWrite): string {
   return JSON.stringify({
     kind: item.kind,
@@ -310,6 +434,9 @@ function buildRelations(stored: StoredActivity[]): ActivityRelation[] {
 
 export class CollectorRepository {
   readonly epoch = randomUUID();
+  readonly migration: MigrationResult;
+  /** The only permitted write path for session transcripts. */
+  readonly transcripts: TranscriptArchive;
   private readonly db: DatabaseSync;
   private readonly listeners = new Set<(change: RepositoryChange) => void>();
   private readonly findFingerprint: StatementSync;
@@ -321,63 +448,8 @@ export class CollectorRepository {
     mkdirSync(dirname(databasePath), { recursive: true });
     this.db = new DatabaseSync(databasePath);
     this.db.exec("PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL; PRAGMA busy_timeout = 3000;");
-    this.db.exec(`
-      CREATE TABLE IF NOT EXISTS meta (
-        key TEXT PRIMARY KEY,
-        value TEXT NOT NULL
-      );
-
-      CREATE TABLE IF NOT EXISTS activities (
-        id TEXT PRIMARY KEY,
-        source_key TEXT NOT NULL UNIQUE,
-        kind TEXT NOT NULL,
-        origin TEXT NOT NULL,
-        catalog TEXT NOT NULL,
-        task_id TEXT,
-        run_ref TEXT,
-        session_key TEXT,
-        parent_task_id TEXT,
-        flow_id TEXT,
-        agent_id TEXT NOT NULL,
-        runtime TEXT,
-        title TEXT NOT NULL,
-        state TEXT NOT NULL,
-        outcome TEXT NOT NULL,
-        phase TEXT NOT NULL,
-        attention TEXT NOT NULL,
-        stage TEXT NOT NULL,
-        freshness TEXT NOT NULL,
-        progress_summary TEXT,
-        last_tool_name TEXT,
-        created_at INTEGER,
-        started_at INTEGER,
-        ended_at INTEGER,
-        updated_at INTEGER NOT NULL,
-        last_observed_at INTEGER NOT NULL,
-        evidence_json TEXT NOT NULL,
-        fingerprint TEXT NOT NULL
-      );
-
-      CREATE INDEX IF NOT EXISTS idx_activities_run_ref ON activities(run_ref);
-      CREATE INDEX IF NOT EXISTS idx_activities_session_key ON activities(session_key);
-      CREATE INDEX IF NOT EXISTS idx_activities_updated_at ON activities(updated_at DESC);
-      CREATE INDEX IF NOT EXISTS idx_activities_terminal_at
-        ON activities(catalog, COALESCE(ended_at, updated_at) DESC);
-
-      CREATE TABLE IF NOT EXISTS observations (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        activity_id TEXT NOT NULL,
-        source TEXT NOT NULL,
-        kind TEXT NOT NULL,
-        phase TEXT,
-        status TEXT,
-        tool_name TEXT,
-        occurred_at INTEGER NOT NULL,
-        FOREIGN KEY(activity_id) REFERENCES activities(id) ON DELETE CASCADE
-      );
-
-      CREATE INDEX IF NOT EXISTS idx_observations_activity ON observations(activity_id, occurred_at DESC);
-    `);
+    this.migration = applyMigrations(this.db, databasePath);
+    this.transcripts = new TranscriptArchive(this.db);
     this.db.prepare("INSERT OR REPLACE INTO meta(key, value) VALUES ('epoch', ?)").run(this.epoch);
     this.db.prepare("INSERT OR REPLACE INTO meta(key, value) VALUES ('revision', '0')").run();
 
@@ -766,11 +838,230 @@ export class CollectorRepository {
     };
   }
 
+  /**
+   * Agent roster upsert. An authoritative `roster` entry is never downgraded to
+   * `observed` by a later inference, and `runtime`/`model` are only widened so a
+   * partial observation cannot erase known facts.
+   */
+  upsertAgents(writes: AgentWrite[]): number {
+    if (writes.length === 0) return 0;
+    const statement = this.db.prepare(`
+      INSERT INTO agents (
+        id, display_name, kind, runtime, model, origin, first_observed_at, last_activity_at, fingerprint
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(id) DO UPDATE SET
+        display_name = excluded.display_name,
+        kind = excluded.kind,
+        runtime = COALESCE(excluded.runtime, agents.runtime),
+        model = COALESCE(excluded.model, agents.model),
+        origin = CASE WHEN excluded.origin = 'roster' THEN 'roster' ELSE agents.origin END,
+        first_observed_at = MIN(excluded.first_observed_at, agents.first_observed_at),
+        last_activity_at = CASE
+          WHEN excluded.last_activity_at IS NULL THEN agents.last_activity_at
+          WHEN agents.last_activity_at IS NULL THEN excluded.last_activity_at
+          ELSE MAX(excluded.last_activity_at, agents.last_activity_at)
+        END,
+        fingerprint = excluded.fingerprint
+    `);
+    const findFingerprint = this.db.prepare("SELECT fingerprint FROM agents WHERE id = ?");
+    let changed = 0;
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      for (const write of writes) {
+        const fingerprint = agentFingerprint(write);
+        const existing = findFingerprint.get(write.id) as { fingerprint?: string } | undefined;
+        if (existing?.fingerprint !== fingerprint) changed += 1;
+        statement.run(
+          write.id,
+          write.displayName,
+          write.kind,
+          write.runtime ?? null,
+          write.model ?? null,
+          write.origin,
+          write.observedAt,
+          write.lastActivityAt ?? null,
+          fingerprint,
+        );
+      }
+      this.db.exec("COMMIT");
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
+    return changed;
+  }
+
+  listAgents(): AgentSummary[] {
+    const rows = this.db
+      .prepare("SELECT * FROM agents ORDER BY COALESCE(last_activity_at, first_observed_at) DESC, id ASC")
+      .all() as ActivityRow[];
+    return rows.map(rowToAgent);
+  }
+
+  /**
+   * Session archive upsert.
+   *
+   * Current-truth fields (label, archived, active run, category, placement hint)
+   * take the incoming value. Write-once lineage facts are merged with COALESCE
+   * because Gateway rows can omit them, and a partial observation must not erase
+   * a fork source or subagent role that was already established.
+   */
+  upsertSessions(writes: SessionWrite[]): number {
+    if (writes.length === 0) return 0;
+    const statement = this.db.prepare(`
+      INSERT INTO sessions (
+        session_key, session_id, agent_id, label, runtime, model, category, kind_hint,
+        archived, has_active_run, placement, parent_session_key, previous_session_id,
+        fork_source_key, spawned_by, spawn_depth, subagent_role, worktree_branch,
+        created_at, last_activity_at, last_observed_at, coverage_json, fingerprint
+      ) VALUES (
+        ?, ?, ?, ?, ?, ?, ?, ?,
+        ?, ?, ?, ?, ?,
+        ?, ?, ?, ?, ?,
+        ?, ?, ?, ?, ?
+      )
+      ON CONFLICT(session_key) DO UPDATE SET
+        session_id = COALESCE(excluded.session_id, sessions.session_id),
+        agent_id = excluded.agent_id,
+        label = excluded.label,
+        runtime = COALESCE(excluded.runtime, sessions.runtime),
+        model = COALESCE(excluded.model, sessions.model),
+        category = excluded.category,
+        kind_hint = excluded.kind_hint,
+        archived = excluded.archived,
+        has_active_run = excluded.has_active_run,
+        placement = COALESCE(excluded.placement, sessions.placement),
+        parent_session_key = COALESCE(excluded.parent_session_key, sessions.parent_session_key),
+        previous_session_id = COALESCE(excluded.previous_session_id, sessions.previous_session_id),
+        fork_source_key = COALESCE(excluded.fork_source_key, sessions.fork_source_key),
+        spawned_by = COALESCE(excluded.spawned_by, sessions.spawned_by),
+        spawn_depth = COALESCE(excluded.spawn_depth, sessions.spawn_depth),
+        subagent_role = COALESCE(excluded.subagent_role, sessions.subagent_role),
+        worktree_branch = COALESCE(excluded.worktree_branch, sessions.worktree_branch),
+        created_at = COALESCE(sessions.created_at, excluded.created_at),
+        last_activity_at = MAX(excluded.last_activity_at, sessions.last_activity_at),
+        last_observed_at = MAX(excluded.last_observed_at, sessions.last_observed_at),
+        coverage_json = excluded.coverage_json,
+        fingerprint = excluded.fingerprint
+    `);
+    const findFingerprint = this.db.prepare("SELECT fingerprint FROM sessions WHERE session_key = ?");
+    let changed = 0;
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      for (const write of writes) {
+        const fingerprint = sessionFingerprint(write);
+        const existing = findFingerprint.get(write.sessionKey) as { fingerprint?: string } | undefined;
+        if (existing?.fingerprint !== fingerprint) changed += 1;
+        statement.run(
+          write.sessionKey,
+          write.sessionId ?? null,
+          write.agentId,
+          write.label,
+          write.runtime ?? null,
+          write.model ?? null,
+          write.category ?? null,
+          write.kindHint,
+          write.archived ? 1 : 0,
+          write.hasActiveRun ? 1 : 0,
+          write.placement ?? null,
+          write.lineage.parentSessionKey ?? null,
+          write.lineage.previousSessionId ?? null,
+          write.lineage.forkSourceKey ?? null,
+          write.lineage.spawnedBy ?? null,
+          write.lineage.spawnDepth ?? null,
+          write.lineage.subagentRole ?? null,
+          write.lineage.worktreeBranch ?? null,
+          write.createdAt ?? null,
+          write.lastActivityAt,
+          write.observedAt,
+          JSON.stringify(write.coverage),
+          fingerprint,
+        );
+      }
+      this.db.exec("COMMIT");
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
+    return changed;
+  }
+
+  getSession(sessionKey: string): SessionRecord | undefined {
+    const row = this.db
+      .prepare(`
+        SELECT s.*, (SELECT COUNT(*) FROM activities a WHERE a.session_ref = s.session_key) AS activity_count
+        FROM sessions s WHERE s.session_key = ?
+      `)
+      .get(sessionKey) as ActivityRow | undefined;
+    return row ? rowToSessionRecord(row) : undefined;
+  }
+
+  listSessions(query: SessionListQuery = {}): SessionSummary[] {
+    const conditions: string[] = [];
+    const parameters: Array<string | number> = [];
+    if (query.agentId !== undefined) {
+      conditions.push("s.agent_id = ?");
+      parameters.push(query.agentId);
+    }
+    if (query.includeArchived !== true) conditions.push("s.archived = 0");
+    const where = conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : "";
+    parameters.push(query.limit ?? 100);
+    const rows = this.db
+      .prepare(`
+        SELECT s.*, (SELECT COUNT(*) FROM activities a WHERE a.session_ref = s.session_key) AS activity_count
+        FROM sessions s
+        ${where}
+        ORDER BY s.last_activity_at DESC, s.session_key ASC
+        LIMIT ?
+      `)
+      .all(...parameters) as ActivityRow[];
+    return rows.map(rowToSessionSummary);
+  }
+
+  /**
+   * Promotes claimed `session_key` values to confirmed `session_ref` foreign keys
+   * once the matching Session row exists. Activities whose session has not been
+   * observed yet keep a null ref, which is a legitimate state rather than an error.
+   */
+  linkActivitySessions(): number {
+    const result = this.db
+      .prepare(`
+        UPDATE activities
+        SET session_ref = session_key
+        WHERE session_ref IS NULL
+          AND session_key IS NOT NULL
+          AND session_key IN (SELECT session_key FROM sessions)
+      `)
+      .run();
+    return Number(result.changes);
+  }
+
   prune(cutoff: number): number {
     const result = this.db
       .prepare("DELETE FROM activities WHERE catalog = 'terminal_history' AND updated_at < ?")
       .run(cutoff);
     this.db.prepare("DELETE FROM observations WHERE activity_id NOT IN (SELECT id FROM activities)").run();
+    return Number(result.changes);
+  }
+
+  /**
+   * Session archives outlive terminal Activity on purpose, so only archived
+   * sessions age out. Foreign keys are declared but not enforced, so dangling
+   * refs are cleared explicitly.
+   */
+  pruneSessions(cutoff: number): number {
+    const result = this.db
+      .prepare("DELETE FROM sessions WHERE archived = 1 AND last_activity_at < ?")
+      .run(cutoff);
+    if (Number(result.changes) > 0) {
+      this.db
+        .prepare(`
+          UPDATE activities SET session_ref = NULL
+          WHERE session_ref IS NOT NULL
+            AND session_ref NOT IN (SELECT session_key FROM sessions)
+        `)
+        .run();
+    }
     return Number(result.changes);
   }
 

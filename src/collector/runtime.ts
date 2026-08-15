@@ -663,7 +663,11 @@ export class CollectorRuntime {
   }
 
   private prune(): void {
-    const cutoff = Date.now() - this.config.storage.terminalRetentionDays * 24 * 60 * 60 * 1_000;
-    this.repository.prune(cutoff);
+    const day = 24 * 60 * 60 * 1_000;
+    const now = Date.now();
+    this.repository.prune(now - this.config.storage.terminalRetentionDays * day);
+    // Sessions outlive the activities that referenced them, so they prune on
+    // their own, longer retention window.
+    this.repository.pruneSessions(now - this.config.storage.sessionRetentionDays * day);
   }
 }

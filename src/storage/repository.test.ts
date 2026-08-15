@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { attemptPatch, taskToActivity } from "../activity/projector.js";
-import { CollectorRepository } from "./repository.js";
+import { CollectorRepository, type SessionWrite } from "./repository.js";
 
 const cleanups: Array<() => void> = [];
 afterEach(() => {
@@ -19,6 +19,104 @@ function repository(): CollectorRepository {
   });
   return result;
 }
+
+describe("CollectorRepository agents and sessions", () => {
+  const session = (overrides: Partial<SessionWrite> & Pick<SessionWrite, "sessionKey">): SessionWrite => ({
+    agentId: "builder",
+    label: "Session",
+    kindHint: "main",
+    archived: false,
+    hasActiveRun: false,
+    lineage: {},
+    lastActivityAt: 5_000,
+    observedAt: 5_000,
+    coverage: { index: "live", detail: "not_observed", usage: "not_observed", messages: "not_observed" },
+    ...overrides,
+  });
+
+  it("never downgrades an authoritative roster entry to an inferred one", () => {
+    const repo = repository();
+    repo.upsertAgents([
+      { id: "builder", displayName: "Builder", kind: "agent", model: "sonnet", origin: "roster", observedAt: 1_000 },
+    ]);
+    repo.upsertAgents([{ id: "builder", displayName: "builder", kind: "unknown", origin: "observed", observedAt: 2_000 }]);
+
+    expect(repo.listAgents()[0]).toMatchObject({ origin: "roster", model: "sonnet", firstObservedAt: 1_000 });
+  });
+
+  it("keeps lineage facts that a later partial observation omits", () => {
+    const repo = repository();
+    repo.upsertSessions([
+      session({ sessionKey: "s-1", lineage: { forkSourceKey: "s-0", spawnDepth: 2 }, createdAt: 100 }),
+    ]);
+    repo.upsertSessions([session({ sessionKey: "s-1", label: "Renamed", lastActivityAt: 9_000 })]);
+
+    const stored = repo.getSession("s-1");
+    expect(stored).toMatchObject({ label: "Renamed", lastActivityAt: 9_000, createdAt: 100 });
+    expect(stored?.lineage).toEqual({ forkSourceKey: "s-0", spawnDepth: 2 });
+  });
+
+  it("reports no change when the same session row is observed twice", () => {
+    const repo = repository();
+    expect(repo.upsertSessions([session({ sessionKey: "s-1" })])).toBe(1);
+    expect(repo.upsertSessions([session({ sessionKey: "s-1" })])).toBe(0);
+  });
+
+  it("promotes a claimed session key to a confirmed reference only once the session exists", () => {
+    const repo = repository();
+    const attempt = attemptPatch({
+      id: "attempt:ri_1",
+      sourceKey: "attempt:run:run-1",
+      origin: "online",
+      agentId: "builder",
+      title: "Run",
+      now: 1_100,
+      sessionKey: "s-1",
+      state: "active",
+      phase: "tool",
+      source: "events",
+      eventKind: "agent:tool:start",
+    });
+    repo.upsertMany([attempt], ["test"]);
+
+    expect(repo.linkActivitySessions()).toBe(0);
+
+    repo.upsertSessions([session({ sessionKey: "s-1" })]);
+    expect(repo.linkActivitySessions()).toBe(1);
+    expect(repo.getSession("s-1")?.activityCount).toBe(1);
+  });
+
+  it("keeps session archives when the terminal activities they describe are pruned", () => {
+    const repo = repository();
+    repo.upsertSessions([session({ sessionKey: "s-1", lastActivityAt: 1_000 })]);
+    repo.prune(Date.now());
+
+    expect(repo.getSession("s-1")).toBeDefined();
+  });
+
+  it("ages out only archived sessions and clears the references they leave behind", () => {
+    const repo = repository();
+    repo.upsertSessions([
+      session({ sessionKey: "old-archived", archived: true, lastActivityAt: 1_000 }),
+      session({ sessionKey: "old-live", archived: false, lastActivityAt: 1_000 }),
+    ]);
+
+    expect(repo.pruneSessions(2_000)).toBe(1);
+    expect(repo.getSession("old-archived")).toBeUndefined();
+    expect(repo.getSession("old-live")).toBeDefined();
+  });
+
+  it("excludes archived sessions from the default listing", () => {
+    const repo = repository();
+    repo.upsertSessions([
+      session({ sessionKey: "live", lastActivityAt: 2_000 }),
+      session({ sessionKey: "archived", archived: true, lastActivityAt: 3_000 }),
+    ]);
+
+    expect(repo.listSessions().map((row) => row.sessionKey)).toEqual(["live"]);
+    expect(repo.listSessions({ includeArchived: true })).toHaveLength(2);
+  });
+});
 
 describe("CollectorRepository", () => {
   it("stores a queryable projection, relations, and a bounded timeline", () => {

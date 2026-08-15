@@ -14,6 +14,11 @@ export type CollectorConfig = {
   storage: {
     path: string;
     terminalRetentionDays: number;
+    usageRetentionDays: number;
+    sessionRetentionDays: number;
+    transcriptRetentionDays: number;
+    transcriptMaxBytes: number;
+    transcriptSync: "enabled" | "disabled";
   };
   reconcile: {
     tasksMs: number;
@@ -37,7 +42,15 @@ const DEFAULTS: CollectorConfig = {
     tokenEnv: "OPENCLAW_GATEWAY_TOKEN",
   },
   server: { host: "127.0.0.1", port: 47123 },
-  storage: { path: "./data/collector.sqlite", terminalRetentionDays: 30 },
+  storage: {
+    path: "./data/collector.sqlite",
+    terminalRetentionDays: 30,
+    usageRetentionDays: 90,
+    sessionRetentionDays: 365,
+    transcriptRetentionDays: 180,
+    transcriptMaxBytes: 2 * 1024 * 1024 * 1024,
+    transcriptSync: "enabled",
+  },
   reconcile: { tasksMs: 15_000, sessionsMs: 8_000 },
   ui: { recentLimit: 200 },
 };
@@ -83,6 +96,53 @@ export function loadConfig(configPath: string, env: NodeJS.ProcessEnv = process.
   if (host !== "127.0.0.1" && host !== "::1") throw new Error("server.host must be loopback (127.0.0.1 or ::1)");
 
   const configuredStoragePath = stringValue(storage.path, DEFAULTS.storage.path, "storage.path");
+  const terminalRetentionDays = numberValue(
+    storage.terminalRetentionDays,
+    DEFAULTS.storage.terminalRetentionDays,
+    "storage.terminalRetentionDays",
+    1,
+    365,
+  );
+  const usageRetentionDays = numberValue(
+    storage.usageRetentionDays,
+    DEFAULTS.storage.usageRetentionDays,
+    "storage.usageRetentionDays",
+    1,
+    365,
+  );
+  const sessionRetentionDays = numberValue(
+    storage.sessionRetentionDays,
+    DEFAULTS.storage.sessionRetentionDays,
+    "storage.sessionRetentionDays",
+    1,
+    3_650,
+  );
+  if (sessionRetentionDays < terminalRetentionDays) {
+    throw new Error("storage.sessionRetentionDays must be >= storage.terminalRetentionDays");
+  }
+  const transcriptRetentionDays = numberValue(
+    storage.transcriptRetentionDays,
+    DEFAULTS.storage.transcriptRetentionDays,
+    "storage.transcriptRetentionDays",
+    1,
+    3_650,
+  );
+  const transcriptMaxBytes = numberValue(
+    storage.transcriptMaxBytes,
+    DEFAULTS.storage.transcriptMaxBytes,
+    "storage.transcriptMaxBytes",
+    64 * 1024 * 1024,
+    64 * 1024 * 1024 * 1024,
+  );
+  const transcriptSync = stringValue(
+    storage.transcriptSync,
+    DEFAULTS.storage.transcriptSync,
+    "storage.transcriptSync",
+  );
+  if (transcriptSync !== "enabled" && transcriptSync !== "disabled") {
+    throw new Error('storage.transcriptSync must be "enabled" or "disabled"');
+  }
+
   return {
     gateway: {
       name: stringValue(gateway.name, DEFAULTS.gateway.name, "gateway.name"),
@@ -96,13 +156,12 @@ export function loadConfig(configPath: string, env: NodeJS.ProcessEnv = process.
     },
     storage: {
       path: path.resolve(path.dirname(absoluteConfigPath), configuredStoragePath),
-      terminalRetentionDays: numberValue(
-        storage.terminalRetentionDays,
-        DEFAULTS.storage.terminalRetentionDays,
-        "storage.terminalRetentionDays",
-        1,
-        365,
-      ),
+      terminalRetentionDays,
+      usageRetentionDays,
+      sessionRetentionDays,
+      transcriptRetentionDays,
+      transcriptMaxBytes,
+      transcriptSync,
     },
     reconcile: {
       tasksMs: numberValue(reconcile.tasksMs, DEFAULTS.reconcile.tasksMs, "reconcile.tasksMs", 2_000, 300_000),

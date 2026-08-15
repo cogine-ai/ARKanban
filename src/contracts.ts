@@ -183,6 +183,113 @@ export type UpcomingScheduleSnapshot = {
   items: UpcomingSchedule[];
 };
 
+export type AgentKind = "agent" | "system" | "unknown";
+export type AgentOrigin = "roster" | "observed";
+
+export type AgentSummary = {
+  id: string;
+  displayName: string;
+  kind: AgentKind;
+  runtime?: string;
+  model?: string;
+  /** `roster` came from agents.list; `observed` was inferred from seen agentIds. */
+  origin: AgentOrigin;
+  firstObservedAt: number;
+  lastActivityAt?: number;
+};
+
+export type SessionKindHint = "main" | "fork" | "subagent" | "global" | "unknown";
+
+/**
+ * Per-source evidence completeness for one session row. The four paths stay
+ * separate on purpose: "usage unavailable" and "usage is zero" mean opposite
+ * things on a cost view and must never collapse into one flag.
+ */
+export type SessionCoverage = {
+  index: "live" | "snapshot" | "stale" | "unavailable";
+  detail: "live" | "not_observed" | "unavailable";
+  usage: "live" | "not_observed" | "unavailable" | "unauthorized" | "error";
+  messages: "live" | "not_observed" | "unavailable";
+};
+
+export type SessionLineage = {
+  parentSessionKey?: string;
+  previousSessionId?: string;
+  forkSourceKey?: string;
+  spawnedBy?: string;
+  spawnDepth?: number;
+  subagentRole?: string;
+  worktreeBranch?: string;
+};
+
+export type SessionSummary = {
+  sessionKey: string;
+  sessionId?: string;
+  agentId: string;
+  label: string;
+  runtime?: string;
+  model?: string;
+  category?: string;
+  kindHint: SessionKindHint;
+  archived: boolean;
+  hasActiveRun: boolean;
+  placement?: string;
+  createdAt?: number;
+  lastActivityAt: number;
+  lastObservedAt: number;
+  activityCount: number;
+  coverage: SessionCoverage;
+};
+
+export type SessionRecord = SessionSummary & {
+  lineage: SessionLineage;
+};
+
+export type MessageRole = "user" | "assistant" | "system" | "tool";
+
+export type ArchivedMessage = {
+  id: number;
+  sessionKey: string;
+  sessionId?: string;
+  messageId?: string;
+  seq: number;
+  role: MessageRole;
+  channel?: string;
+  toolName?: string;
+  content: string;
+  /** Set when a later transcript generation replaced this message's lineage. */
+  supersededBySessionId?: string;
+  divergent: boolean;
+  createdAt: number;
+};
+
+export type TranscriptSyncState = {
+  sessionKey: string;
+  syncedCount: number;
+  syncedBytes: number;
+  complete: boolean;
+  syncedAt?: number;
+  errorCode?: string;
+};
+
+/**
+ * `fts` used the trigram index; `fallback` used a bounded LIKE scan because the
+ * query was shorter than the three characters FTS5 trigram requires.
+ */
+export type MessageSearchMode = "fts" | "fallback";
+
+export type MessageSearchHit = {
+  message: ArchivedMessage;
+  agentId: string;
+  sessionLabel: string;
+};
+
+export type MessageSearchResult = {
+  mode: MessageSearchMode;
+  hits: MessageSearchHit[];
+  truncated: boolean;
+};
+
 export type SettledRange = "24h" | "7d" | "30d";
 export type SettledGroupingConfidence = "canonical" | "display_exact";
 export type SettledPriorityTier = "P0" | "P1" | "P2" | "P3";

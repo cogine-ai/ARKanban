@@ -10,7 +10,9 @@
   },
   "storage": {
     "path": "./data/collector.sqlite",
-    "terminalRetentionDays": 30
+    "terminalRetentionDays": 30,
+    "usageRetentionDays": 14,
+    "sessionRetentionDays": 90
   },
   "reconcile": {
     "tasksMs": 15000,

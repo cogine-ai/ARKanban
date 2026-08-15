@@ -10,7 +10,9 @@
   },
   "storage": {
     "path": "../data/mock-v3.sqlite",
-    "terminalRetentionDays": 7
+    "terminalRetentionDays": 7,
+    "usageRetentionDays": 7,
+    "sessionRetentionDays": 30
   },
   "reconcile": {
     "tasksMs": 15000,

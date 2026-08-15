@@ -17,7 +17,12 @@ function runtimeFixture(retentionDays = 30): { runtime: CollectorRuntime; config
   const config: ResolvedCollectorConfig = {
     gateway: { name: "test", url: "ws://127.0.0.1:18789", tokenEnv: "TEST_TOKEN", token: "secret" },
     server: { host: "127.0.0.1", port: 47_123 },
-    storage: { path: path.join(directory, "collector.sqlite"), terminalRetentionDays: retentionDays },
+    storage: {
+      path: path.join(directory, "collector.sqlite"),
+      terminalRetentionDays: retentionDays,
+      usageRetentionDays: 14,
+      sessionRetentionDays: 90,
+    },
     reconcile: { tasksMs: 15_000, sessionsMs: 8_000 },
     ui: { recentLimit: 200 },
     configPath: path.join(directory, "collector.config.json"),

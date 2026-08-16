@@ -1,28 +1,19 @@
 import { useMemo, useState } from "react";
-import type {
-  ActivitySnapshot,
-  AgentOverview,
-  AgentRollupWindow,
-  SessionUsageCoverage,
-  UpcomingSchedule,
-} from "../../../src/contracts";
+import type { ActivitySnapshot, AgentOverview, UpcomingSchedule } from "../../../src/contracts";
+import { AgentCost, ROLLUP_WINDOWS } from "../components/AgentCost";
 import { useScheduleNow } from "../hooks/use-schedule-now";
 import { AGENT_COLORS } from "../lib/board";
 import {
-  formatCost,
   formatDuration,
   formatPercent,
   formatRelative,
   formatScheduleRelative,
-  formatTokens,
   hash,
   shortAgent,
 } from "../lib/format";
 import { Link } from "../router";
 import { useAgents } from "../state/use-agents";
 import { useCollector } from "../state/collector-context";
-
-const ROLLUP_WINDOWS: AgentRollupWindow[] = ["24h", "7d"];
 
 /** Live counters the roster endpoint does not carry, read off the activity snapshot. */
 type LiveCounts = { running: number; attention: number; schedules: UpcomingSchedule[] };
@@ -44,57 +35,6 @@ function liveCountsByAgent(snapshot: ActivitySnapshot | undefined): Map<string, 
   return byAgent;
 }
 
-/**
- * Why a card has no cost to show. Each state is a different instruction to the
- * reader, so none of them may render as `$0`.
- */
-const COST_UNAVAILABLE: Partial<Record<SessionUsageCoverage, string>> = {
-  not_observed: "Usage not collected yet",
-  unavailable: "Gateway does not report usage",
-  unauthorized: "Token lacks usage scope",
-  error: "Usage read failed",
-};
-
-function AgentCost({ cost }: { cost: AgentOverview["cost"] }) {
-  const blocked = COST_UNAVAILABLE[cost.coverage];
-  const measured = ROLLUP_WINDOWS.some((window) => cost.windows[window].sessionCount > 0);
-
-  return (
-    <div className="agent-section agent-cost" data-coverage={cost.coverage}>
-      <span className="eyebrow">
-        COST
-        {cost.coverage === "snapshot" ? (
-          <span className="cost-note" title="More sessions were due than one round could read; some figures are from an earlier reading">
-            {" "}snapshot
-          </span>
-        ) : null}
-      </span>
-      {blocked && !measured ? (
-        <span className="cost-empty muted">{blocked}</span>
-      ) : (
-        <div className="cost-windows">
-          {ROLLUP_WINDOWS.map((window) => {
-            const totals = cost.windows[window];
-            const tokens = totals.inputTokens + totals.outputTokens;
-            return (
-              <span key={window} className="cost-window" data-window={window}>
-                <small>{window}</small>
-                <b title={totals.hasCost ? undefined : `At least this much; no price for ${totals.unpricedModels.join(", ") || "some models"}`}>
-                  {formatCost(totals.costMicroUsd)}
-                  {totals.hasCost ? "" : "+"}
-                </b>
-                <small title={`${tokens.toLocaleString()} tokens across ${totals.sessionCount} sessions`}>
-                  {formatTokens(tokens)} tok
-                </small>
-              </span>
-            );
-          })}
-        </div>
-      )}
-    </div>
-  );
-}
-
 function AgentCard({ agent, live }: { agent: AgentOverview; live: LiveCounts }) {
   const now = useScheduleNow();
   const nextRun = live.schedules.reduce<number | undefined>(
@@ -106,13 +46,15 @@ function AgentCard({ agent, live }: { agent: AgentOverview; live: LiveCounts }) 
   return (
     <article className="agent-card" data-agent-id={agent.id} data-kind={agent.kind}>
       <header className="agent-card-head">
-        <span className="agent-avatar" style={{ background: AGENT_COLORS[hash(agent.id) % AGENT_COLORS.length] }}>
-          {shortAgent(agent.id)}
-        </span>
-        <span className="agent-identity">
-          <b>{agent.displayName}</b>
-          <small>{descriptors || "runtime not reported"}</small>
-        </span>
+        <Link className="agent-card-open" to={`/agents/${encodeURIComponent(agent.id)}`}>
+          <span className="agent-avatar" style={{ background: AGENT_COLORS[hash(agent.id) % AGENT_COLORS.length] }}>
+            {shortAgent(agent.id)}
+          </span>
+          <span className="agent-identity">
+            <b>{agent.displayName}</b>
+            <small>{descriptors || "runtime not reported"}</small>
+          </span>
+        </Link>
         <span className="agent-badges">
           {agent.kind === "system" ? <span className="agent-badge system">SYSTEM</span> : null}
           {agent.origin === "observed" ? (

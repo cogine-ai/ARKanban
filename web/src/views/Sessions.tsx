@@ -3,6 +3,7 @@ import type { ChangeTopic, SessionSignalGrade, SessionSummary } from "../../../s
 import type { SessionSort } from "../../../src/storage/keyset-cursor";
 import { collectorApi, type SessionListFilters } from "../api";
 import { GradeChip } from "../components/GradeChip";
+import { TranscriptSearch } from "../components/TranscriptSearch";
 import { AGENT_COLORS } from "../lib/board";
 import { formatRelative, hash, shortAgent } from "../lib/format";
 import { Link, useLocation, useNavigate } from "../router";
@@ -92,9 +93,9 @@ export function SessionsView() {
     [navigateTo, search],
   );
 
-  // The agent box is the one control that is typed rather than picked. Writing
-  // every keystroke to the URL would restart the query per character and push a
-  // history entry per character with it, so the draft is held here and settles.
+  // The typed controls are held here and settle before they reach the URL.
+  // Writing every keystroke would restart the query per character and push a
+  // history entry per character with it.
   const [agentDraft, setAgentDraft] = useState(filters.agentId ?? "");
   useEffect(() => setAgentDraft(filters.agentId ?? ""), [filters.agentId]);
   useEffect(() => {
@@ -103,6 +104,16 @@ export function SessionsView() {
     const timer = setTimeout(() => setParam("agentId", settled), FILTER_SETTLE_MS);
     return () => clearTimeout(timer);
   }, [agentDraft, filters.agentId, setParam]);
+
+  const searchQuery = searchParams.get("q") ?? "";
+  const [searchDraft, setSearchDraft] = useState(searchQuery);
+  useEffect(() => setSearchDraft(searchQuery), [searchQuery]);
+  useEffect(() => {
+    const settled = searchDraft.trim();
+    if (settled === searchQuery) return;
+    const timer = setTimeout(() => setParam("q", settled), FILTER_SETTLE_MS);
+    return () => clearTimeout(timer);
+  }, [searchDraft, searchQuery, setParam]);
 
   const [scrollTop, setScrollTop] = useState(0);
   const viewport = useRef<HTMLDivElement>(null);
@@ -150,7 +161,22 @@ export function SessionsView() {
             {SORTS.map((sort) => <option key={sort.value} value={sort.value}>{sort.label}</option>)}
           </select>
         </label>
+        <label className="session-search">
+          <span className="eyebrow">SEARCH TRANSCRIPTS</span>
+          <input
+            type="search"
+            value={searchDraft}
+            placeholder="Find text in archived conversations"
+            onChange={(event) => setSearchDraft(event.target.value)}
+          />
+        </label>
       </div>
+
+      {/* Searching reads the local archive, so it answers a different question
+          from the list below and is shown as its own result set. Narrowing by
+          agent also narrows the search, which is what makes a query shorter
+          than the trigram index allows servable at all. */}
+      <TranscriptSearch query={searchQuery} {...(filters.agentId ? { agentId: filters.agentId } : {})} />
 
       {error ? <div className="inline-error">{error}</div> : null}
 

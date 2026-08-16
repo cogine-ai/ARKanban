@@ -6,6 +6,7 @@ import type { KindFilter } from "./lib/board";
 import { statusLabel } from "./lib/format";
 import { Link, matchPath, useLocation, useNavigate } from "./router";
 import { useCollector } from "./state/collector-context";
+import { AgentDetailView } from "./views/AgentDetail";
 import { AgentsView } from "./views/Agents";
 import { ArchiveView } from "./views/Archive";
 import { ConnectionsView } from "./views/Connections";
@@ -68,6 +69,7 @@ export function App() {
   };
 
   const isLive = matchPath("/", pathname) !== undefined;
+  const agentDetail = matchPath("/agents/:agentId", pathname);
   const sessionDetail = matchPath("/sessions/:sessionKey", pathname);
 
   return (
@@ -107,6 +109,7 @@ export function App() {
       ) : (
         <main className="content-shell">
           {matchPath("/agents", pathname) ? <AgentsView /> : null}
+          {agentDetail ? <AgentDetailView agentId={agentDetail.agentId!} /> : null}
           {matchPath("/sessions", pathname) ? <SessionsView /> : null}
           {sessionDetail ? <SessionDetailView sessionKey={sessionDetail.sessionKey!} /> : null}
           {matchPath("/relations", pathname) ? <RelationsView snapshot={snapshot} onSelect={openItem} /> : null}

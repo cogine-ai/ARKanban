@@ -49,7 +49,12 @@ const DEFAULTS: CollectorConfig = {
     sessionRetentionDays: 365,
     transcriptRetentionDays: 180,
     transcriptMaxBytes: 2 * 1024 * 1024 * 1024,
-    transcriptSync: "enabled",
+    // Archiving whole conversations is opt-in. v1.1 §6 invariant 10 forbids
+    // enabling it silently, and a default of "enabled" is exactly that: the
+    // operator never asked, and the only disclosure sits on a page they may
+    // never open. Everything else in this file only changes how much is kept,
+    // not whether conversation text is kept at all.
+    transcriptSync: "disabled",
   },
   reconcile: { tasksMs: 15_000, sessionsMs: 8_000 },
   ui: { recentLimit: 200 },
@@ -191,6 +196,27 @@ export function loadConfig(
     },
     configPath: absoluteConfigPath,
   };
+}
+
+/**
+ * States whether whole conversations are being stored on this machine.
+ *
+ * v1.1 §6 invariant 10 requires that archiving never turn on silently. The
+ * standing disclosure in the UI does not cover it on its own: the operator who
+ * turns this on edits a config file and starts the process from a terminal, so
+ * the terminal has to say so too — and say how to undo it.
+ */
+export function transcriptNotice(config: ResolvedCollectorConfig): string {
+  if (config.storage.transcriptSync !== "enabled") {
+    return "Transcript archive: off. No conversation text is stored (storage.transcriptSync).\n";
+  }
+  return [
+    "Transcript archive: ON. Full conversation text from this Gateway is stored at",
+    `  ${config.storage.path}`,
+    `  kept ${config.storage.transcriptRetentionDays} days, up to ${Math.round(config.storage.transcriptMaxBytes / 1024 / 1024)} MiB`,
+    "  erase with: openclaw-collector purge-transcripts --yes",
+    "",
+  ].join("\n");
 }
 
 export function redactEndpoint(url: string): string {

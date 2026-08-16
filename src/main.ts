@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { CollectorRuntime } from "./collector/runtime.js";
-import { loadConfig, redactEndpoint } from "./config.js";
+import { loadConfig, redactEndpoint, transcriptNotice } from "./config.js";
 import { createHttpServer } from "./http/server.js";
 import { purgeTranscripts } from "./storage/purge-transcripts.js";
 
@@ -87,6 +87,7 @@ async function run(): Promise<void> {
   process.stdout.write(
     `OpenClaw Collector listening on http://${config.server.host}:${config.server.port} (Gateway ${redactEndpoint(config.gateway.url)})\n`,
   );
+  process.stdout.write(transcriptNotice(config));
 
   let stopping = false;
   const stop = async (signal: string): Promise<void> => {

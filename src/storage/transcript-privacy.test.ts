@@ -1,10 +1,10 @@
-import { mkdtempSync, readdirSync, readFileSync, rmSync, statSync } from "node:fs";
+import { mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { CollectorRuntime } from "../collector/runtime.js";
-import type { ResolvedCollectorConfig } from "../config.js";
+import { loadConfig, transcriptNotice, type ResolvedCollectorConfig } from "../config.js";
 import { createHttpServer } from "../http/server.js";
 import { CollectorRepository } from "./repository.js";
 
@@ -162,6 +162,33 @@ describe("local_archive boundary", () => {
 
     // SSE carries counts and watermarks; a fragment must never ride along.
     expect(changes.join("")).not.toContain(SECRET);
+  });
+
+  it("does not archive conversations unless the config asks for it", () => {
+    const directory = mkdtempSync(path.join(tmpdir(), "collector-optin-"));
+    cleanups.push(() => rmSync(directory, { recursive: true, force: true }));
+    const configPath = path.join(directory, "collector.config.json");
+    // A config that says nothing about transcripts, which is what an operator
+    // upgrading into this feature has. Invariant 10 forbids reading that silence
+    // as consent to store every conversation on disk.
+    writeFileSync(configPath, JSON.stringify({ storage: { path: path.join(directory, "c.sqlite") } }));
+
+    const config = loadConfig(configPath, { OPENCLAW_GATEWAY_TOKEN: "t" });
+    expect(config.storage.transcriptSync).toBe("disabled");
+  });
+
+  it("says on every start whether conversations are being stored, and how to erase them", () => {
+    const off = configFixture();
+    off.storage.transcriptSync = "disabled";
+    expect(transcriptNotice(off)).toMatch(/no conversation text is stored/i);
+
+    // The operator turns this on in a file and starts the process in a terminal,
+    // so the terminal has to name the location and the way back out.
+    const on = configFixture();
+    const notice = transcriptNotice(on);
+    expect(notice).toMatch(/ON/);
+    expect(notice).toContain(on.storage.path);
+    expect(notice).toContain("purge-transcripts");
   });
 
   it("has exactly one module that inserts into session_messages", () => {

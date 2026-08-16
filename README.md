@@ -58,11 +58,31 @@ Open `http://127.0.0.1:47123`. This fixture produces 180 operational records, ab
 - Activity Inspector: current state, observation evidence, identities, timeline, and relations
 - Relations: exact parent links and correlation-only run links
 - Archive: recent terminal task and attempt projections
-- Connections: Gateway, Task snapshot, Session snapshot, and Event stream health
-- HTTP API and SSE: `/api/v1/meta`, `/api/v1/snapshot` (including the separate Schedule forecast), `/api/v1/settled-groups`, `/api/v1/activities/:id`, and `/api/v1/events`
+- Agents: per-Agent roster cards with 24h/7d outcome rollups, cost, and next-hour schedule, plus a detail page with the full outcome distribution
+- Sessions: paged session list with grade, state and cost sorting, and a session detail page with lineage, usage, derived signals, timeline, and the archived conversation
+- Connections: Gateway, Task snapshot, Session snapshot, Event stream health, and the transcript archive disclosure
+- HTTP API and SSE: `/api/v1/meta`, `/api/v1/snapshot` (including the separate Schedule forecast), `/api/v1/settled-groups`, `/api/v1/activities/:id`, `/api/v1/agents`, `/api/v1/sessions`, `/api/v1/usage/summary`, and `/api/v1/events`
 - Operational probes: `/healthz` and `/readyz`
 
 Task ledger records and observed execution attempts are intentionally separate. A generic attempt end remains `outcome: unknown`; Collector only shows success when an authoritative source establishes it.
+
+## Conversation archive (off by default)
+
+Collector can keep the full text of every conversation from your Gateway in the local SQLite database, so sessions stay readable and searchable while the Gateway is offline. **This is off unless you turn it on**, because it changes what the database contains from operational metadata into your actual conversations:
+
+```json
+{ "storage": { "transcriptSync": "enabled" } }
+```
+
+With it on, every start prints where the text is stored, how long it is kept, and the command to erase it. Defaults are 180 days and 2 GiB, whichever comes first; eviction drops whole sessions oldest-first rather than leaving half a conversation. The text is served only by `/api/v1/sessions/:key/messages` and `/api/v1/search/messages`, never by the snapshot, SSE, logs, or diagnostics, and the Connections page discloses the archive's size while it exists.
+
+To erase it, including the migration backups that also contain text:
+
+```bash
+pnpm openclaw-collector purge-transcripts --yes
+```
+
+This runs `VACUUM`, so the text is not recoverable from free pages, and it does not require a Gateway token — needing to restore a revoked token before deleting your own local data would be backwards.
 
 ## Design package
 

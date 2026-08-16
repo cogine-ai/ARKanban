@@ -11,14 +11,26 @@ import { ArchiveView } from "./views/Archive";
 import { ConnectionsView } from "./views/Connections";
 import { LiveFlowView } from "./views/LiveFlow";
 import { RelationsView } from "./views/Relations";
+import { SessionDetailView } from "./views/SessionDetail";
+import { SessionsView } from "./views/Sessions";
 
 const NAV_ITEMS = [
   { path: "/", key: "live", label: "Live flow" },
   { path: "/agents", key: "agents", label: "Agents" },
+  { path: "/sessions", key: "sessions", label: "Sessions" },
   { path: "/relations", key: "relations", label: "Relations" },
   { path: "/archive", key: "archive", label: "Archive" },
   { path: "/connections", key: "connections", label: "Connections" },
 ] as const;
+
+/**
+ * A nav entry stays lit on its own subtree, so the Sessions tab does not go dark
+ * when a session detail is open. `/` is excluded because it prefixes everything.
+ */
+function isNavActive(navPath: string, pathname: string): boolean {
+  if (matchPath(navPath, pathname)) return true;
+  return navPath !== "/" && pathname.startsWith(`${navPath}/`);
+}
 
 export function App() {
   const { status, snapshot, settled, range, setRange } = useCollector();
@@ -56,6 +68,7 @@ export function App() {
   };
 
   const isLive = matchPath("/", pathname) !== undefined;
+  const sessionDetail = matchPath("/sessions/:sessionKey", pathname);
 
   return (
     <div className="app-shell">
@@ -67,8 +80,8 @@ export function App() {
               key={item.key}
               to={item.path}
               data-nav={item.key}
-              className={matchPath(item.path, pathname) ? "active" : ""}
-              aria-current={matchPath(item.path, pathname) ? "page" : undefined}
+              className={isNavActive(item.path, pathname) ? "active" : ""}
+              aria-current={isNavActive(item.path, pathname) ? "page" : undefined}
             >
               {item.label}
             </Link>
@@ -94,6 +107,8 @@ export function App() {
       ) : (
         <main className="content-shell">
           {matchPath("/agents", pathname) ? <AgentsView /> : null}
+          {matchPath("/sessions", pathname) ? <SessionsView /> : null}
+          {sessionDetail ? <SessionDetailView sessionKey={sessionDetail.sessionKey!} /> : null}
           {matchPath("/relations", pathname) ? <RelationsView snapshot={snapshot} onSelect={openItem} /> : null}
           {matchPath("/archive", pathname) ? <ArchiveView items={snapshot?.items ?? []} onSelect={openItem} /> : null}
           {matchPath("/connections", pathname) ? <ConnectionsView status={status} /> : null}

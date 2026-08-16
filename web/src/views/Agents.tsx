@@ -18,6 +18,7 @@ import {
   hash,
   shortAgent,
 } from "../lib/format";
+import { Link } from "../router";
 import { useAgents } from "../state/use-agents";
 import { useCollector } from "../state/collector-context";
 
@@ -168,6 +169,11 @@ function AgentCard({ agent, live }: { agent: AgentOverview; live: LiveCounts }) 
 
       <footer className="agent-card-foot">
         <span className="agent-seen">{agent.lastSessionActivityAt ? `Active ${formatRelative(agent.lastSessionActivityAt)}` : "No session observed"}</span>
+        {agent.sessionCount > 0 ? (
+          <Link className="agent-sessions-link" to={`/sessions?agentId=${encodeURIComponent(agent.id)}`}>
+            {agent.sessionCount} sessions
+          </Link>
+        ) : null}
       </footer>
     </article>
   );

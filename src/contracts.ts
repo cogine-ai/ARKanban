@@ -257,10 +257,19 @@ export type SessionKindHint = "main" | "fork" | "subagent" | "global" | "unknown
  * and is carrying an older observation. The spec's §2.2 type omitted it while
  * §3.3 requires it; without it, a deferred session would be indistinguishable
  * from a freshly measured one.
+ *
+ * `unreported` means the endpoint answered and reported no usage: it totals a
+ * session's own accounting file, and a session whose harness never wrote counts
+ * there comes back as zeros. Every session on the calibration machine did, with
+ * `cacheStatus` reporting `fresh`. It is separate from `error` because nothing
+ * failed, and separate from `not_observed` because the reading did happen —
+ * collapsing either way would present a session with no accounting as one that
+ * cost nothing.
  */
 export type SessionUsageCoverage =
   | "live"
   | "snapshot"
+  | "unreported"
   | "not_observed"
   | "unavailable"
   | "unauthorized"

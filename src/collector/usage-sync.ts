@@ -57,6 +57,26 @@ export function classifyUsageFailure(error: unknown): string {
   return "error";
 }
 
+/**
+ * Whether the Gateway's usage cache was still catching up when it answered.
+ *
+ * A reply carries `cacheStatus: { status, cachedFiles, pendingFiles, staleFiles,
+ * refreshedAt }`. It does not explain away an empty reading — the calibration
+ * machine reported `fresh` with `staleFiles: 0` while returning zeros for a
+ * session that had been running for minutes — but `refreshing` does mean the
+ * figures may still arrive, and a session in that state must not be recorded as
+ * having no accounting.
+ */
+function cacheCatchingUp(payload: unknown): boolean {
+  if (!payload || typeof payload !== "object") return false;
+  const status = (payload as Record<string, unknown>).cacheStatus;
+  if (!status || typeof status !== "object") return false;
+  const row = status as Record<string, unknown>;
+  const stale = typeof row.staleFiles === "number" ? row.staleFiles : 0;
+  const pending = typeof row.pendingFiles === "number" ? row.pendingFiles : 0;
+  return (typeof row.status === "string" && row.status !== "fresh") || stale > 0 || pending > 0;
+}
+
 /** Per-agent cost for one window, as priced by the Gateway. */
 export type CostWindows = Record<AgentRollupWindow, Map<string, number>>;
 
@@ -69,8 +89,22 @@ export class UsageSynchronizer {
   private costWindows = emptyCostWindows();
   private costCoverage: SessionUsageCoverage = "not_observed";
   private lastCostAt = 0;
+  private readonly unreported = new Set<string>();
 
   constructor(private readonly deps: UsageSyncDeps) {}
+
+  /**
+   * Sessions the endpoint answered for and reported no usage.
+   *
+   * Tracked per session because the round's own coverage is collector-wide: on a
+   * Gateway where some harnesses record token counts and others do not, a round
+   * is `live` overall while individual sessions have nothing, and those sessions
+   * must not read as merely unmeasured. Membership is dropped as soon as a
+   * session does report, so a warming cache clears itself.
+   */
+  unreportedSessions(): string[] {
+    return [...this.unreported];
+  }
 
   /**
    * Gateway-priced cost per agent, when `usage.cost` answered.
@@ -137,6 +171,7 @@ export class UsageSynchronizer {
     let requests = 0;
     let recorded = 0;
     let succeeded = 0;
+    let catchingUp = 0;
     let errorCode: string | undefined;
     const writes: UsageWrite[] = [];
 
@@ -162,6 +197,9 @@ export class UsageSynchronizer {
           sessionKey: candidate.sessionKey,
           ...(this.deps.inventory ? { inventory: this.deps.inventory } : {}),
         });
+        if (page.writes.length > 0) this.unreported.delete(candidate.sessionKey);
+        else if (cacheCatchingUp(payload)) catchingUp += 1;
+        else this.unreported.add(candidate.sessionKey);
         writes.push(...page.writes);
         succeeded += 1;
       } catch (error) {
@@ -173,7 +211,24 @@ export class UsageSynchronizer {
 
     // One flaky session should not repaint the whole cost view as broken, so
     // `error` is reserved for a round where nothing came back at all.
-    this.coverage = succeeded === 0 ? "error" : demand > candidates.length ? "snapshot" : "live";
+    //
+    // A round can also succeed and yield nothing, which is what the calibration
+    // machine did every time: the endpoint answered for every session with every
+    // count zero, because it totals a session file the harness never wrote counts
+    // into. Calling that `live` would leave a cost view showing $0.00 with no
+    // indication that nothing was ever measured.
+    this.coverage =
+      succeeded === 0
+        ? "error"
+        : writes.length === 0
+          // A round that came back empty only because the cache was still
+          // building has not established anything yet.
+          ? catchingUp === succeeded
+            ? "not_observed"
+            : "unreported"
+          : demand > candidates.length
+            ? "snapshot"
+            : "live";
 
     return {
       requests,

@@ -101,6 +101,13 @@ export type ProjectUsageOptions = {
  * A row with no recognisable token counts is dropped rather than stored as
  * zeros: an invented zero would be indistinguishable from a measured one and
  * would drag a real average down.
+ *
+ * A row whose counts are all present and all zero is dropped for the same
+ * reason. The endpoint totals a session's own accounting file, and on the
+ * calibration machine every session came back with zeros — including one the
+ * index priced at $0.034 — because the file recorded no counts. Storing that
+ * would assert the session was free, and `hasCost` would have called the
+ * assertion complete.
  */
 export function projectUsageRow(raw: unknown, options: ProjectUsageOptions): UsageWrite | undefined {
   const row = record(raw);
@@ -141,13 +148,19 @@ export function projectUsageRow(raw: unknown, options: ProjectUsageOptions): Usa
   const peakContextTokens = asNumber(read("peakContextTokens"));
   const observedAt = asNumber(read("observedAt")) ?? options.observedAt;
 
-  return {
-    sessionKey,
-    observedAt,
+  const tokens = {
     inputTokens: asTokens(inputTokens),
     outputTokens: asTokens(outputTokens),
     cacheReadTokens: asTokens(read("cacheReadTokens")),
     cacheWriteTokens: asTokens(read("cacheWriteTokens")),
+  };
+  const counted = Object.values(tokens).some((value) => value > 0);
+  if (!counted && !(costMicroUsd !== undefined && costMicroUsd > 0)) return undefined;
+
+  return {
+    sessionKey,
+    observedAt,
+    ...tokens,
     ...(peakContextTokens !== undefined && peakContextTokens >= 0
       ? { peakContextTokens: Math.round(peakContextTokens) }
       : {}),
@@ -157,6 +170,25 @@ export function projectUsageRow(raw: unknown, options: ProjectUsageOptions): Usa
     unpricedModels,
   };
 }
+
+/**
+ * The session index's token and cost fields are deliberately not read here.
+ *
+ * `sessions.list` rows carry `inputTokens`, `outputTokens`, `totalTokens` and
+ * `estimatedCostUsd`, and on the calibration machine they were the only figures
+ * with any content — the usage endpoint reported zeros for every session. They
+ * are still the wrong numbers: the runtime assigns rather than accumulates them,
+ * so each one describes the session's *last run*. `estimatedCostUsd` comes from
+ * a function named for a run, and `totalTokens` is derived from the last call's
+ * usage against the context window, which is why the Gateway's own `/usage`
+ * command divides it by `contextTokens` to show a context percentage and reports
+ * `input + output` as the total instead.
+ *
+ * Summed across sessions on an agent card they would read as spend while being
+ * one turn's context, so a session whose harness records no usage is reported as
+ * `unreported` rather than filled in from here. See
+ * docs/v1/real-gateway-field-calibration.md §2.7.
+ */
 
 export const COST_FIELD_ALIASES = {
   agentId: ["agentId", "agent", "id", "key", "name"],

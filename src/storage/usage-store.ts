@@ -67,6 +67,23 @@ function emptyTotals(): UsageTotals {
 }
 
 /**
+ * A reading's total tokens, which is what the high-water gate in `record`
+ * compares so a cumulative figure cannot be replaced by a lower one.
+ */
+function readingTotal(row: Row): number {
+  return (
+    Number(row.input_tokens ?? 0) +
+    Number(row.output_tokens ?? 0) +
+    Number(row.cache_read_tokens ?? 0) +
+    Number(row.cache_write_tokens ?? 0)
+  );
+}
+
+function writeTotal(write: UsageWrite): number {
+  return write.inputTokens + write.outputTokens + write.cacheReadTokens + write.cacheWriteTokens;
+}
+
+/**
  * Folds one row into a running total.
  *
  * `hasCost` is sticky-false: once any contributor is unpriced the sum can only
@@ -93,9 +110,24 @@ export class UsageStore {
   constructor(private readonly db: DatabaseSync) {}
 
   /**
-   * Records a reading. Re-observing a session within the same millisecond
-   * replaces the row rather than failing, since the second read is the better
-   * one and the primary key cannot hold both.
+   * Records a reading, unless it would move a session's cumulative total
+   * backwards.
+   *
+   * The newest row per session is what every aggregate reads, so a reading that
+   * came back smaller than the last one would replace a measured total with a
+   * lower claim about spend. A cumulative figure cannot shrink, so the lower
+   * reading is the worse measurement and is dropped — which is the guard against
+   * a Gateway whose usage cache answers with zeros for a session it has already
+   * measured.
+   *
+   * The cost is that a genuine reset — a session whose accounting really does
+   * restart — leaves the high-water mark in place until it is exceeded.
+   * `groupBy: "family"` keeps transcript rotation from causing one, and holding a
+   * total that is too high is the safer failure on a view about money.
+   *
+   * Re-observing a session within the same millisecond replaces the row rather
+   * than failing, since the second read is the better one and the primary key
+   * cannot hold both.
    */
   record(writes: UsageWrite[]): number {
     if (writes.length === 0) return 0;
@@ -114,10 +146,16 @@ export class UsageStore {
         has_cost = excluded.has_cost,
         models_json = excluded.models_json
     `);
+    const highWater = this.db.prepare(`
+      SELECT input_tokens, output_tokens, cache_read_tokens, cache_write_tokens
+      FROM session_usage_snapshots WHERE session_key = ? ORDER BY observed_at DESC LIMIT 1
+    `);
     let written = 0;
     this.db.exec("BEGIN IMMEDIATE");
     try {
       for (const write of writes) {
+        const previous = highWater.get(write.sessionKey) as Row | undefined;
+        if (previous && writeTotal(write) < readingTotal(previous)) continue;
         statement.run(
           write.sessionKey,
           write.observedAt,

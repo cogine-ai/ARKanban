@@ -120,6 +120,10 @@ if (mode === "shape") {
   process.stdout.write(`runtime populated: ${ratio((w) => w.runtime !== undefined)}\n`);
   process.stdout.write(`model populated:   ${ratio((w) => w.model !== undefined)}\n`);
   process.stdout.write(`kindHint:          ${[...new Set(writes.map((w) => w.kindHint))].join(", ") || "none"}\n`);
+  // The index's `inputTokens`, `totalTokens` and `estimatedCostUsd` show up in
+  // the unknown list below and are deliberately unconsumed: the runtime assigns
+  // them per run rather than accumulating, so they describe the last run and not
+  // the session. Reporting them here would invite reading them as spend.
   reportInventory(inventory);
 } else {
   const inventory = new FieldInventory("sessions.usage");
@@ -130,8 +134,10 @@ if (mode === "shape") {
       `  in/out=${write.inputTokens}/${write.outputTokens} cost=${write.costMicroUsd ?? "none"} hasCost=${write.hasCost} models=${write.models.length}\n`,
     );
   }
-  // A cold usage cache answers with null figures, which is not the same as
-  // having none; `cacheStatus` is where the Gateway says which it is.
+  // A reply that answers with every count zero is dropped, because storing it
+  // would assert the session was free. `cacheStatus` does not explain it away:
+  // the calibration machine reported `fresh` while returning zeros for sessions
+  // the index priced, so a drop here means the cost view falls back to the index.
   const cache = payload.cacheStatus;
   if (cache && typeof cache === "object") process.stdout.write(`cacheStatus:    ${shapeOf(cache, 1)}\n`);
   reportInventory(inventory);

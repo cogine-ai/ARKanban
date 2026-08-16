@@ -141,6 +141,63 @@ describe("UsageSynchronizer rounds", () => {
     expect(outcome).toMatchObject({ requests: 3, recorded: 2, coverage: "live", errorCode: "error" });
   });
 
+  /**
+   * What the calibration machine returns for every session: the call succeeds and
+   * every count is zero. Nothing failed, so `error` would be wrong, and a stored
+   * zero would price a running session at $0.00.
+   */
+  it("reports a round the Gateway answered with no usage as unreported", async () => {
+    const repo = repository();
+    seed(repo, 2);
+    const gateway = recordingGateway({
+      usage: async (_method, params) => ({
+        sessions: [{ key: params.key, usage: { input: 0, output: 0, totalCost: 0, missingCostEntries: 0 } }],
+        cacheStatus: { status: "fresh", staleFiles: 0 },
+      }),
+    });
+    const sync = synchronizer(repo, gateway.request);
+    const outcome = await sync.runOnce({ ...LIVE, now: NOW });
+
+    expect(outcome).toMatchObject({ requests: 2, recorded: 0, coverage: "unreported" });
+    expect(outcome.errorCode).toBeUndefined();
+    expect(sync.unreportedSessions().sort()).toEqual(["agent:builder:0", "agent:builder:1"]);
+  });
+
+  /** A cache that is still building has not established that usage is absent. */
+  it("does not call a session unreported while the usage cache is refreshing", async () => {
+    const repo = repository();
+    seed(repo, 2);
+    const gateway = recordingGateway({
+      usage: async (_method, params) => ({
+        sessions: [{ key: params.key, usage: { input: 0, output: 0, totalCost: 0 } }],
+        cacheStatus: { status: "refreshing", cachedFiles: 0, pendingFiles: 1, staleFiles: 1 },
+      }),
+    });
+    const sync = synchronizer(repo, gateway.request);
+    const outcome = await sync.runOnce({ ...LIVE, now: NOW });
+
+    expect(outcome).toMatchObject({ recorded: 0, coverage: "not_observed" });
+    expect(sync.unreportedSessions()).toEqual([]);
+  });
+
+  it("stops calling a session unreported once it reports usage", async () => {
+    const repo = repository();
+    seed(repo, 1);
+    let counts = { input: 0, output: 0, totalCost: 0 };
+    const gateway = recordingGateway({
+      usage: async (_method, params) => ({ sessions: [{ key: params.key, usage: { ...counts } }] }),
+    });
+    const sync = synchronizer(repo, gateway.request);
+
+    await sync.runOnce({ ...LIVE, now: NOW });
+    expect(sync.unreportedSessions()).toEqual(["agent:builder:0"]);
+
+    counts = { input: 40, output: 5, totalCost: 0.5 };
+    const second = await sync.runOnce({ ...LIVE, now: NOW + 60_000 });
+    expect(second).toMatchObject({ recorded: 1, coverage: "live" });
+    expect(sync.unreportedSessions()).toEqual([]);
+  });
+
   it("falls back to error coverage only when the whole round failed", async () => {
     const repo = repository();
     seed(repo, 2);

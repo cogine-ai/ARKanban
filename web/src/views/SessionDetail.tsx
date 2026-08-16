@@ -84,7 +84,9 @@ function UsagePanel({ usage, coverage }: { usage?: SessionUsage; coverage: strin
             ? "The Gateway does not report usage."
             : coverage === "unauthorized"
               ? "This token lacks the usage scope."
-              : "No reading collected for this session yet."}
+              : coverage === "unreported"
+                ? "The Gateway was asked and reported no usage for this session. Its harness records no token counts, so there is nothing to price — not a session that cost nothing."
+                : "No reading collected for this session yet."}
         </p>
       </div>
     );

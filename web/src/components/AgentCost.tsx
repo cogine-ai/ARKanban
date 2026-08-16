@@ -9,6 +9,9 @@ export const ROLLUP_WINDOWS: AgentRollupWindow[] = ["24h", "7d"];
  */
 const COST_UNAVAILABLE: Partial<Record<SessionUsageCoverage, string>> = {
   not_observed: "Usage not collected yet",
+  // The Gateway answered and had nothing to report, which is not the same as a
+  // free agent and must never render as one.
+  unreported: "Gateway reports no usage for these sessions",
   unavailable: "Gateway does not report usage",
   unauthorized: "Token lacks usage scope",
   error: "Usage read failed",

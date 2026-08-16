@@ -130,8 +130,14 @@ const transcriptTurns = [
 function mockUsage(sessionKey: string, model: string, observedAt: number): Record<string, unknown> {
   let hash = 0;
   for (const character of sessionKey) hash = (hash * 37 + character.charCodeAt(0)) % 9_973;
-  const input = 1_200 + hash * 3;
-  const output = 300 + (hash % 700);
+  // Every fourth session reports the shape the calibration machine returned for
+  // all of them: the endpoint answers, `cacheStatus` says `fresh`, and every
+  // count is zero because the session file it totals recorded none — while the
+  // index reports real tokens for the same session. Stored, that zero asserts the
+  // session was free.
+  const blind = hash % 4 === 0;
+  const input = blind ? 0 : 1_200 + hash * 3;
+  const output = blind ? 0 : 300 + (hash % 700);
   const unpriced = hash % 3 === 0;
   const totalCost = Number(((input * 3 + output * 15) / 1_000_000).toFixed(6));
   // The row shape `sessions.usage` returns: the counts sit in a nested `usage`
@@ -146,16 +152,21 @@ function mockUsage(sessionKey: string, model: string, observedAt: number): Recor
     usage: {
       input,
       output,
-      cacheRead: hash % 500,
-      cacheWrite: hash % 90,
+      cacheRead: blind ? 0 : hash % 500,
+      cacheWrite: blind ? 0 : hash % 90,
       totalTokens: input + output,
-      totalCost: unpriced ? Number((totalCost / 2).toFixed(6)) : totalCost,
+      totalCost: blind ? 0 : unpriced ? Number((totalCost / 2).toFixed(6)) : totalCost,
       inputCost: Number(((input * 3) / 1_000_000).toFixed(6)),
       outputCost: Number(((output * 15) / 1_000_000).toFixed(6)),
-      missingCostEntries: unpriced ? 1 + (hash % 3) : 0,
+      missingCostEntries: unpriced && !blind ? 1 + (hash % 3) : 0,
       modelUsage: [{ provider: "anthropic", model }],
     },
   };
+}
+
+/** Reply-level, not per row, and `fresh` even when every count is zero. */
+function mockCacheStatus(observedAt: number): Record<string, unknown> {
+  return { status: "fresh", cachedFiles: 1, pendingFiles: 0, staleFiles: 0, refreshedAt: observedAt };
 }
 
 function transcriptLength(sessionKey: string): number {
@@ -291,7 +302,11 @@ server.on("connection", (socket) => {
             type: "res",
             id: request.id,
             ok: true,
-            payload: { sessions: [mockUsage(session.key, session.model, observedAt)], updatedAt: observedAt },
+            payload: {
+              sessions: [mockUsage(session.key, session.model, observedAt)],
+              updatedAt: observedAt,
+              cacheStatus: mockCacheStatus(observedAt),
+            },
           });
         }
       } else {
@@ -302,7 +317,10 @@ server.on("connection", (socket) => {
           type: "res",
           id: request.id,
           ok: true,
-          payload: { sessions: sessions.slice(0, limit).map((entry) => mockUsage(entry.key, entry.model, observedAt)) },
+          payload: {
+            sessions: sessions.slice(0, limit).map((entry) => mockUsage(entry.key, entry.model, observedAt)),
+            cacheStatus: mockCacheStatus(observedAt),
+          },
         });
       }
     } else if (request.method === "usage.cost") {

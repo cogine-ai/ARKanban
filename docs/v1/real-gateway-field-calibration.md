@@ -79,11 +79,22 @@ $(npm root -g)/openclaw/dist/
 
 真机还暴露了两件包里看不出来的事，见 §2.5 和 §2.6。
 
-### 反方向的发现：`sessions.list` 已经带用量
+### `runtime` 里就能看出 Codex / Claude Code
 
-会话行里就有 `inputTokens`、`outputTokens`、`totalTokens`、`estimatedCostUsd`、`contextTokens`，还有一个 `totalTokensFresh` 说明这数准不准，以及一个我们没读的 `status`。
+`agentRuntime.id` 不是固定的 `"openclaw"`。它是这个会话实际跑在哪个 harness 上：真机两个会话分别是 `{id: "codex", source: "implicit"}`（model `gpt-5.6-sol`、provider `openai`）和 `{id: "auto"}`（provider `codex`）。
 
-也就是说 S6 那一整套「探测 `sessions.usage` → 存快照 → 做 rollup」，有相当一部分可以由每 8 秒本来就要拉的会话索引直接给出，不额外发一次请求。**动手改之前先量一下** `totalTokensFresh` 在真机上的占比，它为 false 时那个数字是转写自 transcript 的估算。
+session key 里带 `:acp:` 段的会话另算：`applyAcpRuntimeOverlay` 会把 runtime 覆盖成 **ACP 后端名**（拿不到名字才退化成 `acpx`），所以 Codex CLI、Claude Code 这类被 OpenClaw 当后端驱动的 agent，runtime 上直接写着是谁。
+
+两个推论：
+
+- 这正是「`runtime` 读成对象」那个 bug 的实际代价。修之前这一列每行都是 NULL，Agents 卡片一律显示 `runtime not reported`，**任何 runtime 都分不出来**；
+- 反过来，脱离 OpenClaw 单独跑的 `claude` / `codex` CLI，Gateway 不知道它们的存在，collector 也就看不到——collector 只读 Gateway，这是边界而不是缺陷。
+
+### 反方向的发现：`sessions.list` 带着几个用量字段——但不能用
+
+会话行里就有 `inputTokens`、`outputTokens`、`totalTokens`、`estimatedCostUsd`、`contextTokens`、`totalTokensFresh`，以及一个我们没读的 `status`。
+
+这份文档早先的版本据此提出：S6 那套「探测 `sessions.usage` → 存快照 → rollup」有一部分可以由每 8 秒本来就要拉的索引直接给出，不额外发请求。**这个结论是错的，别照着做**，理由见 §2.7。这些字段全部描述**最后一次运行**，不是会话累计。
 
 ---
 
@@ -120,16 +131,38 @@ $(npm root -g)/openclaw/dist/
 
 现在 `flattenToolCall()` 把它渲染成 `工具名 + 参数 JSON`，参数照原样保留（和归档其余部分一致）。
 
-### 2.6 `sessions.usage` 会返回 `usage: null`，而这不等于没有用量
+### 2.6 `sessions.usage` 在真机上恒为零，而零不等于免费
 
-真机上一个刚聊过的会话，`sessions.usage` 返回的行里 `usage` 是 `null`、`totals` 全零、`aggregates.byAgent` 空——因为 Gateway 的用量索引是从 transcript 文件异步算出来的，而 `cacheStatus` 说明了原因：`cachedFiles: 0, pendingFiles: 1, staleFiles: 1`。
+真机上两个刚聊过的会话，`sessions.usage` 的 `totals` 全零、`aggregates.byAgent` 里 token 全零。第一次撞见时以为是缓存没算好（那个会话确实是 `cachedFiles: 0, pendingFiles: 1, staleFiles: 1`），但复核第二个会话时 `cacheStatus.status` 是 **`fresh`、`staleFiles: 0`，token 照样全零**，而 `aggregates.messages` 同时报着 27 条消息、17 次工具调用。`chat.history` 里逐条消息的 `usage` 也全是零。
 
-同一时刻，**同一个会话在 `sessions.list` 里已经有 `totalTokens: 46486` 和 `estimatedCostUsd: 0.026342`**。
+所以不是缓存问题：这个接口是把会话自己的记账文件求和，而 codex harness 根本没往里写 token 数。**这台机器上没有任何一处有会话累计用量。**
 
-两个后果：
+危险的地方在于零是"合法数值"：`missingCostEntries` 是 0、`totalCost` 是 0，于是 `hasCost` 会算成 `true`——等于对着一个真花了钱的会话断言「$0.00，数据完整」。契约里那句「usage unavailable 和 usage is zero 在成本视图上意思相反」正是这一条。
 
-1. `projectUsageRow` 丢掉这种行是对的（不存编造的零），但 `SessionUsageCoverage` 会把「缓存还没算」报成和「真机不提供用量」一样，读的人分不出来。**应该读 `cacheStatus`。**
-2. 这是 §1 那条「用 `sessions.list` 自带的数」最硬的证据——专用用量接口返回 null 的时候，会话索引里已经有数了。
+现在的处理：
+
+1. `projectUsageRow` **丢掉全零读数**（除非成本为正），不存编造的零；
+2. `UsageStore.record` 有高水位闸门，累计读数不得被更低的读数覆盖，所以一次全零回复也无法擦掉已经量到的总量；
+3. 新增 coverage 状态 **`unreported`**：接口答了、并且没有用量可报。它和 `error`（什么都没回来）、`not_observed`（还没读）都分开，UI 上写成「Gateway reports no usage for these sessions」而不是 `$0.00`；
+4. `cacheStatus` 会读，但只用来判断「稍后再来」：`status !== "fresh"` 或 `staleFiles`/`pendingFiles` 非零时，空读数不算 `unreported`，因为数可能还在路上。
+
+### 2.7 `sessions.list` 的 token 与成本是"最后一次运行"，不是会话累计
+
+`inputTokens`、`outputTokens`、`totalTokens`、`estimatedCostUsd` 名字都像会话总量，四个都不是。真机上第一个会话是 `inputTokens: 1036, outputTokens: 4, totalTokens: 59148, estimatedCostUsd: 0.034356`——1036 + 4 加不出 59148，也换不出 $0.034。
+
+包里 `agent-runner.runtime` 写这些字段的地方全是**赋值，不是累加**：
+
+```js
+patch.inputTokens = params.usage?.input ?? 0;          // 本次运行
+patch.estimatedCostUsd = runEstimatedCostUsd;          // estimateSessionRunCostUsd(...)
+patch.totalTokens = deriveSessionTotalTokens({ usage: lastCallUsage, contextTokens, promptTokens });
+```
+
+`estimatedCostUsd` 的来源函数名就叫 `estimateSessionRunCostUsd`；`totalTokens` 是拿最后一次调用的用量对着上下文窗口推出来的，所以它是**上下文占用量**。Gateway 自己的 `/usage` 命令印证了这一点：它把 `totalTokens / contextTokens` 显示成"Context: N%"，而把 "Total" 显示为 `input + output`。
+
+后果：把它当会话用量，在 agent 卡片上按会话求和之后，屏幕上会出现一个「看着像花费、实际是某一轮上下文大小」的数字。**成本视图上宁可空着也不能这样填。** 这就是 §1 里那条建议被推翻的原因，也是 codex 会话现在报 `unreported` 而不是补数的原因。
+
+（`totalTokens` 作为"上下文占用"倒是真实的，`SessionUsage.peakContextTokens` 至今没有数据源——这是一条还没做的事，见 §4。）
 
 ### 2.4 `usage.cost` 没有 per-agent 分解
 
@@ -151,13 +184,11 @@ $(npm root -g)/openclaw/dist/
 
 ## 4. 还没做的事
 
-1. **`usage.cost` 的成本覆盖层**要改成读 `sessions.usage` 的 `aggregates.byAgent`（§2.4）。现在它每轮都拿不到可用数据，诊断端点里 `usage.cost` 的 `consumed` 是空的。
-2. **考虑用 `sessions.list` 自带的 token/成本**替代部分 `sessions.usage` 轮询（§1、§2.6）。
-2.1 **读 `cacheStatus`**，把「Gateway 用量缓存还没算好」和「拿不到用量」分开报（§2.6）。
-2.2 **消息级 `usage` 和 `isError` 没被读**。`chat.history` 的每条消息都带 `usage: { input, output, cacheRead, cacheWrite, totalTokens, cost }`，工具结果还带 `isError`——真机那 30 条里有 13 条带 `isError`、其中 3 条为 true。派生信号现在从 activities/observations 推工具失败，而这里有 Gateway 直接给的结论。
-3. **audit 采集**完全没实现（§3）。
-4. **Agents 页的「系统 agent 折叠」没有数据来源**。`web/src/views/Agents.tsx` 按 `agent.kind === "system"` 分组，而名册里没有任何字段能区分内建 agent，真机上所有 agent 都会落在主列表。要么找别的信号（例如只由 cron 触发的 agent），要么去掉这个分组。
-5. **真机跑通**：本机 Gateway 的会话库还是空的（`sessions.json` 0 entries），得先有真实对话才能验证投影。
+1. **`usage.cost` 的成本覆盖层**要改成读 `sessions.usage` 的 `aggregates.byAgent`（§2.4）。现在它每轮都拿不到可用数据，诊断端点里 `usage.cost` 的 `consumed` 是空的。注意 §2.6：真机上 `aggregates.byAgent` 的 token 也是零，所以这条修完不一定有数。
+2. **消息级 `isError` 没被读**。`chat.history` 的工具结果带 `isError`——真机那 30 条里有 13 条带这个字段、其中 3 条为 true。派生信号现在从 activities/observations 推工具失败，而这里有 Gateway 直接给的结论。（同一批消息的 `usage` 全是零，见 §2.6，别指望它。）
+3. **`peakContextTokens` 没有数据源**，而 `sessions.list` 的 `totalTokens` 就是上下文占用量（§2.7）。要接的话得单独走一条不进成本聚合的写入路径——直接写进用量快照会让零 token 的会话进入成本视图。
+4. **audit 采集**完全没实现（§3）。
+5. **Agents 页的「系统 agent 折叠」没有数据来源**。`web/src/views/Agents.tsx` 按 `agent.kind === "system"` 分组，而名册里没有任何字段能区分内建 agent，真机上所有 agent 都会落在主列表。要么找别的信号（例如只由 cron 触发的 agent），要么去掉这个分组。
 
 ---
 

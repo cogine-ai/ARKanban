@@ -117,6 +117,33 @@ describe("UsageStore", () => {
     const windows = repo.usage.agentWindows(["quiet"], NOW);
     expect(windows.get("quiet")?.["24h"]).toMatchObject({ sessionCount: 0, inputTokens: 0, hasCost: true });
   });
+
+  /**
+   * The newest row is what every aggregate reads, and the calibration machine's
+   * usage endpoint answers with zeros for sessions it has already measured.
+   * Without the gate, that reply would replace a measured total with a claim that
+   * the session was free.
+   */
+  it("refuses a reading that would move a cumulative total backwards", () => {
+    const repo = repository();
+    session(repo, "agent:builder:1", "builder");
+    repo.usage.record([usage("agent:builder:1", { observedAt: NOW - 60_000 })]);
+
+    const written = repo.usage.record([
+      usage("agent:builder:1", {
+        observedAt: NOW,
+        inputTokens: 0,
+        outputTokens: 0,
+        cacheReadTokens: 0,
+        cacheWriteTokens: 0,
+        costMicroUsd: 0,
+      }),
+    ]);
+
+    expect(written).toBe(0);
+    expect(repo.usage.latest("agent:builder:1")).toMatchObject({ inputTokens: 100, costMicroUsd: 1_500 });
+  });
+
 });
 
 describe("UsageStore candidates", () => {

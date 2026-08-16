@@ -648,6 +648,7 @@ export class CollectorRuntime {
     } finally {
       this.usageSyncing = false;
       this.repository.setUsageCoverage(this.usageStatus?.coverage ?? "not_observed");
+      this.repository.setUnreportedUsageSessions(this.usage.unreportedSessions());
       if ((this.usageStatus?.recorded ?? 0) > 0 || this.usageStatus?.costRefreshed) {
         this.emitChange({
           epoch: this.repository.epoch,

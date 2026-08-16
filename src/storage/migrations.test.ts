@@ -58,7 +58,7 @@ describe("schema migrations", () => {
 
     const result = applyMigrations(db, databasePath);
 
-    expect(result.applied).toEqual(["baseline-activities", "agents-session-surface"]);
+    expect(result.applied).toEqual(MIGRATIONS.map((migration) => migration.name));
     const survivor = db.prepare("SELECT title, session_ref FROM activities WHERE id = 'a-1'").get() as {
       title: string;
       session_ref: unknown;

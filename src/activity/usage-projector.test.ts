@@ -122,6 +122,31 @@ describe("projectUsageRow", () => {
     expect(projectUsageRow({ sessionKey: "s", cost: 1 }, { observedAt: OBSERVED_AT })).toBeUndefined();
   });
 
+  /**
+   * The reply every session produced on the calibration machine: the counts are
+   * all present, all zero, and `cacheStatus` reported `fresh`, for sessions that
+   * had run for minutes. Stored, it would have asserted the session was free and
+   * `hasCost` would have called that assertion complete.
+   */
+  it("drops an all-zero reading instead of asserting the session was free", () => {
+    const row = projectUsageRow(
+      {
+        key: "agent:builder:1",
+        usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, totalCost: 0, missingCostEntries: 0 },
+      },
+      { observedAt: OBSERVED_AT },
+    );
+    expect(row).toBeUndefined();
+  });
+
+  it("keeps a genuinely free reading that counted tokens", () => {
+    const row = projectUsageRow(
+      { key: "s", usage: { input: 10, output: 2, totalCost: 0, missingCostEntries: 0 } },
+      { observedAt: OBSERVED_AT },
+    );
+    expect(row).toMatchObject({ costMicroUsd: 0, hasCost: true });
+  });
+
   it("falls back to the requested session when the reply omits the key", () => {
     const row = projectUsageRow({ inputTokens: 4, outputTokens: 1 }, { observedAt: OBSERVED_AT, sessionKey: "asked" });
     expect(row?.sessionKey).toBe("asked");

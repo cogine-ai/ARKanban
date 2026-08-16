@@ -1341,7 +1341,12 @@ export class CollectorRepository {
       this.usageCoverage === "unavailable" || this.usageCoverage === "unauthorized"
         ? this.usageCoverage
         : !hasSnapshot
-          ? "not_observed"
+          // `unreported` outranks `not_observed` for a session the loop did read
+          // and the Gateway had no usage to give: a different instruction to the
+          // reader than "not read yet".
+          ? this.unreportedUsage.has(session.sessionKey)
+            ? "unreported"
+            : "not_observed"
           : this.usageCoverage === "not_observed"
             ? "snapshot"
             : this.usageCoverage;
@@ -1350,6 +1355,19 @@ export class CollectorRepository {
 
   setUsageCoverage(coverage: SessionUsageCoverage): void {
     this.usageCoverage = coverage;
+  }
+
+  /**
+   * Sessions the usage endpoint answered for while reporting nothing.
+   *
+   * Not stored: it describes the last round rather than the session, and a
+   * restart should go back to saying "not read yet" instead of asserting that a
+   * session has no accounting on evidence it no longer holds.
+   */
+  private unreportedUsage: ReadonlySet<string> = new Set();
+
+  setUnreportedUsageSessions(sessionKeys: readonly string[]): void {
+    this.unreportedUsage = new Set(sessionKeys);
   }
 
   getUsageCoverage(): SessionUsageCoverage {

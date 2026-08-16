@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { decodeCursor, encodeCursor, isSessionSort } from "./keyset-cursor.js";
+import { decodeCursor, DEFERRED_SESSION_SORTS, encodeCursor, isSessionSort } from "./keyset-cursor.js";
 
 describe("keyset cursor", () => {
   it("round-trips a cursor", () => {
@@ -39,6 +39,16 @@ describe("keyset cursor", () => {
   it("recognises only collected sorts", () => {
     expect(isSessionSort("lastActivity")).toBe(true);
     expect(isSessionSort("cost")).toBe(true);
-    expect(isSessionSort("grade")).toBe(false);
+    expect(isSessionSort("grade")).toBe(true);
+    expect(isSessionSort("nonsense")).toBe(false);
+  });
+
+  // The two lists must stay disjoint. A sort in both would be advertised as
+  // deferred and served at the same time, and whichever check ran first would
+  // decide — silently.
+  it("never lists a sort as both deferred and collected", () => {
+    for (const deferred of Object.keys(DEFERRED_SESSION_SORTS)) {
+      expect(isSessionSort(deferred)).toBe(false);
+    }
   });
 });

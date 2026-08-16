@@ -41,6 +41,8 @@ import {
   type StoredActivity,
 } from "../storage/repository.js";
 import { USAGE_ROLLUP_AFTER_DAYS } from "../storage/usage-store.js";
+import { SIGNAL_RECOMPUTE_BATCH } from "../storage/signal-store.js";
+import { SIGNAL_ALGORITHM_VERSION } from "../activity/session-signals.js";
 import {
   DUE_GRACE_MINUTES,
   scheduleAgentIds,
@@ -67,6 +69,17 @@ const REQUIRED_METHODS = ["tasks.list", "sessions.list", "sessions.subscribe"] a
 const SCHEDULE_RECONCILE_MS = 60_000;
 const CRON_PAGE_LIMIT = 200;
 const AGENT_RECONCILE_MS = 300_000;
+const SIGNAL_RECOMPUTE_MS = 60_000;
+
+/** Last signal recompute pass, for the diagnostics surface. */
+export type SignalRecomputeStatus = {
+  computedAt: number;
+  rescored: number;
+  /** Non-zero when the batch limit was reached and work remains for the next pass. */
+  backlog: number;
+  algorithmVersion: number;
+  errorCode?: string;
+};
 
 type StatusListener = (status: CollectorStatus) => void;
 type ChangeListener = (change: RepositoryChange) => void;
@@ -125,12 +138,14 @@ export class CollectorRuntime {
   private agentTimer?: NodeJS.Timeout;
   private transcriptTimer?: NodeJS.Timeout;
   private usageTimer?: NodeJS.Timeout;
+  private signalTimer?: NodeJS.Timeout;
   private taskSyncing = false;
   private sessionSyncing = false;
   private scheduleSyncing = false;
   private agentSyncing = false;
   private transcriptSyncing = false;
   private usageSyncing = false;
+  private signalRecomputing = false;
   private readonly capabilities = new CapabilityRegistry();
   private readonly sessionFields = new FieldInventory("sessions.list");
   private readonly agentFields = new FieldInventory("agents.list");
@@ -141,6 +156,7 @@ export class CollectorRuntime {
   private readonly usage: UsageSynchronizer;
   private transcriptStatus: TranscriptSyncOutcome | undefined;
   private usageStatus: UsageSyncOutcome | undefined;
+  private signalStatus: SignalRecomputeStatus | undefined;
   private sessionArchiveError?: string;
   private syncState: CollectorSyncState = "starting";
   private syncReasons: string[] = ["collector_starting"];
@@ -199,6 +215,7 @@ export class CollectorRuntime {
     this.agentTimer = setInterval(() => void this.syncAgents("agent_interval"), AGENT_RECONCILE_MS);
     this.transcriptTimer = setInterval(() => void this.syncTranscripts(), TRANSCRIPT_SYNC_MS);
     this.usageTimer = setInterval(() => void this.syncUsage(), USAGE_SYNC_MS);
+    this.signalTimer = setInterval(() => this.recomputeSignals(), SIGNAL_RECOMPUTE_MS);
     this.gateway.start();
   }
 
@@ -211,6 +228,7 @@ export class CollectorRuntime {
     if (this.agentTimer) clearInterval(this.agentTimer);
     if (this.transcriptTimer) clearInterval(this.transcriptTimer);
     if (this.usageTimer) clearInterval(this.usageTimer);
+    if (this.signalTimer) clearInterval(this.signalTimer);
     this.gateway.stop();
     this.repository.close();
   }
@@ -613,6 +631,49 @@ export class CollectorRuntime {
 
   getUsageStatus(): UsageSyncOutcome | undefined {
     return this.usageStatus;
+  }
+
+  /**
+   * Rescores sessions whose stored signals fell behind the evidence.
+   *
+   * Purely local: signals derive from stored activities and observations, so
+   * this runs whether or not the Gateway is reachable, and a disconnection can
+   * never make a stored verdict go missing. Batched so a large archive — or a
+   * weight change that invalidates every row at once — drains over several
+   * passes instead of blocking one.
+   */
+  private recomputeSignals(): void {
+    if (this.signalRecomputing) return;
+    this.signalRecomputing = true;
+    const startedAt = Date.now();
+    try {
+      const rescored = this.repository.signals.recomputeStale(startedAt, SIGNAL_RECOMPUTE_BATCH);
+      const backlog = rescored === 0 ? 0 : this.repository.signals.staleSessions(1).length;
+      this.signalStatus = { computedAt: startedAt, rescored, backlog, algorithmVersion: SIGNAL_ALGORITHM_VERSION };
+      if (rescored > 0) {
+        this.emitChange({
+          epoch: this.repository.epoch,
+          revision: this.repository.revision,
+          topics: ["sessions"],
+          ids: [],
+          reasons: ["signals_recomputed"],
+        });
+      }
+    } catch (error) {
+      this.signalStatus = {
+        computedAt: startedAt,
+        rescored: 0,
+        backlog: 0,
+        algorithmVersion: SIGNAL_ALGORITHM_VERSION,
+        errorCode: error instanceof Error ? error.message : String(error),
+      };
+    } finally {
+      this.signalRecomputing = false;
+    }
+  }
+
+  getSignalStatus(): SignalRecomputeStatus | undefined {
+    return this.signalStatus;
   }
 
   /** Gateway-priced cost per agent, absent when `usage.cost` never answered. */

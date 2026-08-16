@@ -6,6 +6,7 @@ import type {
   AgentOverview,
   CollectorChange,
   CollectorStatus,
+  SessionSignalGrade,
   SettledRange,
   UsageSummary,
 } from "../contracts.js";
@@ -29,6 +30,7 @@ const MESSAGE_PAGE_LIMIT_MAX = 500;
 const MESSAGE_SEARCH_LIMIT_DEFAULT = 50;
 const USAGE_SUMMARY_DEFAULT_MS = 24 * 60 * 60 * 1_000;
 const SESSION_STATES: readonly SessionStateFilter[] = ["active", "terminal", "archived"];
+const SESSION_SIGNAL_GRADES: readonly SessionSignalGrade[] = ["A", "B", "C", "D", "F", "unscored"];
 
 function sseEvent(event: string, data: unknown): string {
   return `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
@@ -36,6 +38,10 @@ function sseEvent(event: string, data: unknown): string {
 
 function isSessionState(value: string): value is SessionStateFilter {
   return (SESSION_STATES as readonly string[]).includes(value);
+}
+
+function isSignalGrade(value: string): value is SessionSignalGrade {
+  return (SESSION_SIGNAL_GRADES as readonly string[]).includes(value);
 }
 
 /** Returns undefined for an out-of-range or non-integer limit so callers can 400. */
@@ -173,6 +179,7 @@ export async function createHttpServer(
     Querystring: {
       agentId?: string;
       state?: string;
+      grade?: string;
       since?: string;
       until?: string;
       sort?: string;
@@ -180,7 +187,7 @@ export async function createHttpServer(
       cursor?: string;
     };
   }>("/api/v1/sessions", async (request, reply) => {
-    const { sort, state, limit, since, until } = request.query;
+    const { sort, state, grade, limit, since, until } = request.query;
 
     if (sort !== undefined && DEFERRED_SESSION_SORTS[sort]) {
       // Named explicitly so a client does not read a silent fallback ordering as
@@ -198,6 +205,9 @@ export async function createHttpServer(
     }
     if (state !== undefined && !isSessionState(state)) {
       return reply.code(400).send({ error: "invalid_state", supported: SESSION_STATES });
+    }
+    if (grade !== undefined && !isSignalGrade(grade)) {
+      return reply.code(400).send({ error: "invalid_grade", supported: SESSION_SIGNAL_GRADES });
     }
     const resolvedLimit = parseLimit(limit);
     if (resolvedLimit === undefined) {
@@ -219,6 +229,7 @@ export async function createHttpServer(
     return runtime.repository.listSessionsPage({
       ...(request.query.agentId !== undefined ? { agentId: request.query.agentId } : {}),
       ...(state !== undefined ? { state } : {}),
+      ...(grade !== undefined ? { grade } : {}),
       ...(sinceMs !== undefined ? { since: sinceMs } : {}),
       ...(untilMs !== undefined ? { until: untilMs } : {}),
       sort: resolvedSort,
@@ -231,7 +242,12 @@ export async function createHttpServer(
     const session = runtime.repository.getSession(request.params.key);
     if (!session) return reply.code(404).send({ error: "session_not_found" });
     const usage = runtime.repository.usage.latest(request.params.key);
-    return { ...session, ...(usage ? { usage } : {}) };
+    // Scored on read when the stored row is behind the evidence. Opening one
+    // session is exactly when its verdict matters, and one session costs a
+    // couple of indexed reads — cheap enough not to make the reader wait for
+    // the background pass to come round.
+    const signals = runtime.repository.signals.freshFor(request.params.key, Date.now());
+    return { ...session, ...(usage ? { usage } : {}), ...(signals ? { signals } : {}) };
   });
 
   app.get<{ Params: { key: string }; Querystring: { limit?: string } }>(

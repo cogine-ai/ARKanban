@@ -3,6 +3,8 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import type { FastifyInstance } from "fastify";
 import { afterEach, describe, expect, it } from "vitest";
+import { attemptPatch } from "../activity/projector.js";
+import { SIGNAL_ALGORITHM_VERSION } from "../activity/session-signals.js";
 import { CollectorRuntime } from "../collector/runtime.js";
 import type { AgentOverview } from "../contracts.js";
 import type { ResolvedCollectorConfig } from "../config.js";
@@ -119,20 +121,12 @@ describe("sessions and agents HTTP API", () => {
     expect(response.json()).toMatchObject({ error: "invalid_cursor" });
   });
 
-  it("names the phase that will collect a sort it cannot serve yet", async () => {
-    const app = await serverWith([]);
-    const response = await app.inject({ method: "GET", url: "/api/v1/sessions?sort=grade" });
-
-    expect(response.statusCode).toBe(400);
-    expect(response.json()).toMatchObject({ error: "sort_not_yet_collected", sort: "grade" });
-    expect(response.json().availableIn).toContain("S7");
-  });
-
-  it("rejects unknown sorts, states and out-of-range limits", async () => {
+  it("rejects unknown sorts, states, grades and out-of-range limits", async () => {
     const app = await serverWith([]);
 
     expect((await app.inject({ method: "GET", url: "/api/v1/sessions?sort=nonsense" })).statusCode).toBe(400);
     expect((await app.inject({ method: "GET", url: "/api/v1/sessions?state=paused" })).statusCode).toBe(400);
+    expect((await app.inject({ method: "GET", url: "/api/v1/sessions?grade=S" })).statusCode).toBe(400);
     expect((await app.inject({ method: "GET", url: "/api/v1/sessions?limit=0" })).statusCode).toBe(400);
     expect((await app.inject({ method: "GET", url: "/api/v1/sessions?limit=500" })).statusCode).toBe(400);
   });
@@ -504,5 +498,140 @@ describe("usage HTTP API", () => {
     const reversed = await app.inject({ method: "GET", url: `/api/v1/usage/summary?from=${NOW}&to=${NOW - 1}` });
     expect(reversed.statusCode).toBe(400);
     expect((await app.inject({ method: "GET", url: "/api/v1/usage/summary?from=yesterday" })).statusCode).toBe(400);
+  });
+});
+
+describe("session signals HTTP API", () => {
+  const NOW = 1_800_000_000_000;
+
+  async function serverWithSignals(): Promise<{ app: FastifyInstance; runtime: CollectorRuntime }> {
+    const { runtime, config } = runtimeFixture();
+    runtime.repository.upsertSessions(
+      ["failing", "clean", "unjudged"].map((name) => ({
+        sessionKey: `agent:builder:${name}`,
+        agentId: "builder",
+        label: name,
+        kindHint: "main" as const,
+        archived: false,
+        hasActiveRun: name === "unjudged",
+        lineage: {},
+        lastActivityAt: NOW,
+        observedAt: NOW,
+        coverage: {
+          index: "live" as const,
+          detail: "not_observed" as const,
+          usage: "not_observed" as const,
+          messages: "not_observed" as const,
+        },
+      })),
+    );
+    const run = (name: string, outcome: "succeeded" | "failed") =>
+      attemptPatch({
+        id: `attempt:${name}`,
+        sourceKey: `attempt:${name}`,
+        origin: "session_segment",
+        agentId: "builder",
+        title: name,
+        now: NOW - 1_000,
+        sessionKey: `agent:builder:${name}`,
+        state: "terminal",
+        outcome,
+        endedAt: NOW - 1_000,
+        source: "events",
+        eventKind: "agent:lifecycle:end",
+        status: "end",
+      });
+    runtime.repository.upsertMany([run("failing", "failed"), run("clean", "succeeded")], ["test"]);
+    runtime.repository.signals.recomputeStale(NOW);
+    const app = await createHttpServer(runtime, config);
+    cleanups.push(() => app.close());
+    return { app, runtime };
+  }
+
+  it("sorts worst first and leaves unscored sessions at the bottom", async () => {
+    const { app } = await serverWithSignals();
+    const response = await app.inject({ method: "GET", url: "/api/v1/sessions?sort=grade" });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json().items.map((row: { sessionKey: string }) => row.sessionKey)).toEqual([
+      "agent:builder:failing",
+      "agent:builder:clean",
+      "agent:builder:unjudged",
+    ]);
+  });
+
+  it("pages a grade sort without repeating the boundary row", async () => {
+    const { app } = await serverWithSignals();
+    const first = await app.inject({ method: "GET", url: "/api/v1/sessions?sort=grade&limit=1" });
+    const second = await app.inject({
+      method: "GET",
+      url: `/api/v1/sessions?sort=grade&limit=1&cursor=${encodeURIComponent(first.json().nextCursor)}`,
+    });
+
+    expect(first.json().items[0].sessionKey).toBe("agent:builder:failing");
+    expect(second.json().items[0].sessionKey).toBe("agent:builder:clean");
+  });
+
+  it("carries a compact grade on every list row", async () => {
+    const { app } = await serverWithSignals();
+    const rows = (await app.inject({ method: "GET", url: "/api/v1/sessions" })).json().items as Array<{
+      sessionKey: string;
+      signals?: { grade: string; outcome: string; score?: number };
+    }>;
+
+    expect(rows.find((row) => row.sessionKey === "agent:builder:failing")?.signals).toMatchObject({
+      grade: "D",
+      outcome: "errored",
+      score: 55,
+    });
+    expect(rows.find((row) => row.sessionKey === "agent:builder:clean")?.signals).toMatchObject({ grade: "A" });
+    expect(rows.find((row) => row.sessionKey === "agent:builder:unjudged")?.signals).toMatchObject({
+      grade: "unscored",
+    });
+  });
+
+  it("filters by grade, counting a never-scored session as unscored", async () => {
+    const { app } = await serverWithSignals();
+
+    const errored = await app.inject({ method: "GET", url: "/api/v1/sessions?grade=D" });
+    expect(errored.json().items.map((row: { sessionKey: string }) => row.sessionKey)).toEqual(["agent:builder:failing"]);
+
+    const unscored = await app.inject({ method: "GET", url: "/api/v1/sessions?grade=unscored" });
+    expect(unscored.json().items.map((row: { sessionKey: string }) => row.sessionKey)).toEqual(["agent:builder:unjudged"]);
+  });
+
+  it("attaches the full signal row, penalties included, to the detail", async () => {
+    const { app } = await serverWithSignals();
+    const response = await app.inject({ method: "GET", url: "/api/v1/sessions/agent%3Abuilder%3Afailing" });
+
+    expect(response.json().signals).toMatchObject({
+      grade: "D",
+      outcome: "errored",
+      confidence: "medium",
+      algorithmVersion: SIGNAL_ALGORITHM_VERSION,
+      penalties: [{ code: "errored_outcome", points: 45 }],
+    });
+  });
+
+  it("scores a session on first read rather than waiting for the background pass", async () => {
+    const { app, runtime } = await serverWithSignals();
+    runtime.repository.upsertSessions([
+      {
+        sessionKey: "agent:builder:fresh",
+        agentId: "builder",
+        label: "fresh",
+        kindHint: "main",
+        archived: false,
+        hasActiveRun: false,
+        lineage: {},
+        lastActivityAt: NOW,
+        observedAt: NOW,
+        coverage: { index: "live", detail: "not_observed", usage: "not_observed", messages: "not_observed" },
+      },
+    ]);
+
+    const response = await app.inject({ method: "GET", url: "/api/v1/sessions/agent%3Abuilder%3Afresh" });
+
+    expect(response.json().signals).toMatchObject({ grade: "unscored", algorithmVersion: SIGNAL_ALGORITHM_VERSION });
   });
 });

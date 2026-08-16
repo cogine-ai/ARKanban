@@ -11,7 +11,7 @@
  * nonsense page, so decoding rejects the mismatch instead.
  */
 
-export const SESSION_SORTS = ["lastActivity", "duration", "cost"] as const;
+export const SESSION_SORTS = ["lastActivity", "duration", "cost", "grade"] as const;
 
 export type SessionSort = (typeof SESSION_SORTS)[number];
 
@@ -19,10 +19,12 @@ export type SessionSort = (typeof SESSION_SORTS)[number];
  * Sorts the API accepts but cannot serve yet, mapped to the phase that collects
  * their backing data. Rejecting them by name beats silently falling back to a
  * different order, which would look like a working sort returning wrong results.
+ *
+ * Empty now that every sort in the spec is collected. Kept because the rejection
+ * path it feeds is the contract: a future sort must land here before it lands in
+ * `SESSION_SORTS`, never as a silent fallback to `lastActivity`.
  */
-export const DEFERRED_SESSION_SORTS: Record<string, string> = {
-  grade: "S7 (derived session signals)",
-};
+export const DEFERRED_SESSION_SORTS: Record<string, string> = {};
 
 export type KeysetCursor = {
   sort: SessionSort;

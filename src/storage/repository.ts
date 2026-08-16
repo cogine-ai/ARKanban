@@ -17,10 +17,14 @@ import type {
   EvidenceState,
   LaneSummary,
   ObservationView,
+  SessionConfidence,
   SessionCoverage,
   SessionKindHint,
   SessionLineage,
+  SessionOutcomeClass,
   SessionRecord,
+  SessionSignalGrade,
+  SessionSignalsBrief,
   SessionSummary,
   SessionUsageCoverage,
   SettledGroupSnapshot,
@@ -35,6 +39,7 @@ import type {
 import { agentIdFromSessionKey, type ActivityWrite } from "../activity/projector.js";
 import { applyMigrations, type MigrationResult } from "./migrations.js";
 import { encodeCursor, type KeysetCursor, type SessionSort } from "./keyset-cursor.js";
+import { GRADE_SEVERITY, SignalStore } from "./signal-store.js";
 import { TranscriptArchive } from "./transcript-archive.js";
 import { UsageStore } from "./usage-store.js";
 
@@ -100,6 +105,7 @@ export type SessionStateFilter = "active" | "terminal" | "archived";
 export type SessionPageQuery = {
   agentId?: string;
   state?: SessionStateFilter;
+  grade?: SessionSignalGrade;
   since?: number;
   until?: number;
   sort: SessionSort;
@@ -113,6 +119,33 @@ export type SessionPage = {
 };
 
 type ActivityRow = Record<string, unknown>;
+
+/** Grade of one session, correlated by primary key. */
+const SIGNAL_GRADE_SUBQUERY = "(SELECT g.grade FROM session_signals g WHERE g.session_key = s.session_key)";
+
+/**
+ * Compact signal columns for list rows.
+ *
+ * A join would be tidier, but `sessions s` is already the driving table for the
+ * keyset scan and correlated primary-key lookups keep that plan intact.
+ */
+const SIGNAL_BRIEF_COLUMNS = `
+  ${SIGNAL_GRADE_SUBQUERY} AS signal_grade,
+  (SELECT g.score FROM session_signals g WHERE g.session_key = s.session_key) AS signal_score,
+  (SELECT g.outcome FROM session_signals g WHERE g.session_key = s.session_key) AS signal_outcome,
+  (SELECT g.confidence FROM session_signals g WHERE g.session_key = s.session_key) AS signal_confidence
+`;
+
+function rowToSignalsBrief(row: ActivityRow): SessionSignalsBrief | undefined {
+  if (typeof row.signal_grade !== "string") return undefined;
+  const score = asNumber(row.signal_score);
+  return {
+    grade: row.signal_grade as SessionSignalGrade,
+    ...(score !== undefined ? { score } : {}),
+    outcome: String(row.signal_outcome ?? "unknown") as SessionOutcomeClass,
+    confidence: String(row.signal_confidence ?? "low") as SessionConfidence,
+  };
+}
 
 const AGENT_ROLLUP_WINDOW_MS: Record<AgentRollupWindow, number> = {
   "24h": 24 * 60 * 60 * 1_000,
@@ -388,6 +421,7 @@ function rowToAgent(row: ActivityRow): AgentSummary {
 }
 
 function rowToSessionSummary(row: ActivityRow): SessionSummary {
+  const signals = rowToSignalsBrief(row);
   return {
     sessionKey: String(row.session_key),
     ...(asString(row.session_id) ? { sessionId: asString(row.session_id) } : {}),
@@ -405,6 +439,7 @@ function rowToSessionSummary(row: ActivityRow): SessionSummary {
     lastObservedAt: Number(row.last_observed_at),
     activityCount: Number(row.activity_count ?? 0),
     coverage: parseJson(row.coverage_json, DEFAULT_SESSION_COVERAGE),
+    ...(signals ? { signals } : {}),
   };
 }
 
@@ -525,6 +560,7 @@ export class CollectorRepository {
   /** The only permitted write path for session transcripts. */
   readonly transcripts: TranscriptArchive;
   readonly usage: UsageStore;
+  readonly signals: SignalStore;
   private readonly db: DatabaseSync;
   private readonly listeners = new Set<(change: RepositoryChange) => void>();
   private readonly findFingerprint: StatementSync;
@@ -539,6 +575,7 @@ export class CollectorRepository {
     this.migration = applyMigrations(this.db, databasePath);
     this.transcripts = new TranscriptArchive(this.db);
     this.usage = new UsageStore(this.db);
+    this.signals = new SignalStore(this.db);
     this.db.prepare("INSERT OR REPLACE INTO meta(key, value) VALUES ('epoch', ?)").run(this.epoch);
     this.db.prepare("INSERT OR REPLACE INTO meta(key, value) VALUES ('revision', '0')").run();
 
@@ -1087,7 +1124,8 @@ export class CollectorRepository {
     const row = this.db
       .prepare(`
         SELECT s.*, (SELECT COUNT(*) FROM activities a WHERE a.session_ref = s.session_key) AS activity_count,
-               EXISTS(SELECT 1 FROM session_usage_snapshots u WHERE u.session_key = s.session_key) AS has_usage
+               EXISTS(SELECT 1 FROM session_usage_snapshots u WHERE u.session_key = s.session_key) AS has_usage,
+               ${SIGNAL_BRIEF_COLUMNS}
         FROM sessions s WHERE s.session_key = ?
       `)
       .get(sessionKey) as ActivityRow | undefined;
@@ -1134,6 +1172,12 @@ export class CollectorRepository {
     if (query.state === "active") conditions.push("s.archived = 0 AND s.has_active_run = 1");
     else if (query.state === "terminal") conditions.push("s.archived = 0 AND s.has_active_run = 0");
     else if (query.state === "archived") conditions.push("s.archived = 1");
+    if (query.grade !== undefined) {
+      // A session with no stored row reads as `unscored`, which is what it is:
+      // the recompute pass has not reached it yet.
+      conditions.push(`COALESCE(${SIGNAL_GRADE_SUBQUERY}, 'unscored') = ?`);
+      parameters.push(query.grade);
+    }
     if (query.since !== undefined) {
       conditions.push("s.last_activity_at >= ?");
       parameters.push(query.since);
@@ -1160,6 +1204,15 @@ export class CollectorRepository {
             WHERE u.session_key = s.session_key
             ORDER BY u.observed_at DESC LIMIT 1
           ), 0)`;
+        case "grade":
+          // Worst first, which is the order a review pass wants. Unscored ranks
+          // lowest so rows the scorer could not judge sit below every judged one.
+          return `CASE ${SIGNAL_GRADE_SUBQUERY}
+            ${(Object.entries(GRADE_SEVERITY) as Array<[string, number]>)
+              .filter(([grade]) => grade !== "unscored")
+              .map(([grade, rank]) => `WHEN '${grade}' THEN ${rank}`)
+              .join("\n            ")}
+            ELSE ${GRADE_SEVERITY.unscored} END`;
         default: {
           const exhaustive: never = query.sort;
           throw new Error(`Unhandled session sort: ${String(exhaustive)}`);
@@ -1180,7 +1233,8 @@ export class CollectorRepository {
       .prepare(`
         SELECT s.*, ${sortExpression} AS sort_value,
                (SELECT COUNT(*) FROM activities a WHERE a.session_ref = s.session_key) AS activity_count,
-               EXISTS(SELECT 1 FROM session_usage_snapshots u WHERE u.session_key = s.session_key) AS has_usage
+               EXISTS(SELECT 1 FROM session_usage_snapshots u WHERE u.session_key = s.session_key) AS has_usage,
+               ${SIGNAL_BRIEF_COLUMNS}
         FROM sessions s
         ${where}
         ORDER BY sort_value DESC, s.session_key ASC

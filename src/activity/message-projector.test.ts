@@ -59,6 +59,38 @@ describe("history page projection", () => {
     expect(page.writes[0]).toMatchObject({ messageId: "m1", seq: 1, role: "user", content: "hello", createdAt: 1_000 });
   });
 
+  /**
+   * The block shapes a live Gateway returned: a `toolCall` has no text field at
+   * all, and dropping it removed the assistant's turn from the archive entirely,
+   * leaving a tool result that appeared to arrive unprompted.
+   */
+  it("keeps a tool call, which carries no text field", () => {
+    const page = projectHistoryPage(
+      {
+        messages: [
+          {
+            role: "assistant",
+            content: [
+              {
+                type: "toolCall",
+                id: "call-1",
+                name: "bash",
+                arguments: '{"command":"ls"}',
+                input: { command: "ls" },
+              },
+            ],
+            timestamp: 4_000,
+            __openclaw: { id: "m4", seq: 17 },
+          },
+        ],
+      },
+      base,
+    );
+
+    expect(page.dropped).toBe(0);
+    expect(page.writes[0]).toMatchObject({ role: "assistant", seq: 17, content: 'bash {"command":"ls"}' });
+  });
+
   it("reads block-array content and the camelCase tool role", () => {
     const page = projectHistoryPage(
       {

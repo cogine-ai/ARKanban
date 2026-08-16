@@ -8,6 +8,21 @@
 
 ---
 
+## 0. 怎么拿真实响应（不用碰 token）
+
+`openclaw gateway call` 用的是 CLI 自己的认证，所以取真实 payload 完全不需要处理 token：
+
+```bash
+openclaw gateway call sessions.list --json --params '{"limit":20}' \
+  | npx tsx scripts/inspect-gateway-payload.ts sessions
+```
+
+`scripts/inspect-gateway-payload.ts` 有四个模式：`shape` 只打印字段名、类型和字符串长度；`sessions`/`history`/`usage` 把真实 payload 喂进 collector 自己的投影器，报出哪些字段真的填上了。
+
+**它不打印任何字符串值。** payload 里除了对话正文，还有 `senderName` 这类联系人标识和 `MediaPath` 这类宿主机路径——「正文不进日志和诊断」这条规矩同样管这个脚本。抓下来的 payload 文件用完就删，别留在 `.fixtures/` 里。
+
+---
+
 ## 1. 已经核实过的部分（OpenClaw 2026.7.1-2）
 
 不需要连上 Gateway 就能核实字段形状：`openclaw` 的 npm 包里带着未混淆的响应构造代码和协议文档。
@@ -58,6 +73,12 @@ $(npm root -g)/openclaw/dist/
 
 诊断端点的 `unknown` 列表现在只剩**真机确实返回、而我们有意不读**的键，可以当作待办清单读：`sessions.list` 的 `totalTokens`/`estimatedCostUsd`/`contextTokens`/`totalTokensFresh`/`status`、`agents.list` 的 `workspace`（宿主机路径，隐私约束不存）、`usage.cost` 的 `daily`/`totals`（见 §2.4）。
 
+### 真机复核（2026.7.1-2，有真实对话的 Gateway）
+
+上面的修正随后在真机 payload 上逐条复核过，全部成立：`agentRuntime` 确实是 `{id, source}`、`model` 在名册里确实是 `{primary}`、行上确实没有 `agentId`（从 key 解析出 `main`，1/1 成功）、`kind` 确实是 `direct`、正文确实用 `offset`/`nextOffset` 分页且 id 与 seq 在 `__openclaw` 里（30 条消息 id 全拿到，序号是 Gateway 自己的 14..43）。
+
+真机还暴露了两件包里看不出来的事，见 §2.5 和 §2.6。
+
 ### 反方向的发现：`sessions.list` 已经带用量
 
 会话行里就有 `inputTokens`、`outputTokens`、`totalTokens`、`estimatedCostUsd`、`contextTokens`，还有一个 `totalTokensFresh` 说明这数准不准，以及一个我们没读的 `status`。
@@ -91,6 +112,25 @@ $(npm root -g)/openclaw/dist/
 
 `input`/`cost` 是这一轮的增量，`cumulativeTokens`/`cumulativeCost` 才是会话内累计。混用会算错，目前没有代码读它。
 
+### 2.5 `toolCall` 块没有任何文本字段
+
+真机上一条助手回合的 content 是 `[{ type: "toolCall", id, name, arguments, input }]`——**没有 `text`，也没有 `content`**。原来的 `flattenContent` 只探 `text`/`content`/`value`，探不到就返回空串，而空正文的消息会被当成空行丢弃。
+
+在一段 30 条消息的真实对话上，**13 条会被静默丢掉，全部是助手调用工具的回合**。归档下来的会读成：助手说了句话，然后工具结果自己冒出来了——调用那一步凭空消失。工具交换里信息量最大的恰恰是那一行。
+
+现在 `flattenToolCall()` 把它渲染成 `工具名 + 参数 JSON`，参数照原样保留（和归档其余部分一致）。
+
+### 2.6 `sessions.usage` 会返回 `usage: null`，而这不等于没有用量
+
+真机上一个刚聊过的会话，`sessions.usage` 返回的行里 `usage` 是 `null`、`totals` 全零、`aggregates.byAgent` 空——因为 Gateway 的用量索引是从 transcript 文件异步算出来的，而 `cacheStatus` 说明了原因：`cachedFiles: 0, pendingFiles: 1, staleFiles: 1`。
+
+同一时刻，**同一个会话在 `sessions.list` 里已经有 `totalTokens: 46486` 和 `estimatedCostUsd: 0.026342`**。
+
+两个后果：
+
+1. `projectUsageRow` 丢掉这种行是对的（不存编造的零），但 `SessionUsageCoverage` 会把「缓存还没算」报成和「真机不提供用量」一样，读的人分不出来。**应该读 `cacheStatus`。**
+2. 这是 §1 那条「用 `sessions.list` 自带的数」最硬的证据——专用用量接口返回 null 的时候，会话索引里已经有数了。
+
 ### 2.4 `usage.cost` 没有 per-agent 分解
 
 响应是 `{ updatedAt, days, daily[], totals }`。`agentScope: "all"` 只是把所有 agent 合并进 `totals`，不会分开。**按 agent 分解只有 `sessions.usage` 的 `aggregates.byAgent` 有。**
@@ -112,7 +152,9 @@ $(npm root -g)/openclaw/dist/
 ## 4. 还没做的事
 
 1. **`usage.cost` 的成本覆盖层**要改成读 `sessions.usage` 的 `aggregates.byAgent`（§2.4）。现在它每轮都拿不到可用数据，诊断端点里 `usage.cost` 的 `consumed` 是空的。
-2. **考虑用 `sessions.list` 自带的 token/成本**替代部分 `sessions.usage` 轮询（§1）。
+2. **考虑用 `sessions.list` 自带的 token/成本**替代部分 `sessions.usage` 轮询（§1、§2.6）。
+2.1 **读 `cacheStatus`**，把「Gateway 用量缓存还没算好」和「拿不到用量」分开报（§2.6）。
+2.2 **消息级 `usage` 和 `isError` 没被读**。`chat.history` 的每条消息都带 `usage: { input, output, cacheRead, cacheWrite, totalTokens, cost }`，工具结果还带 `isError`——真机那 30 条里有 13 条带 `isError`、其中 3 条为 true。派生信号现在从 activities/observations 推工具失败，而这里有 Gateway 直接给的结论。
 3. **audit 采集**完全没实现（§3）。
 4. **Agents 页的「系统 agent 折叠」没有数据来源**。`web/src/views/Agents.tsx` 按 `agent.kind === "system"` 分组，而名册里没有任何字段能区分内建 agent，真机上所有 agent 都会落在主列表。要么找别的信号（例如只由 cron 触发的 agent），要么去掉这个分组。
 5. **真机跑通**：本机 Gateway 的会话库还是空的（`sessions.json` 0 entries），得先有真实对话才能验证投影。

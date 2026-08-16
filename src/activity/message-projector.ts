@@ -87,11 +87,38 @@ function record(value: unknown): Record<string, unknown> | undefined {
 }
 
 /**
+ * Renders a tool invocation as text.
+ *
+ * A `toolCall` block carries `{ type, id, name, arguments, input }` and no text
+ * field of any kind, so the text probe below found nothing and the whole message
+ * was discarded as empty. That silently removed every turn where the assistant
+ * called a tool: a transcript would show the reasoning and the tool's output
+ * with the call between them missing, which reads as though the result arrived
+ * unprompted. The call is the most informative line in a tool exchange.
+ *
+ * The arguments are kept verbatim, like the rest of the archive.
+ */
+function flattenToolCall(object: Record<string, unknown>): string {
+  const type = typeof object.type === "string" ? object.type.toLowerCase() : "";
+  if (!type.includes("tool")) return "";
+  const name = typeof object.name === "string" && object.name.trim() ? object.name.trim() : undefined;
+  const input = object.input !== undefined ? object.input : object.arguments;
+  const rendered =
+    typeof input === "string"
+      ? input
+      : input !== undefined && input !== null
+        ? JSON.stringify(input)
+        : undefined;
+  if (name && rendered) return `${name} ${rendered}`;
+  return name ?? rendered ?? "";
+}
+
+/**
  * Flattens the content block shapes chat APIs use into plain text.
  *
- * Anything that is not recognisably text is dropped rather than stringified:
- * a JSON blob of an image block in the middle of a transcript is noise in the
- * reader and false matches in search.
+ * Anything that is neither text nor a tool call is dropped rather than
+ * stringified: a JSON blob of an image block in the middle of a transcript is
+ * noise in the reader and false matches in search.
  */
 export function flattenContent(value: unknown): string {
   if (typeof value === "string") return value;
@@ -108,7 +135,7 @@ export function flattenContent(value: unknown): string {
     if (typeof nested === "string") return nested;
     if (Array.isArray(nested)) return flattenContent(nested);
   }
-  return "";
+  return flattenToolCall(object);
 }
 
 export function messageRole(raw: unknown): MessageRole {

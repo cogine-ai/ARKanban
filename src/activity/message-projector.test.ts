@@ -33,23 +33,52 @@ describe("role normalisation", () => {
 });
 
 describe("history page projection", () => {
-  it("reads the documented shape and carries the cursor through", () => {
+  /**
+   * The shape here is the one OpenClaw 2026.7.1-2 actually returns: identity and
+   * ordering under `__openclaw`, `timestamp` for the time, and offset paging.
+   * The earlier version of this test asserted a top-level `id`/`seq` and a
+   * `nextCursor`, none of which the Gateway sends — it passed while the code it
+   * covered could not have read a single real message.
+   */
+  it("reads the real shape, taking identity from the envelope", () => {
     const page = projectHistoryPage(
       {
         messages: [
-          { id: "m1", seq: 0, role: "user", content: "hello", createdAt: 1_000 },
-          { id: "m2", seq: 1, role: "assistant", content: "hi", createdAt: 2_000 },
+          { role: "user", content: "hello", timestamp: 1_000, __openclaw: { id: "m1", seq: 1 } },
+          { role: "assistant", content: "hi", timestamp: 2_000, __openclaw: { id: "m2", seq: 2 } },
         ],
-        nextCursor: "2",
+        nextOffset: 200,
         hasMore: true,
       },
       base,
     );
 
     expect(page.hasMore).toBe(true);
-    expect(page.nextCursor).toBe("2");
+    expect(page.nextOffset).toBe(200);
     expect(page.writes).toHaveLength(2);
-    expect(page.writes[0]).toMatchObject({ messageId: "m1", seq: 0, role: "user", content: "hello", createdAt: 1_000 });
+    expect(page.writes[0]).toMatchObject({ messageId: "m1", seq: 1, role: "user", content: "hello", createdAt: 1_000 });
+  });
+
+  it("reads block-array content and the camelCase tool role", () => {
+    const page = projectHistoryPage(
+      {
+        messages: [
+          {
+            role: "toolResult",
+            content: [
+              { type: "text", text: "first" },
+              { type: "image", source: "ignored" },
+              { type: "text", text: "second" },
+            ],
+            timestamp: 3_000,
+            __openclaw: { id: "m3", seq: 7 },
+          },
+        ],
+      },
+      base,
+    );
+
+    expect(page.writes[0]).toMatchObject({ role: "tool", seq: 7, content: "first\nsecond" });
   });
 
   it("numbers rows the Gateway left unnumbered, continuing from the stored watermark", () => {
@@ -72,12 +101,12 @@ describe("history page projection", () => {
     expect(page.writes[0]!.content).toBe("real");
   });
 
-  it("treats a cursor as proof of more history when no explicit flag is sent", () => {
-    const page = projectHistoryPage({ messages: [{ role: "user", content: "a" }], nextCursor: "7" }, base);
+  it("treats an offset as proof of more history when no explicit flag is sent", () => {
+    const page = projectHistoryPage({ messages: [{ role: "user", content: "a" }], nextOffset: 7 }, base);
     expect(page.hasMore).toBe(true);
   });
 
-  it("stops when neither a flag nor a cursor is returned", () => {
+  it("stops when neither a flag nor an offset is returned", () => {
     const page = projectHistoryPage({ messages: [{ role: "user", content: "a" }] }, base);
     expect(page.hasMore).toBe(false);
   });

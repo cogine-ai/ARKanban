@@ -4,24 +4,41 @@ import type { UsageWrite } from "../storage/usage-store.js";
 /**
  * Projects `sessions.usage` and `usage.cost` replies into usage writes.
  *
- * Every field goes through an alias list for the same reason as the other
- * projectors: these names come from protocol documentation, not from a Gateway
- * anyone here has read. Correcting one is a single-line edit — move the real
- * key to the front of its list.
+ * Every field goes through an alias list, so correcting one is a single-line
+ * edit — move the real key to the front. The lists have been checked against
+ * OpenClaw 2026.7.1-2, where the counts sit one level down in a `usage` object.
  */
 
+/**
+ * Token and cost figures live in a nested object, not on the row.
+ *
+ * A usage row is `{ key, label, agentId, model, usage: { input, output,
+ * cacheRead, cacheWrite, totalCost, missingCostEntries, ... } }`. Several alias
+ * names below did match the inner object's keys all along, which is why this
+ * reads both levels rather than being rewritten to the inner names only.
+ */
+const USAGE_ENVELOPE_KEY = "usage";
+
 export const USAGE_FIELD_ALIASES = {
-  sessionKey: ["sessionKey", "session", "sessionId", "key"],
-  inputTokens: ["inputTokens", "input", "promptTokens", "prompt_tokens"],
-  outputTokens: ["outputTokens", "output", "completionTokens", "completion_tokens"],
-  cacheReadTokens: ["cacheReadTokens", "cacheRead", "cache_read_input_tokens", "cachedTokens"],
-  cacheWriteTokens: ["cacheWriteTokens", "cacheWrite", "cache_creation_input_tokens"],
-  peakContextTokens: ["peakContextTokens", "peakContext", "maxContextTokens", "contextTokens"],
+  // `key` leads deliberately. `sessionId` used to outrank it, and since rows
+  // carry both, usage would have been filed under the transcript generation id
+  // instead of the session it belongs to.
+  sessionKey: ["key", "sessionKey", "session"],
+  inputTokens: ["input", "inputTokens", "promptTokens", "prompt_tokens"],
+  outputTokens: ["output", "outputTokens", "completionTokens", "completion_tokens"],
+  cacheReadTokens: ["cacheRead", "cacheReadTokens", "cache_read_input_tokens", "cachedTokens"],
+  cacheWriteTokens: ["cacheWrite", "cacheWriteTokens", "cache_creation_input_tokens"],
+  // No peak-context figure is published. `contextTokens` used to sit in this
+  // list and is the model's context *window*, so a 200k budget would have been
+  // reported as 200k of context consumed.
+  peakContextTokens: ["peakContextTokens", "peakContext"],
   costMicroUsd: ["costMicroUsd", "costMicros", "cost_micro_usd"],
-  costUsd: ["costUsd", "cost", "totalCost", "amountUsd"],
-  models: ["models", "model", "modelIds"],
+  costUsd: ["totalCost", "costUsd", "cost", "amountUsd"],
+  models: ["modelUsage", "models", "model", "modelIds"],
   unpricedModels: ["unpricedModels", "unpriced", "missingPricing"],
-  observedAt: ["observedAt", "ts", "timestamp", "updatedAt"],
+  /** Count of entries the Gateway could not price; see `unpricedCount` below. */
+  missingCostEntries: ["missingCostEntries"],
+  observedAt: ["updatedAt", "observedAt", "ts", "timestamp"],
 } as const satisfies Record<string, readonly string[]>;
 
 export const USAGE_PAGE_ALIASES = {
@@ -89,7 +106,12 @@ export function projectUsageRow(raw: unknown, options: ProjectUsageOptions): Usa
   const row = record(raw);
   if (!row) return undefined;
   options.inventory?.observeRow(row);
-  const read = (field: UsageField): unknown => pick(row, field, USAGE_FIELD_ALIASES[field], options.inventory);
+  const envelope = record(row[USAGE_ENVELOPE_KEY]);
+  const read = (field: UsageField): unknown => {
+    const direct = pick(row, field, USAGE_FIELD_ALIASES[field], options.inventory);
+    if (direct !== undefined) return direct;
+    return envelope ? pick(envelope, field, USAGE_FIELD_ALIASES[field], options.inventory) : undefined;
+  };
 
   const sessionKey = (() => {
     const value = read("sessionKey");
@@ -107,9 +129,14 @@ export function projectUsageRow(raw: unknown, options: ProjectUsageOptions): Usa
   const micros = asNumber(read("costMicroUsd"));
   const dollars = asNumber(read("costUsd"));
   const costMicroUsd = micros !== undefined ? Math.round(micros) : dollars !== undefined ? toMicroUsd(dollars) : undefined;
+  // 2026.7.1-2 reports how many entries it could not price, without naming the
+  // models. That is enough to know the total is a floor, which is what `hasCost`
+  // is for; `unpricedModels` stays empty because the names are genuinely not
+  // available, and an empty list must not be read as "everything was priced".
+  const unpricedCount = asNumber(read("missingCostEntries")) ?? 0;
   // A cost of zero is still a price; only a missing figure or a model the
   // Gateway could not price makes the total a floor.
-  const hasCost = costMicroUsd !== undefined && unpricedModels.length === 0;
+  const hasCost = costMicroUsd !== undefined && unpricedModels.length === 0 && unpricedCount === 0;
 
   const peakContextTokens = asNumber(read("peakContextTokens"));
   const observedAt = asNumber(read("observedAt")) ?? options.observedAt;

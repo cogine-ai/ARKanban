@@ -6,12 +6,16 @@ import { agentIdFromSessionKey, type RawSessionRow } from "./projector.js";
 /**
  * Projects raw Gateway rows into Session and Agent archive records.
  *
- * Every field is read through an alias list rather than a hard-coded key. The
- * names come from the OpenClaw protocol documentation and have not been checked
- * against a live Gateway, so correcting one is meant to be a single-line edit
- * here: add the real key to the front of the relevant list. `FieldInventory`
- * reports which logical fields never matched and which response keys nothing
- * consumed.
+ * Every field is read through an alias list rather than a hard-coded key, so
+ * correcting one is a single-line edit here. `FieldInventory` reports which
+ * logical fields never matched and which response keys nothing consumed.
+ *
+ * The lists were originally guessed from protocol prose. They have since been
+ * checked against the response builders shipped in OpenClaw 2026.7.1-2
+ * (`buildGatewaySessionRow`, `listAgentsForGateway`), and the real name is
+ * first in each list. Two classes of correction were needed and neither would
+ * have announced itself: names that exist nowhere we looked, and names that
+ * match while carrying an object where a string was expected.
  */
 
 export type RawAgentRow = Record<string, unknown>;
@@ -28,11 +32,14 @@ export const SESSION_FIELD_ALIASES = {
   archived: ["archived", "isArchived", "archivedAt"],
   hasActiveRun: ["hasActiveRun", "active"],
   placement: ["placement"],
-  createdAt: ["createdAt", "startedAt"],
+  // 2026.7.1-2 rows carry no creation time. `startedAt` is the newest run's
+  // start and used to sit in this list, which would have labelled a long-lived
+  // session as created moments ago every time it ran.
+  createdAt: ["createdAt"],
   lastActivityAt: ["lastActivityAt", "updatedAt", "lastMessageAt"],
   parentSessionKey: ["parentSessionKey", "parentKey"],
   previousSessionId: ["previousSessionId", "priorSessionId"],
-  forkSourceKey: ["forkSource", "forkSourceKey", "forkedFrom"],
+  forkSourceKey: ["forkedFromParent", "forkSource", "forkSourceKey", "forkedFrom"],
   spawnedBy: ["spawnedBy", "spawnedByKey"],
   spawnDepth: ["spawnDepth", "depth"],
   subagentRole: ["subagentRole", "role"],
@@ -41,15 +48,26 @@ export const SESSION_FIELD_ALIASES = {
 
 export const AGENT_FIELD_ALIASES = {
   id: ["id", "agentId"],
-  displayName: ["displayName", "name", "label"],
+  displayName: ["name", "displayName", "label"],
+  // No agent kind is exposed. Roster rows are `{ id, name, model, agentRuntime,
+  // workspace, identity, ... }` with nothing marking an agent as built-in, so
+  // every entry projects as `unknown` and callers must not read that as a fact
+  // about the agent.
   kind: ["kind", "type"],
-  runtime: ["runtime", "agentRuntime"],
+  runtime: ["agentRuntime", "runtime"],
   model: ["model", "modelId"],
 } as const satisfies Record<string, readonly string[]>;
 
 type SessionField = keyof typeof SESSION_FIELD_ALIASES;
 type AgentField = keyof typeof AGENT_FIELD_ALIASES;
 
+/**
+ * `classifySessionKey` in 2026.7.1-2 answers only `global`, `unknown`, `group`,
+ * or `direct`. The fork and subagent variants are kept for other Gateway lines
+ * but cannot arrive from this one, which is why `projectSession` decides them
+ * from lineage instead; `group` has no counterpart here and stays `unknown`
+ * rather than being flattened into `main`.
+ */
 const KIND_HINTS: Record<string, SessionKindHint> = {
   main: "main",
   direct: "main",
@@ -102,6 +120,26 @@ function optional<K extends string, V>(key: K, value: V | undefined): Record<K, 
   return value === undefined ? {} : ({ [key]: value } as Record<K, V>);
 }
 
+/**
+ * Reads a field that may be a plain string or a descriptor object.
+ *
+ * `agentRuntime` is `{ id, source }` and an agent's `model` is
+ * `{ primary, fallbacks }`. Both names matched our alias lists all along, so
+ * the projection found the field, asked for a string, got an object, and stored
+ * nothing — the failure mode of a correct name with the wrong shape.
+ */
+function asNamed(value: unknown, ...keys: string[]): string | undefined {
+  const direct = asString(value);
+  if (direct) return direct;
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const record = value as Record<string, unknown>;
+  for (const key of keys) {
+    const nested = asString(record[key]);
+    if (nested) return nested;
+  }
+  return undefined;
+}
+
 function branchOf(worktree: unknown): string | undefined {
   if (!worktree || typeof worktree !== "object" || Array.isArray(worktree)) return undefined;
   // Only the branch name is allowed; repoRoot and other host paths stay out per §8.2.
@@ -113,6 +151,26 @@ export function sessionKindHint(raw: unknown, sessionKey: string | undefined): S
   if (token && KIND_HINTS[token]) return KIND_HINTS[token]!;
   if (sessionKey?.startsWith("global:")) return "global";
   return "unknown";
+}
+
+/**
+ * Lineage outranks the reported kind when deciding fork versus subagent.
+ *
+ * A forked or spawned session reports `kind: "direct"` like any other, so
+ * trusting the token alone would file every subagent under `main` and leave the
+ * fork and subagent buckets permanently empty. The lineage fields are the only
+ * evidence that survives.
+ */
+function kindFromLineage(lineage: {
+  forkSourceKey?: string;
+  spawnedBy?: string;
+  spawnDepth?: number;
+  subagentRole?: string;
+}): SessionKindHint | undefined {
+  if (lineage.subagentRole !== undefined || lineage.spawnedBy !== undefined) return "subagent";
+  if (lineage.spawnDepth !== undefined && lineage.spawnDepth > 0) return "subagent";
+  if (lineage.forkSourceKey !== undefined) return "fork";
+  return undefined;
 }
 
 /**
@@ -138,27 +196,30 @@ export function projectSession(
     messages: "not_observed",
   };
 
+  const lineage: SessionWrite["lineage"] = {
+    ...optional("parentSessionKey", asString(read("parentSessionKey"))),
+    ...optional("previousSessionId", asString(read("previousSessionId"))),
+    ...optional("forkSourceKey", asString(read("forkSourceKey"))),
+    ...optional("spawnedBy", asString(read("spawnedBy"))),
+    ...optional("spawnDepth", asInteger(read("spawnDepth"))),
+    ...optional("subagentRole", asString(read("subagentRole"))),
+    ...optional("worktreeBranch", branchOf(read("worktree"))),
+  };
+
   return {
     sessionKey,
     ...optional("sessionId", asString(read("sessionId"))),
+    // Rows carry no `agentId`; the key is the only place it appears.
     agentId: asString(read("agentId")) ?? agentIdFromSessionKey(sessionKey) ?? "Unattributed",
     label: asString(read("label")) ?? sessionKey,
-    ...optional("runtime", asString(read("runtime"))),
-    ...optional("model", asString(read("model"))),
+    ...optional("runtime", asNamed(read("runtime"), "id")),
+    ...optional("model", asNamed(read("model"), "primary")),
     ...optional("category", asString(read("category"))),
-    kindHint: sessionKindHint(read("kind"), sessionKey),
+    kindHint: kindFromLineage(lineage) ?? sessionKindHint(read("kind"), sessionKey),
     archived: asFlag(read("archived")),
     hasActiveRun: asFlag(read("hasActiveRun")),
     ...optional("placement", asString(read("placement"))),
-    lineage: {
-      ...optional("parentSessionKey", asString(read("parentSessionKey"))),
-      ...optional("previousSessionId", asString(read("previousSessionId"))),
-      ...optional("forkSourceKey", asString(read("forkSourceKey"))),
-      ...optional("spawnedBy", asString(read("spawnedBy"))),
-      ...optional("spawnDepth", asInteger(read("spawnDepth"))),
-      ...optional("subagentRole", asString(read("subagentRole"))),
-      ...optional("worktreeBranch", branchOf(read("worktree"))),
-    },
+    lineage,
     ...optional("createdAt", asTimestamp(read("createdAt"))),
     lastActivityAt: asTimestamp(read("lastActivityAt")) ?? observedAt,
     observedAt,
@@ -178,8 +239,8 @@ export function projectAgent(row: RawAgentRow, observedAt: number, inventory?: F
     id,
     displayName: asString(read("displayName")) ?? id,
     kind: kind === "agent" || kind === "system" ? kind : "unknown",
-    ...optional("runtime", asString(read("runtime"))),
-    ...optional("model", asString(read("model"))),
+    ...optional("runtime", asNamed(read("runtime"), "id")),
+    ...optional("model", asNamed(read("model"), "primary")),
     origin: "roster",
     observedAt,
   };

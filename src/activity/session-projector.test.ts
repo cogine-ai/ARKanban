@@ -45,6 +45,60 @@ describe("projectSession", () => {
     expect(write?.lineage.parentSessionKey).toBe("agent:researcher:demo-0");
   });
 
+  /**
+   * A row shaped like `buildGatewaySessionRow` in OpenClaw 2026.7.1-2 rather than
+   * like the protocol prose: no `agentId`, no `createdAt`, `agentRuntime` as a
+   * descriptor object, `forkedFromParent` for the fork source, and a `kind` whose
+   * vocabulary cannot express fork or subagent.
+   */
+  function realSessionRow(): Record<string, unknown> {
+    return {
+      key: "agent:builder:demo-2",
+      sessionId: "session-9",
+      label: "Fix the parser",
+      displayName: "Fix the parser",
+      agentRuntime: { id: "codex", source: "implicit" },
+      model: "gpt-5-codex",
+      modelProvider: "openai",
+      kind: "direct",
+      archived: false,
+      archivedAt: undefined,
+      hasActiveRun: true,
+      status: "running",
+      updatedAt: NOW - 2_000,
+      lastActivityAt: NOW - 2_000,
+      startedAt: NOW - 30_000,
+      forkedFromParent: "agent:builder:demo-1",
+      totalTokens: 4_210,
+      estimatedCostUsd: 0.0731,
+    };
+  }
+
+  it("reads the shape the Gateway actually sends", () => {
+    const write = projectSession(realSessionRow(), NOW);
+
+    expect(write?.agentId).toBe("builder");
+    expect(write?.runtime).toBe("codex");
+    expect(write?.lineage.forkSourceKey).toBe("agent:builder:demo-1");
+    // `startedAt` is the newest run, so it must not become a creation time.
+    expect(write?.createdAt).toBeUndefined();
+  });
+
+  it("calls a forked session a fork even though its kind says direct", () => {
+    const write = projectSession(realSessionRow(), NOW);
+    expect(write?.kindHint).toBe("fork");
+  });
+
+  it("calls a spawned session a subagent, which no kind value can express", () => {
+    const row = { ...realSessionRow(), forkedFromParent: undefined, spawnedBy: "agent:builder:demo-1", spawnDepth: 1 };
+    expect(projectSession(row, NOW)?.kindHint).toBe("subagent");
+  });
+
+  it("does not flatten a group conversation into main", () => {
+    const row = { key: "agent:builder:whatsapp:group:42", kind: "group" };
+    expect(projectSession(row, NOW)?.kindHint).toBe("unknown");
+  });
+
   it("keeps the worktree branch but drops the repo path", () => {
     const write = projectSession(fullSessionRow(), NOW);
     expect(write?.lineage.worktreeBranch).toBe("feature/demo");
@@ -115,6 +169,31 @@ describe("projectAgent", () => {
     expect(projectAgent({ id: "x", kind: "weird" }, NOW)?.kind).toBe("unknown");
   });
 
+  /**
+   * `listAgentsForGateway` names the label `name`, makes `model` a
+   * `{ primary, fallbacks }` selection and `agentRuntime` a descriptor, and
+   * exposes no kind at all. Both objects matched the old alias lists and then
+   * projected as nothing, since a string was expected.
+   */
+  it("reads the roster shape the Gateway actually sends", () => {
+    const write = projectAgent(
+      {
+        id: "builder",
+        name: "Builder",
+        model: { primary: "gpt-5-codex", fallbacks: ["gpt-5"] },
+        agentRuntime: { id: "codex", source: "config" },
+        workspace: "/Users/demo/.openclaw/workspace",
+      },
+      NOW,
+    );
+
+    expect(write?.displayName).toBe("Builder");
+    expect(write?.model).toBe("gpt-5-codex");
+    expect(write?.runtime).toBe("codex");
+    // No kind is published, and inventing one would misreport a fact.
+    expect(write?.kind).toBe("unknown");
+  });
+
   it("drops rows without an id", () => {
     expect(projectAgent({ displayName: "No id" }, NOW)).toBeUndefined();
   });
@@ -145,9 +224,9 @@ describe("field inventory integration", () => {
 
   it("does not report a recognised alternate alias as unknown", () => {
     const inventory = new FieldInventory("sessions.list");
-    // createdAt wins over its alternate startedAt, which is understood, not unrecognised.
-    projectSession({ key: "agent:a:1", createdAt: NOW, startedAt: NOW - 1 }, NOW, inventory);
-    expect(inventory.report().unknown).not.toContain("startedAt");
+    // lastActivityAt wins over its alternate updatedAt, which is understood, not unrecognised.
+    projectSession({ key: "agent:a:1", lastActivityAt: NOW, updatedAt: NOW - 1 }, NOW, inventory);
+    expect(inventory.report().unknown).not.toContain("updatedAt");
   });
 
   it("reports a logical field whose whole alias list failed to match", () => {

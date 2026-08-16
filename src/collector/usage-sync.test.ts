@@ -132,7 +132,7 @@ describe("UsageSynchronizer rounds", () => {
     seed(repo, 3);
     const gateway = recordingGateway({
       usage: async (_method, params) => {
-        if (params.sessionKey === "agent:builder:1") throw new Error("boom");
+        if (params.key === "agent:builder:1") throw new Error("boom");
         return { inputTokens: 10, outputTokens: 1 };
       },
     });

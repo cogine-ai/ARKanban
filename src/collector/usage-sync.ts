@@ -143,7 +143,20 @@ export class UsageSynchronizer {
     for (const candidate of candidates) {
       requests += 1;
       try {
-        const payload = await this.deps.request("sessions.usage", { sessionKey: candidate.sessionKey });
+        // The selector is `key`, and the schema refuses unknown params, so the
+        // `sessionKey` this used to send made every call an error.
+        //
+        // `range: "all"` matters as much as the name. The reply is an aggregate
+        // over a date window that defaults to the last 30 days, while the store
+        // treats each reading as a lifetime cumulative total. Left at the
+        // default, a session's total would shrink as its early days aged out of
+        // the window. `groupBy: "family"` then keeps a session whose transcript
+        // id has rotated as one logical row, which is how the archive keys it.
+        const payload = await this.deps.request("sessions.usage", {
+          key: candidate.sessionKey,
+          range: "all",
+          groupBy: "family",
+        });
         const page = projectUsagePage(payload, {
           observedAt: options.now,
           sessionKey: candidate.sessionKey,

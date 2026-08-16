@@ -5,27 +5,42 @@ import type { MessageWrite } from "../storage/transcript-archive.js";
 /**
  * Projects raw `chat.history` rows into archive writes.
  *
- * As with the session and agent projectors, every field is read through an
- * alias list because these names come from the protocol documentation rather
- * than from an observed Gateway. Correcting one is a single-line edit: put the
- * real key at the front of the relevant list.
+ * Every field is read through an alias list, so correcting one is a single-line
+ * edit: put the real key at the front. The lists were checked against the
+ * `chat.history` handler in OpenClaw 2026.7.1-2, which moved two of them.
  */
+
+/**
+ * Identity and ordering live in a reserved envelope rather than on the message.
+ *
+ * `chat.history` returns provider-shaped messages and attaches its own metadata
+ * under `__openclaw` — `{ id, seq, recordTimestampMs, ... }`. Reading a
+ * top-level `id` finds nothing, which costs both the idempotency key and any
+ * chance of resolving the row later through `chat.message.get`.
+ */
+const ENVELOPE_KEY = "__openclaw";
 
 export const MESSAGE_FIELD_ALIASES = {
   messageId: ["id", "messageId", "uuid"],
   seq: ["seq", "index", "ordinal", "position"],
   role: ["role", "author", "sender"],
   channel: ["channel", "source"],
-  toolName: ["toolName", "tool", "functionName"],
+  toolName: ["toolName", "tool_name", "tool", "functionName"],
   content: ["content", "text", "body", "message", "parts"],
-  createdAt: ["createdAt", "ts", "timestamp", "time"],
+  createdAt: ["timestamp", "recordTimestampMs", "createdAt", "ts", "time"],
   sessionId: ["sessionId", "conversationId"],
 } as const satisfies Record<string, readonly string[]>;
 
 export const HISTORY_PAGE_ALIASES = {
   messages: ["messages", "items", "history", "entries"],
-  nextCursor: ["nextCursor", "cursor", "next"],
+  /**
+   * Paging is by offset from the tail, not by cursor. The response carries
+   * `nextOffset` (a number) and only when the request asked for an offset at
+   * all; an unpaged call returns the newest page with no paging fields.
+   */
+  nextOffset: ["nextOffset"],
   hasMore: ["hasMore", "more"],
+  totalMessages: ["totalMessages"],
 } as const satisfies Record<string, readonly string[]>;
 
 type MessageField = keyof typeof MESSAGE_FIELD_ALIASES;
@@ -42,6 +57,10 @@ const ROLES: Record<string, MessageRole> = {
   tool: "tool",
   function: "tool",
   tool_result: "tool",
+  // 2026.7.1-2 emits the camelCase form, which lowercases to this rather than
+  // to the underscored spelling above.
+  toolresult: "tool",
+  tooluse: "tool",
 };
 
 function asString(value: unknown): string | undefined {
@@ -112,7 +131,8 @@ export type ProjectMessagesOptions = {
 
 export type ProjectedPage = {
   writes: MessageWrite[];
-  nextCursor?: string;
+  /** Offset to request for the next older page, absent when the page is the last. */
+  nextOffset?: number;
   hasMore: boolean;
   /** Rows carrying neither text nor a usable identity. */
   dropped: number;
@@ -136,7 +156,12 @@ export function projectHistoryPage(payload: Record<string, unknown>, options: Pr
       continue;
     }
     options.inventory?.observeRow(row);
-    const read = (field: MessageField): unknown => pick(row, field, MESSAGE_FIELD_ALIASES[field], options.inventory);
+    const envelope = record(row[ENVELOPE_KEY]);
+    const read = (field: MessageField): unknown => {
+      const direct = pick(row, field, MESSAGE_FIELD_ALIASES[field], options.inventory);
+      if (direct !== undefined) return direct;
+      return envelope ? pick(envelope, field, MESSAGE_FIELD_ALIASES[field], options.inventory) : undefined;
+    };
 
     const content = flattenContent(read("content"));
     if (!content.trim()) {
@@ -162,14 +187,14 @@ export function projectHistoryPage(payload: Record<string, unknown>, options: Pr
     });
   }
 
-  const nextCursor = asString(pick(payload, "nextCursor", HISTORY_PAGE_ALIASES.nextCursor, options.inventory));
+  const nextOffset = asInteger(pick(payload, "nextOffset", HISTORY_PAGE_ALIASES.nextOffset, options.inventory));
   const hasMore = pick(payload, "hasMore", HISTORY_PAGE_ALIASES.hasMore, options.inventory);
 
   return {
     writes,
-    ...(nextCursor ? { nextCursor } : {}),
-    // An explicit flag wins; otherwise a cursor is itself the signal there is more.
-    hasMore: typeof hasMore === "boolean" ? hasMore : nextCursor !== undefined,
+    ...(nextOffset !== undefined ? { nextOffset } : {}),
+    // An explicit flag wins; otherwise an offset is itself the signal there is more.
+    hasMore: typeof hasMore === "boolean" ? hasMore : nextOffset !== undefined,
     dropped,
   };
 }

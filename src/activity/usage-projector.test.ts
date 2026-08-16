@@ -34,6 +34,57 @@ describe("projectUsageRow", () => {
     });
   });
 
+  /**
+   * The row shape `sessions.usage` actually returns: the figures are nested in a
+   * `usage` object, cost is dollars under `totalCost`, models arrive as
+   * `{ provider, model }` pairs, and the unpriced signal is a count.
+   */
+  it("reads the nested shape the Gateway actually sends", () => {
+    const row = projectUsageRow(
+      {
+        key: "agent:builder:1",
+        sessionId: "generation-7",
+        agentId: "builder",
+        updatedAt: OBSERVED_AT - 5_000,
+        usage: {
+          input: 1_200,
+          output: 300,
+          cacheRead: 40,
+          cacheWrite: 12,
+          totalTokens: 1_552,
+          totalCost: 0.0045,
+          missingCostEntries: 0,
+          modelUsage: [{ provider: "anthropic", model: "sonnet" }],
+        },
+      },
+      { observedAt: OBSERVED_AT },
+    );
+
+    // Filed under the session key, not the transcript generation id.
+    expect(row?.sessionKey).toBe("agent:builder:1");
+    expect(row).toMatchObject({
+      inputTokens: 1_200,
+      outputTokens: 300,
+      cacheReadTokens: 40,
+      cacheWriteTokens: 12,
+      costMicroUsd: 4_500,
+      hasCost: true,
+      models: ["sonnet"],
+    });
+    // No peak-context figure exists, so none may be reported.
+    expect(row?.peakContextTokens).toBeUndefined();
+  });
+
+  it("treats an unpriced entry count as proof the cost is only a floor", () => {
+    const row = projectUsageRow(
+      { key: "agent:builder:1", usage: { input: 10, output: 2, totalCost: 0.5, missingCostEntries: 3 } },
+      { observedAt: OBSERVED_AT },
+    );
+
+    expect(row?.costMicroUsd).toBe(500_000);
+    expect(row?.hasCost).toBe(false);
+  });
+
   it("accepts the snake_case aliases a different Gateway build might use", () => {
     const row = projectUsageRow(
       { session: "agent:builder:1", prompt_tokens: 10, completion_tokens: 5, cache_creation_input_tokens: 2 },

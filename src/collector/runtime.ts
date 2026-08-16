@@ -117,6 +117,15 @@ function lifecycleOutcome(data: Record<string, unknown>): "failed" | "cancelled"
  * Gateway asserted, and dropping it leaves every clean session unclassified —
  * which is indistinguishable from a session nobody can judge.
  */
+/**
+ * Terminal session statuses and the outcome each asserts.
+ *
+ * The first alias of each row is the value OpenClaw 2026.7.1-2 actually sends
+ * (`running` aside, its session vocabulary is `done`, `failed`, `killed`,
+ * `timeout`), and the same four verdicts name the audit ledger's `succeeded`,
+ * `failed`, `cancelled`, `timed_out`. The rest are tolerance for other Gateway
+ * lines and cost nothing to keep.
+ */
 const TERMINAL_STATUS_OUTCOMES: Array<{ outcome: ActivityOutcome; aliases: readonly string[] }> = [
   { outcome: "succeeded", aliases: ["done", "completed", "complete", "finished", "succeeded", "success", "ok"] },
   { outcome: "failed", aliases: ["failed", "failure", "error", "errored"] },
@@ -835,11 +844,13 @@ export class CollectorRuntime {
     const status = stringField(payload, "status") ?? phase;
     let outcome: ActivityOutcome = "none";
     if (terminal) {
-      // The status wins when it asserts an outcome; `phase: "error"` is itself an
-      // assertion of failure. Anything else falls through to the error fields,
-      // and stays `unknown` when none of them say what happened.
+      // `status` is the Gateway's own verdict and wins when it asserts one;
+      // `phase: "error"` is itself an assertion of failure. 2026.7.1-2 sends the
+      // session snapshot flattened onto this event, with no `lastRunError` and no
+      // top-level `data` — lifecycle detail rides the separate `agent` event — so
+      // once those two are exhausted this stays `unknown` instead of guessing.
       outcome = outcomeFromStatus(stringField(payload, "status"))
-        ?? lifecycleOutcome({ ...data, ...(phase === "error" ? { error: stringField(payload, "lastRunError") ?? "session error" } : {}) });
+        ?? lifecycleOutcome({ ...data, ...(phase === "error" ? { error: "session error" } : {}) });
     }
     const write = attemptPatch({
       id: existing?.id ?? newAttemptActivityId(),

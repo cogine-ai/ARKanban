@@ -56,19 +56,29 @@ function gateway(pages: Record<string, Array<Record<string, unknown>>>): {
 } {
   const calls: string[] = [];
   const request: HistoryRequest = async (_method, params) => {
-    const { sessionKey, cursor } = params as { sessionKey: string; cursor?: string };
+    // Pages by `offset` and answers `nextOffset`, as `chat.history` does. The
+    // real method counts the offset back from the newest message; slicing
+    // forward here keeps the fixtures readable and exercises the same paging
+    // contract, which is what this suite is about.
+    const { sessionKey, offset } = params as { sessionKey: string; offset?: number };
     calls.push(sessionKey);
     const messages = pages[sessionKey] ?? [];
-    const offset = Number(cursor ?? 0);
-    const page = messages.slice(offset, offset + 2);
-    const next = offset + page.length;
-    return { messages: page, hasMore: next < messages.length, ...(next < messages.length ? { nextCursor: String(next) } : {}) };
+    const from = offset ?? 0;
+    const page = messages.slice(from, from + 2);
+    const next = from + page.length;
+    return { messages: page, hasMore: next < messages.length, ...(next < messages.length ? { nextOffset: next } : {}) };
   };
   return { request, calls };
 }
 
+/** The envelope shape `chat.history` returns: metadata under `__openclaw`. */
 function turn(seq: number): Record<string, unknown> {
-  return { id: `m${seq}`, seq, role: "user", content: `message ${seq}`, createdAt: NOW - 1_000 + seq };
+  return {
+    role: "user",
+    content: `message ${seq}`,
+    timestamp: NOW - 1_000 + seq,
+    __openclaw: { id: `m${seq}`, seq },
+  };
 }
 
 function synchronizer(

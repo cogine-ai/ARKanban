@@ -24,6 +24,22 @@ export const USAGE_MEASURE_MS = 5 * 60_000;
 
 export type HistoryRequest = (method: string, params: unknown) => Promise<unknown>;
 
+/**
+ * Turns the stored continuation token into `chat.history` paging params.
+ *
+ * The method pages by `offset` counted back from the newest message, and it
+ * rejects unknown params, so the `cursor` this code used to send was refused
+ * outright. The archive column stays named `cursor` because it is opaque there;
+ * only this function knows it holds a decimal offset. An absent or unparseable
+ * token means start at the newest page, which is also the right behaviour for
+ * the incremental case: the tail is what a live conversation needs.
+ */
+function continuationParams(cursor: string | undefined): { offset?: number } {
+  if (cursor === undefined) return {};
+  const offset = Number.parseInt(cursor, 10);
+  return Number.isSafeInteger(offset) && offset > 0 ? { offset } : {};
+}
+
 export type TranscriptSyncOutcome = {
   requests: number;
   inserted: number;
@@ -163,7 +179,7 @@ export class TranscriptSynchronizer {
         await this.deps.request("chat.history", {
           sessionKey: candidate.sessionKey,
           limit: HISTORY_PAGE_LIMIT,
-          ...(candidate.cursor ? { cursor: candidate.cursor } : {}),
+          ...continuationParams(candidate.cursor),
         }),
       );
     } catch (error) {
@@ -192,7 +208,7 @@ export class TranscriptSynchronizer {
     const lastSeq = writes.length > 0 ? Math.max(...writes.map((write) => write.seq)) : candidate.lastSeq;
     this.deps.archive.recordSync({
       sessionKey: candidate.sessionKey,
-      ...(page.nextCursor ? { cursor: page.nextCursor } : {}),
+      ...(page.nextOffset !== undefined ? { cursor: String(page.nextOffset) } : {}),
       ...(lastSeq !== undefined ? { lastSeq } : {}),
       complete: !page.hasMore,
       syncedAt: now,

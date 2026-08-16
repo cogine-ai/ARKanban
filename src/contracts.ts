@@ -300,7 +300,11 @@ export type SessionSummary = {
   lastObservedAt: number;
   activityCount: number;
   coverage: SessionCoverage;
+  /** Enough of the derived health to render a list row; the full row is on the detail. */
+  signals?: SessionSignalsBrief;
 };
+
+export type SessionSignalsBrief = Pick<SessionSignals, "grade" | "score" | "outcome" | "confidence">;
 
 export type SessionRecord = SessionSummary & {
   lineage: SessionLineage;
@@ -348,6 +352,33 @@ export type UsageSummary = {
   totals: UsageTotals;
   byAgent: Array<{ agentId: string; totals: UsageTotals }>;
   byModel: Array<{ model: string; totals: UsageTotals }>;
+};
+
+export type SessionSignalGrade = "A" | "B" | "C" | "D" | "F" | "unscored";
+export type SessionOutcomeClass = "completed" | "abandoned" | "errored" | "unknown";
+export type SessionConfidence = "high" | "medium" | "low";
+
+/**
+ * Derived health for one session.
+ *
+ * `algorithmVersion` is mandatory. The model is heuristic and will be retuned,
+ * and without a version there is no way to tell which rows need recomputing.
+ *
+ * `unscored` is a legitimate result. When the evidence is too thin, this must
+ * say so rather than emit a number that looks precise.
+ */
+export type SessionSignals = {
+  sessionKey: string;
+  algorithmVersion: number;
+  computedAt: number;
+  grade: SessionSignalGrade;
+  score?: number;
+  outcome: SessionOutcomeClass;
+  confidence: SessionConfidence;
+  toolFailures: number;
+  toolRetries: number;
+  consecutiveFailureMax: number;
+  penalties: Array<{ code: string; points: number }>;
 };
 
 export type MessageRole = "user" | "assistant" | "system" | "tool";

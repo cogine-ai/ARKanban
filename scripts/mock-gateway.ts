@@ -56,21 +56,33 @@ const sessions = Array.from({ length: 64 }, (_, index) => {
   return {
     key: `agent:${agentId}:demo-${live ? "live" : "idle"}-${index + 1}`,
     sessionId: `demo-session-${index + 1}`,
-    kind,
+    // Every row reports `direct`, as `classifySessionKey` does. Fork and
+    // subagent are only knowable from the lineage fields below, and a fixture
+    // that labelled them outright would hide that.
+    kind: "direct",
     label: titles[(index + 5) % titles.length]!,
+    // Retained for this script's own use and stripped before the row goes on the
+    // wire; see `sessionWireRow`.
     agentId,
-    agentRuntime: "openclaw",
+    agentRuntime: { id: "openclaw", source: index % 4 === 0 ? "config" : "implicit" },
     model: models[index % models.length]!,
+    modelProvider: "anthropic",
     category: categories[index % categories.length]!,
-    placement: index % 5 === 0 ? "workspace" : "inline",
     archived,
+    ...(archived ? { archivedAt: now - index * 1_100 } : {}),
     updatedAt: now - index * 1_200,
+    lastActivityAt: now - index * 1_200,
     status: live ? "running" : "idle",
     hasActiveRun: live,
     activeRunIds: live ? [`demo-live-run-${index + 1}`] : [],
     startedAt: now - (index + 1) * 11_000,
-    createdAt: now - (index + 1) * 11_000,
-    ...(kind === "fork" ? { forkSource: `agent:${agentId}:demo-live-${Math.max(1, index - 1)}` } : {}),
+    // Session rows carry their own token and cost totals, which is why the usage
+    // loop is not the only possible source for them.
+    totalTokens: 1_500 + index * 37,
+    totalTokensFresh: live,
+    estimatedCostUsd: Number((0.004 + index * 0.0007).toFixed(6)),
+    contextTokens: 200_000,
+    ...(kind === "fork" ? { forkedFromParent: `agent:${agentId}:demo-live-${Math.max(1, index - 1)}` } : {}),
     ...(kind === "subagent"
       ? {
           parentSessionKey: `agent:${agentId}:demo-live-${Math.max(1, index - 2)}`,
@@ -82,6 +94,18 @@ const sessions = Array.from({ length: 64 }, (_, index) => {
     worktree: { branch: `feature/demo-${index % 7}`, repoRoot: "/home/demo/repo" },
   };
 });
+
+/**
+ * Strips the fields a real `sessions.list` row does not carry.
+ *
+ * `buildGatewaySessionRow` publishes no `agentId`, `createdAt` or `placement`.
+ * Sending them here would keep the collector's key-parsing fallback untested and
+ * would let a creation time reappear that the Gateway cannot actually supply.
+ */
+function sessionWireRow(session: (typeof sessions)[number]): Record<string, unknown> {
+  const { agentId: _agentId, ...wire } = session;
+  return wire;
+}
 
 // Transcript bodies deliberately mix scripts, languages and an injection payload:
 // the archive stores untrusted input, and the reader must render all of it as
@@ -106,20 +130,31 @@ const transcriptTurns = [
 function mockUsage(sessionKey: string, model: string, observedAt: number): Record<string, unknown> {
   let hash = 0;
   for (const character of sessionKey) hash = (hash * 37 + character.charCodeAt(0)) % 9_973;
-  const inputTokens = 1_200 + hash * 3;
-  const outputTokens = 300 + (hash % 700);
+  const input = 1_200 + hash * 3;
+  const output = 300 + (hash % 700);
   const unpriced = hash % 3 === 0;
+  const totalCost = Number(((input * 3 + output * 15) / 1_000_000).toFixed(6));
+  // The row shape `sessions.usage` returns: the counts sit in a nested `usage`
+  // object, cost is dollars, models arrive as provider/model pairs, and an
+  // unpriced total is reported as a count without naming the model.
   return {
-    sessionKey,
-    inputTokens,
-    outputTokens,
-    cacheReadTokens: hash % 500,
-    cacheWriteTokens: hash % 90,
-    peakContextTokens: 8_000 + (hash % 24_000),
-    ...(unpriced ? {} : { costUsd: Number(((inputTokens * 3 + outputTokens * 15) / 1_000_000).toFixed(6)) }),
-    models: [model],
-    ...(unpriced ? { unpricedModels: [model] } : {}),
-    observedAt,
+    key: sessionKey,
+    sessionId: `demo-session-of-${sessionKey}`,
+    updatedAt: observedAt,
+    model,
+    modelProvider: "anthropic",
+    usage: {
+      input,
+      output,
+      cacheRead: hash % 500,
+      cacheWrite: hash % 90,
+      totalTokens: input + output,
+      totalCost: unpriced ? Number((totalCost / 2).toFixed(6)) : totalCost,
+      inputCost: Number(((input * 3) / 1_000_000).toFixed(6)),
+      outputCost: Number(((output * 15) / 1_000_000).toFixed(6)),
+      missingCostEntries: unpriced ? 1 + (hash % 3) : 0,
+      modelUsage: [{ provider: "anthropic", model }],
+    },
   };
 }
 
@@ -131,16 +166,23 @@ function transcriptLength(sessionKey: string): number {
   return 4 + (hash % (transcriptTurns.length * 2));
 }
 
+/**
+ * A message in the shape `chat.history` returns.
+ *
+ * Identity and ordering are in the `__openclaw` envelope, not on the message,
+ * and every third turn uses the block-array content form so the flattening path
+ * is exercised rather than assumed.
+ */
 function mockMessage(sessionKey: string, sessionId: string | undefined, index: number): Record<string, unknown> {
   const turn = transcriptTurns[index % transcriptTurns.length]!;
+  const asBlocks = index % 3 === 0;
   return {
-    id: `${sessionKey}#${index}`,
-    seq: index,
     role: turn.role,
     ...(turn.toolName ? { toolName: turn.toolName } : {}),
     ...(sessionId ? { sessionId } : {}),
-    content: turn.content,
-    createdAt: now - (200 - index) * 30_000,
+    content: asBlocks ? [{ type: "text", text: turn.content }] : turn.content,
+    timestamp: now - (200 - index) * 30_000,
+    __openclaw: { id: `${sessionKey}#${index}`, seq: index + 1, recordTimestampMs: now - (200 - index) * 30_000 },
   };
 }
 
@@ -186,7 +228,7 @@ server.on("connection", (socket) => {
     } else if (request.method === "sessions.list") {
       const offset = Number(request.params?.offset ?? 0);
       const limit = Number(request.params?.limit ?? 500);
-      const page = sessions.slice(offset, offset + limit);
+      const page = sessions.slice(offset, offset + limit).map(sessionWireRow);
       send(socket, { type: "res", id: request.id, ok: true, payload: { sessions: page, count: sessions.length, offset, limit, hasMore: offset + page.length < sessions.length, nextOffset: offset + page.length } });
       setTimeout(() => {
         sessions.slice(0, 30).forEach((session) => {
@@ -201,10 +243,10 @@ server.on("connection", (socket) => {
         });
       }, 120);
     } else if (request.method === "chat.history") {
-      const params = request.params as { sessionKey?: string; cursor?: string; limit?: number } | undefined;
+      const params = request.params as { sessionKey?: string; offset?: number; limit?: number } | undefined;
       const sessionKey = String(params?.sessionKey ?? "");
       const session = sessions.find((entry) => entry.key === sessionKey);
-      const offset = Number(params?.cursor ?? 0);
+      const offset = Number(params?.offset ?? 0);
       const limit = Math.min(Number(params?.limit ?? 200), 200);
       const total = session ? transcriptLength(sessionKey) : 0;
       const page = Array.from({ length: Math.max(0, Math.min(limit, total - offset)) }, (_, index) =>
@@ -217,19 +259,40 @@ server.on("connection", (socket) => {
         ok: true,
         payload: {
           messages: page,
-          hasMore: nextOffset < total,
-          ...(nextOffset < total ? { nextCursor: String(nextOffset) } : {}),
+          sessionKey,
+          ...(session?.sessionId ? { sessionId: session.sessionId } : {}),
+          // Paging fields only appear when the request asked for an offset, as
+          // the real handler does.
+          ...(params?.offset === undefined
+            ? {}
+            : { offset, totalMessages: total, hasMore: nextOffset < total, ...(nextOffset < total ? { nextOffset } : {}) }),
         },
       });
     } else if (request.method === "sessions.usage") {
-      const params = request.params as { sessionKey?: string; limit?: number } | undefined;
+      const params = request.params as { key?: string; sessionKey?: string; limit?: number } | undefined;
       const observedAt = Date.now();
-      if (params?.sessionKey) {
-        const session = sessions.find((entry) => entry.key === params.sessionKey);
+      // The real schema sets `additionalProperties: false`, so a caller sending
+      // `sessionKey` gets an error rather than a silently ignored parameter. The
+      // mock refuses it too: this is the difference between a usage loop that
+      // works and one that reports zeros forever.
+      if (params?.sessionKey !== undefined) {
+        send(socket, {
+          type: "res",
+          id: request.id,
+          ok: false,
+          error: { code: "invalid_params", message: "unknown parameter sessionKey; the session selector is `key`" },
+        });
+      } else if (params?.key) {
+        const session = sessions.find((entry) => entry.key === params.key);
         if (!session) {
           send(socket, { type: "res", id: request.id, ok: false, error: { code: "NOT_FOUND", message: "unknown session" } });
         } else {
-          send(socket, { type: "res", id: request.id, ok: true, payload: mockUsage(session.key, session.model, observedAt) });
+          send(socket, {
+            type: "res",
+            id: request.id,
+            ok: true,
+            payload: { sessions: [mockUsage(session.key, session.model, observedAt)], updatedAt: observedAt },
+          });
         }
       } else {
         // The capability probe calls this with only a limit, so the batch shape
@@ -243,47 +306,51 @@ server.on("connection", (socket) => {
         });
       }
     } else if (request.method === "usage.cost") {
-      const params = request.params as { from?: number; to?: number } | undefined;
-      const from = Number(params?.from ?? 0);
-      const to = Number(params?.to ?? Date.now());
-      const byAgent = new Map<string, number>();
+      // Deliberately the real shape, which has no per-agent breakdown: dates in,
+      // `{ updatedAt, days, daily[], totals }` out. Only `sessions.usage` splits
+      // by agent, through `aggregates.byAgent`. The collector still asks this for
+      // a per-agent overlay and so gets nothing usable — a gap that is meant to
+      // be visible here rather than papered over by an obliging fixture.
+      const params = request.params as { days?: number; range?: string } | undefined;
+      const days = Math.min(Math.max(Number(params?.days ?? 7), 1), 30);
+      const totals = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, totalCost: 0, missingCostEntries: 0 };
       for (const session of sessions) {
-        if (session.updatedAt < from || session.updatedAt > to) continue;
-        const usage = mockUsage(session.key, session.model, to);
-        const costUsd = usage.costUsd;
-        if (typeof costUsd !== "number") continue;
-        byAgent.set(session.agentId, (byAgent.get(session.agentId) ?? 0) + Math.round(costUsd * 1_000_000));
+        const usage = mockUsage(session.key, session.model, now).usage as Record<string, number>;
+        totals.input += usage.input!;
+        totals.output += usage.output!;
+        totals.totalTokens += usage.totalTokens!;
+        totals.totalCost = Number((totals.totalCost + usage.totalCost!).toFixed(6));
+        totals.missingCostEntries += usage.missingCostEntries!;
       }
-      send(socket, {
-        type: "res",
-        id: request.id,
-        ok: true,
-        payload: {
-          from,
-          to,
-          agents: [...byAgent].map(([agentId, costMicroUsd]) => ({ agentId, costMicroUsd })),
-        },
-      });
+      const daily = Array.from({ length: days }, (_, index) => ({
+        date: new Date(now - (days - 1 - index) * 86_400_000).toISOString().slice(0, 10),
+        totalCost: Number((totals.totalCost / days).toFixed(6)),
+        totalTokens: Math.round(totals.totalTokens / days),
+      }));
+      send(socket, { type: "res", id: request.id, ok: true, payload: { updatedAt: now, days, daily, totals } });
     } else if (request.method === "agents.list") {
       send(socket, {
         type: "res",
         id: request.id,
         ok: true,
+        // The roster shape `listAgentsForGateway` returns: the label is `name`,
+        // the model is a selection object, the runtime is a descriptor — and
+        // there is no `kind`. Nothing here marks an agent as built-in, which is
+        // why the Agents page cannot actually separate system agents.
         payload: {
           defaultId: "main",
           agents: [
             ...agents.map((id, index) => ({
               id,
-              displayName: `${id[0]!.toUpperCase()}${id.slice(1)}`,
-              kind: "agent",
-              runtime: "openclaw",
-              model: models[index % models.length]!,
+              name: `${id[0]!.toUpperCase()}${id.slice(1)}`,
+              agentRuntime: { id: "openclaw", source: "config" },
+              model: { primary: models[index % models.length]!, fallbacks: [models[(index + 1) % models.length]!] },
+              workspace: `/home/demo/.openclaw/agents/${id}`,
             })),
             ...systemAgents.map((id) => ({
               id,
-              displayName: id.split("-").map((part) => `${part[0]!.toUpperCase()}${part.slice(1)}`).join(" "),
-              kind: "system",
-              runtime: "openclaw",
+              name: id.split("-").map((part) => `${part[0]!.toUpperCase()}${part.slice(1)}`).join(" "),
+              agentRuntime: { id: "openclaw", source: "implicit" },
             })),
           ],
         },

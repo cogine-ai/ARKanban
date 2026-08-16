@@ -157,6 +157,11 @@ export function projectHistoryPage(payload: Record<string, unknown>, options: Pr
     }
     options.inventory?.observeRow(row);
     const envelope = record(row[ENVELOPE_KEY]);
+    // Recorded as consumed because it is: the fields below are read out of it.
+    // Without this the coverage report lists `__openclaw` as a key no alias
+    // claimed, which is the report's way of saying "you are probably missing
+    // something" — a false alarm aimed at whoever is calibrating next.
+    if (envelope) options.inventory?.observeLookup("messageEnvelope", [ENVELOPE_KEY], ENVELOPE_KEY);
     const read = (field: MessageField): unknown => {
       const direct = pick(row, field, MESSAGE_FIELD_ALIASES[field], options.inventory);
       if (direct !== undefined) return direct;

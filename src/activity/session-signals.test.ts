@@ -116,6 +116,30 @@ describe("session scoring", () => {
     });
   });
 
+  it("refuses to read a terminal activity with no classified outcome as success", () => {
+    const signals = computeSessionSignals(
+      evidence({
+        activities: [{ state: "terminal", outcome: "unknown", attention: "none", endedAt: NOW - 1_000, updatedAt: NOW - 1_000 }],
+      }),
+      NOW,
+    );
+
+    expect(signals).toMatchObject({ grade: "unscored", outcome: "unknown", confidence: "low" });
+    expect(signals).not.toHaveProperty("score");
+  });
+
+  it("still grades an unclassified ending once tool calls settled to judge it on", () => {
+    const signals = computeSessionSignals(
+      evidence({
+        activities: [{ state: "terminal", outcome: "unknown", attention: "none", endedAt: NOW - 1_000, updatedAt: NOW - 1_000 }],
+        toolEvents: [tool("end", "read", 0), tool("error", "exec", 1)],
+      }),
+      NOW,
+    );
+
+    expect(signals).toMatchObject({ grade: "A", score: 94, outcome: "unknown", confidence: "medium" });
+  });
+
   it("refuses to score a session with no terminal activity and no settled tool call", () => {
     const signals = computeSessionSignals(evidence({ hasActiveRun: true, toolEvents: [tool("start")] }), NOW);
 
@@ -199,6 +223,26 @@ describe("session scoring", () => {
 
     expect(signals.outcome).toBe("completed");
     expect(signals.penalties).toEqual([]);
+  });
+
+  it("does not let a newer unclassified ending bury the verdict the Gateway gave", () => {
+    // A snapshot closing a leftover attempt writes `unknown` and is newer than
+    // the run that actually failed. Reading the newest row outright would grade
+    // this session as if nothing had gone wrong.
+    const signals = computeSessionSignals(
+      evidence({
+        activities: [
+          { state: "terminal", outcome: "failed", attention: "error", endedAt: NOW - 90_000, updatedAt: NOW - 90_000 },
+          { state: "terminal", outcome: "unknown", attention: "none", endedAt: NOW - 5_000, updatedAt: NOW - 5_000 },
+        ],
+        toolEvents: [tool("end")],
+      }),
+      NOW,
+    );
+
+    expect(signals.outcome).toBe("errored");
+    expect(signals.grade).toBe("D");
+    expect(signals.confidence).toBe("high");
   });
 
   it("ignores still-running activities when picking the verdict", () => {

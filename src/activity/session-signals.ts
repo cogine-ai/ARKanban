@@ -22,7 +22,7 @@ import type {
  * per §2.4 of the spec.
  */
 
-export const SIGNAL_ALGORITHM_VERSION = 1;
+export const SIGNAL_ALGORITHM_VERSION = 2;
 
 /**
  * Points deducted from 100. Each entry is capped so one pathological session
@@ -153,15 +153,27 @@ export function tallyToolEvents(events: ToolEventEvidence[]): ToolTally {
   return tally;
 }
 
-/** The terminal activity that decided the session, or undefined if none ended. */
+/**
+ * The terminal activity that decided the session, or undefined if none ended.
+ *
+ * The newest classified outcome wins over a newer unclassified one. `unknown`
+ * says nothing, and it is routinely the newest row: an event arriving after its
+ * run ended opens a fresh attempt, which the next snapshot closes as `unknown`
+ * once the Gateway stops advertising it. Taking the newest row outright would
+ * let that bookkeeping bury a verdict the Gateway actually gave.
+ */
 function decidingActivity(activities: ActivityEvidence[]): ActivityEvidence | undefined {
+  let classified: ActivityEvidence | undefined;
   let latest: ActivityEvidence | undefined;
+  const endedAt = (activity: ActivityEvidence): number => activity.endedAt ?? activity.updatedAt;
+
   for (const activity of activities) {
     if (activity.state !== "terminal") continue;
-    const at = activity.endedAt ?? activity.updatedAt;
-    if (!latest || at >= (latest.endedAt ?? latest.updatedAt)) latest = activity;
+    if (!latest || endedAt(activity) >= endedAt(latest)) latest = activity;
+    const isClassified = activity.outcome !== "unknown" && activity.outcome !== "none";
+    if (isClassified && (!classified || endedAt(activity) >= endedAt(classified))) classified = activity;
   }
-  return latest;
+  return classified ?? latest;
 }
 
 function outcomeClass(outcome: ActivityOutcome): SessionOutcomeClass {
@@ -205,14 +217,20 @@ function charge(
 /**
  * Scores one session.
  *
- * Returns `unscored` when nothing was observed that could support a grade: no
- * terminal activity and no settled tool call. Guessing a number there would be
- * indistinguishable from a measured one on every surface that reads it.
+ * Returns `unscored` when nothing was observed that could support a grade:
+ * no classified terminal outcome and no settled tool call. Guessing a number
+ * there would be indistinguishable from a measured one on every surface that
+ * reads it.
  */
 export function computeSessionSignals(evidence: SignalEvidence, now: number): SessionSignals {
   const tally = tallyToolEvents(evidence.toolEvents);
   const deciding = decidingActivity(evidence.activities);
   const quietFor = now - evidence.lastActivityAt;
+
+  // "Something ended" is not a verdict. Session-level terminal events often
+  // carry no classified outcome at all, and treating that as success would
+  // hand out clean grades on the strength of a run merely stopping.
+  const hasVerdict = deciding !== undefined && deciding.outcome !== "none" && deciding.outcome !== "unknown";
 
   const outcome: SessionOutcomeClass = deciding
     ? outcomeClass(deciding.outcome)
@@ -222,9 +240,9 @@ export function computeSessionSignals(evidence: SignalEvidence, now: number): Se
         ? "abandoned"
         : "unknown";
 
-  const confidence: SessionConfidence = deciding && tally.settled > 0
+  const confidence: SessionConfidence = hasVerdict && tally.settled > 0
     ? "high"
-    : deciding || tally.settled > 0
+    : hasVerdict || tally.settled > 0
       ? "medium"
       : "low";
 
@@ -240,10 +258,10 @@ export function computeSessionSignals(evidence: SignalEvidence, now: number): Se
     penalties: [],
   };
 
-  if (!deciding && tally.settled === 0) {
-    // An abandoned-looking session with no evidence at all still reports the
-    // outcome guess, because `confidence` is there to qualify it — but it gets
-    // no grade.
+  // A grade needs either a classified terminal outcome or at least one settled
+  // tool call. Below that bar the outcome guess still ships — `confidence` is
+  // there to qualify it — but no number does.
+  if (!hasVerdict && tally.settled === 0) {
     return { ...base, grade: "unscored" };
   }
 

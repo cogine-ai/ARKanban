@@ -163,6 +163,14 @@ export type SessionSignals = {
 
 上下文类信号（compaction、context pressure）在真实 Gateway 验证可得之前**整体省略**，不进入 `penalties`，也不在 UI 占位。
 
+实现补充（S7）：
+
+- 评分只读本机已存的 `activities` 与 `observations`，不回查 Gateway，因此离线可算、可重算。权重表见 `SIGNAL_PENALTIES`，每一类都带上限，避免单个病态会话把分数拉到任意负值——那会让 F 这个桶失去意义。
+- 给分门槛：必须存在**已分类的终态结论**或**至少一次已结算的工具调用**，否则返回 `unscored`。「有东西结束了」不是结论：会话级终态事件经常不带任何 outcome，把它当成功会仅凭「运行停了」就发出干净的分数。
+- 判定用哪一行终态时，**最新的已分类结论优先于更新的未分类行**。`unknown` 不携带信息，而它经常就是最新的一行：运行结束后才到的事件会开出一个新的 attempt，下一轮快照发现 Gateway 不再广告它，就把它关成 `unknown`。直接取最新行会让这类记账盖掉 Gateway 真正给过的结论。
+- 与之配套，`sessions.changed` 的终态 `status` 现在按别名表映射成 outcome，其中包含 `succeeded`（`done` / `completed` / `finished` …）。此前只分类失败、其余一律 `unknown`，结果是所有健康会话都拿不到结论，读起来与「无从判断的会话」完全一样。
+- 重算由后台循环按批推进（`SIGNAL_RECOMPUTE_BATCH`），挑选未评分、算法版本落后、或活动时间晚于 `computed_at` 的会话，活跃会话优先。打开详情页时对该会话按需重算一次：那正是结论最要紧的时刻，一个会话只值几次带索引的读。
+
 ## 3. Gateway 采集
 
 ### 3.1 方法与频率
@@ -540,7 +548,9 @@ GET /api/v1/sessions
 
 `cost` 与 `grade` 的排序在 S3 阶段返回 400 `sort_not_yet_collected`，并在响应里注明数据将由哪个分片采集（分别是 S6、S7）。不做静默降级到 `lastActivity`：那会让调用方以为排序生效了，只是结果不对。
 
-S6 起 `cost` 已可用，取每个会话最新快照的 `cost_micro_usd`。倒序扫描要求每行都有数值，因此从未定价的会话按 0 参与排序、落在末尾；该行自己的 `coverage.usage` 才是「这个 0 不是测量值」的依据。`grade` 仍然被拒绝。
+S6 起 `cost` 已可用，取每个会话最新快照的 `cost_micro_usd`。倒序扫描要求每行都有数值，因此从未定价的会话按 0 参与排序、落在末尾；该行自己的 `coverage.usage` 才是「这个 0 不是测量值」的依据。
+
+S7 起 `grade` 已可用，四个排序键全部落地，`sort_not_yet_collected` 这条分支随之退役。`grade` 按严重度倒序（F 最先），未评分的行排在末尾——与 `cost` 里未定价行的处置一致：`unscored` 是「没有证据支撑一个数」，不是「表现良好」。列表行只带 `signals` 的摘要（grade/score/outcome/confidence），完整的 penalty 明细留给详情页。
 
 **会话列表不进入 `ActivitySnapshot`。** 现有 snapshot 是全量下发模型，把上千会话塞进去会让每次 SSE invalidate 都产生一次全量传输。
 

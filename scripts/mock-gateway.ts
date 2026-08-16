@@ -303,23 +303,116 @@ server.on("connection", (socket) => {
 
 const liveSessions = sessions.filter((session) => session.hasActiveRun);
 
+function broadcast(event: string, payload: unknown): void {
+  for (const socket of server.clients) {
+    if (socket.readyState === socket.OPEN) send(socket, { type: "event", event, payload, seq: frameSequence });
+  }
+  frameSequence += 1;
+}
+
+/**
+ * Tool calls are opened and then settled, and some runs end.
+ *
+ * Emitting only `start` would leave every session unscored: derived signals need
+ * a settled call or a classified ending before they will grade anything, so a
+ * mock that never finishes anything cannot exercise the grades at all.
+ */
+let tick = 0;
+
 const eventTimer = setInterval(() => {
-  const index = Math.floor(Date.now() / 1_800) % liveSessions.length;
-  const session = liveSessions[index]!;
-  const payload = {
+  const session = liveSessions[tick % liveSessions.length]!;
+  // Between an end and its restart there is no run to attribute tool calls to.
+  if (!session.hasActiveRun) {
+    tick += 1;
+    return;
+  }
+  const toolName = ["read", "exec", "edit", "web_search"][tick % 4]!;
+  const base = {
     runId: session.activeRunIds[0],
     sessionKey: session.key,
     agentId: session.agentId,
-    seq: frameSequence,
     stream: "tool",
     ts: Date.now(),
-    data: { phase: "start", name: ["read", "exec", "edit", "web_search"][index % 4], toolCallId: `demo-tool-${frameSequence}` },
   };
-  for (const socket of server.clients) {
-    if (socket.readyState === socket.OPEN) send(socket, { type: "event", event: "session.tool", payload, seq: frameSequence });
-  }
-  frameSequence += 1;
+  const toolCallId = `demo-tool-${frameSequence}`;
+
+  broadcast("session.tool", { ...base, seq: frameSequence, data: { phase: "start", name: toolName, toolCallId } });
+
+  // Every fifth call fails, and every fifteenth fails twice in a row, so both a
+  // one-off failure and a retry loop appear in the archive.
+  const fails = tick % 5 === 0;
+  // The run ends every third tick, alternating between a clean stop and a
+  // failure, which is what gives the archive classified terminal outcomes.
+  const endsRun = tick % 3 === 2;
+  const failingRun = tick % 6 === 2;
+
+  setTimeout(() => {
+    broadcast("session.tool", {
+      ...base,
+      ts: Date.now(),
+      seq: frameSequence,
+      data: fails
+        ? { phase: "error", name: toolName, toolCallId, error: "mock tool failure" }
+        : { phase: "end", name: toolName, toolCallId },
+    });
+    if (tick % 15 === 0) {
+      broadcast("session.tool", {
+        ...base,
+        ts: Date.now(),
+        seq: frameSequence,
+        data: { phase: "error", name: toolName, toolCallId: `${toolCallId}-retry`, error: "mock retry failure" },
+      });
+    }
+    // Ordered after the tool settles, the way a real run ends: its last tool
+    // call resolves and then the run stops. Ending first would leave a tool
+    // event arriving for a run that had already finished.
+    if (endsRun) endRun(session, failingRun);
+  }, 700);
+
+  tick += 1;
 }, 1_800);
+
+/**
+ * Stops a run and restarts the session under a fresh run id.
+ *
+ * The session must also stop advertising the run: `sessions.list` is
+ * authoritative on the collector side, so a mock that kept listing an ended run
+ * as active would have the next reconcile flip the activity back to running and
+ * no terminal outcome would ever survive.
+ */
+function endRun(session: (typeof liveSessions)[number], failing: boolean): void {
+  const endedRunId = session.activeRunIds[0];
+  session.hasActiveRun = false;
+  session.activeRunIds = [];
+  session.status = "idle";
+  broadcast("sessions.changed", {
+    sessionKey: session.key,
+    agentId: session.agentId,
+    runId: endedRunId,
+    phase: failing ? "error" : "end",
+    status: failing ? "failed" : "done",
+    hasActiveRun: false,
+    ts: Date.now(),
+    ...(failing ? { lastRunError: "mock run failure" } : {}),
+  });
+
+  // Restarted under a fresh run id, so the board keeps moving and the archive
+  // accumulates generations instead of draining to nothing.
+  setTimeout(() => {
+    session.hasActiveRun = true;
+    session.activeRunIds = [`demo-live-run-${session.key}-${Date.now()}`];
+    session.status = "running";
+    broadcast("sessions.changed", {
+      sessionKey: session.key,
+      agentId: session.agentId,
+      runId: session.activeRunIds[0],
+      phase: "start",
+      status: "running",
+      hasActiveRun: true,
+      ts: Date.now(),
+    });
+  }, 9_000);
+}
 
 process.stdout.write(`Mock OpenClaw Gateway listening on ws://127.0.0.1:${port} with 170 tasks and 40 active sessions\n`);
 

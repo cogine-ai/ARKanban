@@ -1,5 +1,6 @@
 import type {
   ActivityDetail,
+  ActivityOutcome,
   ActivityPhase,
   ActivitySnapshot,
   AgentRollupWindow,
@@ -107,6 +108,27 @@ function lifecycleOutcome(data: Record<string, unknown>): "failed" | "cancelled"
   if (reason.includes("timeout") || error.includes("timed out") || error.includes("timeout")) return "timed_out";
   if (error) return "failed";
   return "unknown";
+}
+
+/**
+ * Terminal session status vocabularies, as alias sets.
+ *
+ * A run merely stopping is not a verdict, but a status of `done` is one the
+ * Gateway asserted, and dropping it leaves every clean session unclassified —
+ * which is indistinguishable from a session nobody can judge.
+ */
+const TERMINAL_STATUS_OUTCOMES: Array<{ outcome: ActivityOutcome; aliases: readonly string[] }> = [
+  { outcome: "succeeded", aliases: ["done", "completed", "complete", "finished", "succeeded", "success", "ok"] },
+  { outcome: "failed", aliases: ["failed", "failure", "error", "errored"] },
+  { outcome: "cancelled", aliases: ["killed", "cancelled", "canceled", "aborted", "interrupted", "stopped"] },
+  { outcome: "timed_out", aliases: ["timeout", "timed_out", "timedout", "expired"] },
+];
+
+/** The outcome an explicit terminal status asserts, or undefined if it asserts none. */
+function outcomeFromStatus(status: string | undefined): ActivityOutcome | undefined {
+  if (!status) return undefined;
+  const lowered = status.toLowerCase();
+  return TERMINAL_STATUS_OUTCOMES.find((entry) => entry.aliases.includes(lowered))?.outcome;
 }
 
 function phaseForStream(stream: string, data: Record<string, unknown>): ActivityPhase {
@@ -802,7 +824,8 @@ export class CollectorRuntime {
     const runRef = directRunRef ?? runRefs[0];
     const phase = stringField(payload, "phase");
     const active = payload.hasActiveRun === true || phase === "start" || stringField(payload, "status") === "running";
-    const terminal = phase === "end" || phase === "error" || (!active && (payload.hasActiveRun === false || ["done", "failed", "killed", "timeout"].includes(stringField(payload, "status") ?? "")));
+    const terminal = phase === "end" || phase === "error"
+      || (!active && (payload.hasActiveRun === false || outcomeFromStatus(stringField(payload, "status")) !== undefined));
     if (!active && !terminal) return;
     const existing = this.repository.findOpenAttempt({ ...(runRef ? { runRef } : {}), ...(key ? { sessionKey: key } : {}) })
       ?? (runRef ? this.repository.findBySourceKey(`attempt:run:${runRef}`) : undefined);
@@ -810,10 +833,13 @@ export class CollectorRuntime {
     const data = record(payload.data);
     const sourceKey = existing?.sourceKey ?? (runRef ? `attempt:run:${runRef}` : `attempt:session:${key ?? "unknown"}:${now}`);
     const status = stringField(payload, "status") ?? phase;
-    let outcome: "none" | "failed" | "cancelled" | "timed_out" | "unknown" = "none";
+    let outcome: ActivityOutcome = "none";
     if (terminal) {
-      const sessionStatus = stringField(payload, "status");
-      outcome = sessionStatus === "failed" ? "failed" : sessionStatus === "killed" ? "cancelled" : sessionStatus === "timeout" ? "timed_out" : lifecycleOutcome({ ...data, ...(phase === "error" ? { error: stringField(payload, "lastRunError") ?? "session error" } : {}) });
+      // The status wins when it asserts an outcome; `phase: "error"` is itself an
+      // assertion of failure. Anything else falls through to the error fields,
+      // and stays `unknown` when none of them say what happened.
+      outcome = outcomeFromStatus(stringField(payload, "status"))
+        ?? lifecycleOutcome({ ...data, ...(phase === "error" ? { error: stringField(payload, "lastRunError") ?? "session error" } : {}) });
     }
     const write = attemptPatch({
       id: existing?.id ?? newAttemptActivityId(),

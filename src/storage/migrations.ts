@@ -290,7 +290,44 @@ const agentsSessionSurface: Migration = {
   },
 };
 
-export const MIGRATIONS: readonly Migration[] = [baseline, agentsSessionSurface];
+/**
+ * The daily rollup was storing each day's cumulative reading, so summing the days
+ * counted a session once per day it stayed alive. It now stores per-day
+ * increments, differenced against how much of a session has already been folded.
+ *
+ * Existing rollup rows are inflated by that bug and the snapshots they came from
+ * are gone, so there is nothing to recompute them from: they are dropped rather
+ * than kept as a wrong number in a view about money. Watermarks start empty, so
+ * the next fold contributes each live session's full total to date.
+ */
+const usageRollupIncrements: Migration = {
+  version: 3,
+  name: "usage-rollup-increments",
+  up(db) {
+    db.exec(`
+      CREATE TABLE usage_rollup_watermark (
+        session_key TEXT PRIMARY KEY,
+        input_tokens INTEGER NOT NULL,
+        output_tokens INTEGER NOT NULL,
+        cache_read_tokens INTEGER NOT NULL,
+        cache_write_tokens INTEGER NOT NULL,
+        cost_micro_usd INTEGER,
+        -- The day bucket that counted this session, null if no folded day ever
+        -- did. A session is counted once, on the first day it is folded, so
+        -- summing days does not count it again; the day is kept so a range
+        -- summary can tell whether that one count falls inside it.
+        first_day INTEGER,
+        -- Once the session is gone its readings cascade away too, and a fold
+        -- record for a session that no longer exists is only future growth.
+        FOREIGN KEY (session_key) REFERENCES sessions(session_key) ON DELETE CASCADE
+      );
+
+      DELETE FROM usage_daily_rollup;
+    `);
+  },
+};
+
+export const MIGRATIONS: readonly Migration[] = [baseline, agentsSessionSurface, usageRollupIncrements];
 
 export const TARGET_SCHEMA_VERSION = MIGRATIONS.reduce(
   (highest, migration) => Math.max(highest, migration.version),

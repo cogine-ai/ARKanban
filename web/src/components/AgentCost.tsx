@@ -43,7 +43,9 @@ export function AgentCost({ cost }: { cost: AgentOverview["cost"] }) {
                 <small>{window}</small>
                 <b title={totals.hasCost ? undefined : `At least this much; no price for ${totals.unpricedModels.join(", ") || "some models"}`}>
                   {formatCost(totals.costMicroUsd)}
-                  {totals.hasCost ? "" : "+"}
+                  {/* `+` reads as "at least". With no amount at all there is
+                      nothing for it to qualify, and "—+" reads as neither. */}
+                  {totals.hasCost || totals.costMicroUsd === undefined ? "" : "+"}
                 </b>
                 <small title={`${tokens.toLocaleString()} tokens across ${totals.sessionCount} sessions`}>
                   {formatTokens(tokens)} tok

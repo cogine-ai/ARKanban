@@ -84,6 +84,84 @@ function writeTotal(write: UsageWrite): number {
 }
 
 /**
+ * The cost to store for a reading, which is never less than the cost already
+ * recorded for that session.
+ *
+ * Cost is cumulative like the token counts, but it can regress on its own: the
+ * same counts can come back with the price missing, and a token-only comparison
+ * would let that through and turn a measured cost into $0.00. Dropping such a
+ * reading is not right either — it may be the one reporting a model the Gateway
+ * could not price, and that has to reach `hasCost`. So the reading is stored
+ * with its own completeness, floored at the price already known.
+ */
+function costFloor(write: UsageWrite, previous: Row | undefined): number | undefined {
+  const recorded = previous ? asNumber(previous.cost_micro_usd) : undefined;
+  if (recorded === undefined) return write.costMicroUsd;
+  return Math.max(write.costMicroUsd ?? 0, recorded);
+}
+
+/**
+ * How much of a session's cumulative reading has already been folded into the
+ * daily rollup. Kept per session so a later day contributes only its own
+ * increment, and so the still-raw snapshot can be reduced by the same amount
+ * instead of being counted a second time.
+ */
+type FoldWatermark = {
+  input: number;
+  output: number;
+  cacheRead: number;
+  cacheWrite: number;
+  cost?: number;
+  /** The day bucket that counted this session, absent until it is first folded. */
+  firstDay?: number;
+};
+
+const EMPTY_WATERMARK: FoldWatermark = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
+
+function readingWatermark(row: Row): FoldWatermark {
+  const cost = asNumber(row.cost_micro_usd);
+  const firstDay = asNumber(row.first_day);
+  return {
+    input: Number(row.input_tokens ?? 0),
+    output: Number(row.output_tokens ?? 0),
+    cacheRead: Number(row.cache_read_tokens ?? 0),
+    cacheWrite: Number(row.cache_write_tokens ?? 0),
+    ...(cost !== undefined ? { cost } : {}),
+    ...(firstDay !== undefined ? { firstDay } : {}),
+  };
+}
+
+/**
+ * Never negative: a reading below the watermark means the session's accounting
+ * restarted, and a negative increment would subtract spend that did happen.
+ */
+function increment(reading: number, folded: number): number {
+  return Math.max(0, reading - folded);
+}
+
+/**
+ * The part of a cumulative reading that is not already in the daily rollup.
+ *
+ * `counted` says whether the rollup rows inside the range being summarised have
+ * already counted this session, in which case the raw row contributes its
+ * remaining tokens but not a second session.
+ */
+function netOfFold(row: Row, folded: FoldWatermark | undefined, counted: boolean): Row {
+  if (!folded) return row;
+  const reading = readingWatermark(row);
+  const cost = reading.cost === undefined ? undefined : increment(reading.cost, folded.cost ?? 0);
+  return {
+    ...row,
+    input_tokens: increment(reading.input, folded.input),
+    output_tokens: increment(reading.output, folded.output),
+    cache_read_tokens: increment(reading.cacheRead, folded.cacheRead),
+    cache_write_tokens: increment(reading.cacheWrite, folded.cacheWrite),
+    cost_micro_usd: cost ?? null,
+    session_count: counted ? 0 : 1,
+  };
+}
+
+/**
  * Folds one row into a running total.
  *
  * `hasCost` is sticky-false: once any contributor is unpriced the sum can only
@@ -125,6 +203,10 @@ export class UsageStore {
    * `groupBy: "family"` keeps transcript rotation from causing one, and holding a
    * total that is too high is the safer failure on a view about money.
    *
+   * Cost is floored the same way but without dropping the row, because a reading
+   * that lost its price may be the one reporting an unpriced model; see
+   * `costFloor`.
+   *
    * Re-observing a session within the same millisecond replaces the row rather
    * than failing, since the second read is the better one and the primary key
    * cannot hold both.
@@ -147,7 +229,7 @@ export class UsageStore {
         models_json = excluded.models_json
     `);
     const highWater = this.db.prepare(`
-      SELECT input_tokens, output_tokens, cache_read_tokens, cache_write_tokens
+      SELECT input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, cost_micro_usd
       FROM session_usage_snapshots WHERE session_key = ? ORDER BY observed_at DESC LIMIT 1
     `);
     let written = 0;
@@ -164,7 +246,7 @@ export class UsageStore {
           write.cacheReadTokens,
           write.cacheWriteTokens,
           write.peakContextTokens ?? null,
-          write.costMicroUsd ?? null,
+          costFloor(write, previous) ?? null,
           write.hasCost ? 1 : 0,
           JSON.stringify([...new Set([...write.models, ...write.unpricedModels])]),
         );
@@ -326,21 +408,30 @@ export class UsageStore {
       `)
       .all(from, to, from, to) as Row[];
 
+    const fromDay = Math.floor(from / DAY_MS) * DAY_MS;
+    const folded = this.foldWatermarks();
     for (const row of snapshots) {
       const models = parseModels(row.models_json);
       const priced = Number(row.has_cost) === 1;
       const unpriced = priced ? [] : models;
-      accumulate(totals, row, priced, unpriced);
-      accumulate(forAgent(String(row.agent_id)), row, priced, unpriced);
+      // A session whose earlier days are already in the rollup is still holding a
+      // cumulative reading here, so the folded part is subtracted rather than
+      // counted for a second time under the raw side.
+      const watermark = folded.get(String(row.session_key));
+      const firstDay = watermark?.firstDay;
+      const counted = firstDay !== undefined && firstDay >= fromDay && firstDay <= to;
+      const remainder = netOfFold(row, watermark, counted);
+      accumulate(totals, remainder, priced, unpriced);
+      accumulate(forAgent(String(row.agent_id)), remainder, priced, unpriced);
       // A session may span models, and splitting its total between them is not
       // possible from a cumulative reading. Multi-model sessions are therefore
       // reported under a combined label rather than double counted.
-      accumulate(forModel(modelLabel(models)), row, priced, unpriced);
+      accumulate(forModel(modelLabel(models)), remainder, priced, unpriced);
     }
 
     const rolled = this.db
       .prepare("SELECT * FROM usage_daily_rollup WHERE day BETWEEN ? AND ?")
-      .all(Math.floor(from / DAY_MS) * DAY_MS, to) as Row[];
+      .all(fromDay, to) as Row[];
     for (const row of rolled) {
       const model = String(row.model);
       // The rollup table has no priced flag, so a missing cost is the only
@@ -358,11 +449,18 @@ export class UsageStore {
   /**
    * Folds snapshots older than the cutoff into per-day rows and deletes them.
    *
-   * Only the last snapshot of each session-day is folded, again because
-   * snapshots are cumulative. Rollup rows are replaced rather than added to, so
-   * a re-run over the same day is idempotent.
+   * The rollup holds each day's **increment**, not the cumulative reading taken
+   * that day. Storing the reading and summing days would count a long-running
+   * session once per day it survived: 100 tokens on Monday and 300 cumulative on
+   * Tuesday is 300 spent, not 400. Each day therefore contributes the reading
+   * minus what has already been folded for that session, tracked in
+   * `usage_rollup_watermark` because the earlier snapshots are gone by then.
+   *
+   * Only whole days are folded, so a day is written exactly once and the replace
+   * semantics below stay idempotent.
    */
   rollupOlderThan(cutoff: number): { days: number; snapshots: number } {
+    const foldBefore = Math.floor(cutoff / DAY_MS) * DAY_MS;
     const rows = this.db
       .prepare(`
         SELECT (u.observed_at / ${DAY_MS}) * ${DAY_MS} AS day,
@@ -378,8 +476,9 @@ export class UsageStore {
             WHERE x.session_key = u.session_key
               AND (x.observed_at / ${DAY_MS}) = (u.observed_at / ${DAY_MS})
           )
+        ORDER BY day ASC
       `)
-      .all(cutoff) as Row[];
+      .all(foldBefore) as Row[];
 
     type Bucket = {
       day: number;
@@ -393,11 +492,14 @@ export class UsageStore {
       hasCost: boolean;
       sessions: Set<string>;
     };
+    const folded = this.foldWatermarks();
     const buckets = new Map<string, Bucket>();
+    const advanced = new Map<string, FoldWatermark>();
     for (const row of rows) {
       const model = modelLabel(parseModels(row.models_json));
       const day = Number(row.day);
       const agentId = String(row.agent_id);
+      const sessionKey = String(row.session_key);
       const id = `${day}\u0000${agentId}\u0000${model}`;
       const bucket = buckets.get(id) ?? {
         day,
@@ -410,14 +512,50 @@ export class UsageStore {
         hasCost: true,
         sessions: new Set<string>(),
       };
-      bucket.input += Number(row.input_tokens);
-      bucket.output += Number(row.output_tokens);
-      bucket.cacheRead += Number(row.cache_read_tokens);
-      bucket.cacheWrite += Number(row.cache_write_tokens);
-      const cost = asNumber(row.cost_micro_usd);
-      if (cost !== undefined) bucket.cost = (bucket.cost ?? 0) + cost;
+      // Rows arrive oldest day first, so the previous day's reading for this
+      // session is already the watermark by the time the next one is folded.
+      const previous = advanced.get(sessionKey) ?? folded.get(sessionKey) ?? EMPTY_WATERMARK;
+      const reading = readingWatermark(row);
+
+      const added = {
+        input: increment(reading.input, previous.input),
+        output: increment(reading.output, previous.output),
+        cacheRead: increment(reading.cacheRead, previous.cacheRead),
+        cacheWrite: increment(reading.cacheWrite, previous.cacheWrite),
+        cost: reading.cost === undefined ? 0 : increment(reading.cost, previous.cost ?? 0),
+      };
+      // A reading that adds nothing beyond what is already folded — the same
+      // snapshot observed again — must not reach the bucket at all, or it would
+      // count the session a second time in `session_count`.
+      const contributes = Object.values(added).some((value) => value > 0);
+      // The watermark only ever rises. A reading that came back lower would
+      // otherwise lower the base the next day is measured against, and that day
+      // would fold the difference a second time.
+      advanced.set(sessionKey, {
+        input: Math.max(reading.input, previous.input),
+        output: Math.max(reading.output, previous.output),
+        cacheRead: Math.max(reading.cacheRead, previous.cacheRead),
+        cacheWrite: Math.max(reading.cacheWrite, previous.cacheWrite),
+        ...(reading.cost !== undefined || previous.cost !== undefined
+          ? { cost: Math.max(reading.cost ?? 0, previous.cost ?? 0) }
+          : {}),
+        ...(previous.firstDay !== undefined
+          ? { firstDay: previous.firstDay }
+          : contributes
+            ? { firstDay: day }
+            : {}),
+      });
+      if (!contributes) continue;
+
+      bucket.input += added.input;
+      bucket.output += added.output;
+      bucket.cacheRead += added.cacheRead;
+      bucket.cacheWrite += added.cacheWrite;
+      if (reading.cost !== undefined) bucket.cost = (bucket.cost ?? 0) + added.cost;
       if (Number(row.has_cost) !== 1) bucket.hasCost = false;
-      bucket.sessions.add(String(row.session_key));
+      // Counted on the first day it is folded and never again, so summing the
+      // days of a session that lived across several reports one session.
+      if (previous.firstDay === undefined) bucket.sessions.add(sessionKey);
       buckets.set(id, bucket);
     }
 
@@ -426,13 +564,34 @@ export class UsageStore {
         day, agent_id, model, input_tokens, output_tokens,
         cache_read_tokens, cache_write_tokens, cost_micro_usd, session_count
       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      -- Increments add. A day is normally folded in one pass, but a session that
+      -- reports again for an already-folded day brings only what is new, and
+      -- replacing the row would drop everything folded before it.
       ON CONFLICT (day, agent_id, model) DO UPDATE SET
+        input_tokens = input_tokens + excluded.input_tokens,
+        output_tokens = output_tokens + excluded.output_tokens,
+        cache_read_tokens = cache_read_tokens + excluded.cache_read_tokens,
+        cache_write_tokens = cache_write_tokens + excluded.cache_write_tokens,
+        cost_micro_usd = CASE
+          WHEN excluded.cost_micro_usd IS NULL THEN cost_micro_usd
+          ELSE COALESCE(cost_micro_usd, 0) + excluded.cost_micro_usd
+        END,
+        session_count = session_count + excluded.session_count
+    `);
+    const markFolded = this.db.prepare(`
+      INSERT INTO usage_rollup_watermark (
+        session_key, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, cost_micro_usd,
+        first_day
+      ) VALUES (?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT (session_key) DO UPDATE SET
         input_tokens = excluded.input_tokens,
         output_tokens = excluded.output_tokens,
         cache_read_tokens = excluded.cache_read_tokens,
         cache_write_tokens = excluded.cache_write_tokens,
-        cost_micro_usd = excluded.cost_micro_usd,
-        session_count = excluded.session_count
+        cost_micro_usd = COALESCE(excluded.cost_micro_usd, usage_rollup_watermark.cost_micro_usd),
+        -- The day that counted the session is decided once. Later folds move the
+        -- token watermark, they do not move where the session was counted.
+        first_day = COALESCE(usage_rollup_watermark.first_day, excluded.first_day)
     `);
     let snapshots = 0;
     this.db.exec("BEGIN IMMEDIATE");
@@ -450,8 +609,19 @@ export class UsageStore {
           bucket.sessions.size,
         );
       }
+      for (const [sessionKey, reading] of advanced) {
+        markFolded.run(
+          sessionKey,
+          reading.input,
+          reading.output,
+          reading.cacheRead,
+          reading.cacheWrite,
+          reading.cost ?? null,
+          reading.firstDay ?? null,
+        );
+      }
       snapshots = Number(
-        this.db.prepare("DELETE FROM session_usage_snapshots WHERE observed_at < ?").run(cutoff).changes,
+        this.db.prepare("DELETE FROM session_usage_snapshots WHERE observed_at < ?").run(foldBefore).changes,
       );
       this.db.exec("COMMIT");
     } catch (error) {
@@ -459,6 +629,11 @@ export class UsageStore {
       throw error;
     }
     return { days: buckets.size, snapshots };
+  }
+
+  private foldWatermarks(): Map<string, FoldWatermark> {
+    const rows = this.db.prepare("SELECT * FROM usage_rollup_watermark").all() as Row[];
+    return new Map(rows.map((row) => [String(row.session_key), readingWatermark(row)]));
   }
 
   pruneSnapshots(cutoff: number): number {

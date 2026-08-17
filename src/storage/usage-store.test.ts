@@ -144,6 +144,49 @@ describe("UsageStore", () => {
     expect(repo.usage.latest("agent:builder:1")).toMatchObject({ inputTokens: 100, costMicroUsd: 1_500 });
   });
 
+  /**
+   * Cost can regress on its own: the same token counts come back with the price
+   * missing. The token comparison alone let that through and turned a measured
+   * cost into $0.00, which is the same false claim the gate above exists to stop.
+   */
+  it("keeps a price a later reading no longer reports", () => {
+    const repo = repository();
+    session(repo, "agent:builder:1", "builder");
+    repo.usage.record([usage("agent:builder:1", { observedAt: NOW - 60_000, costMicroUsd: 5_000 })]);
+
+    repo.usage.record([usage("agent:builder:1", { observedAt: NOW, costMicroUsd: undefined, hasCost: false })]);
+
+    expect(repo.usage.latest("agent:builder:1")).toMatchObject({ costMicroUsd: 5_000 });
+  });
+
+  /**
+   * The same reading also has to be able to report a model the Gateway could not
+   * price. Dropping it to protect the cost would lose that, and the total would
+   * keep claiming to be complete.
+   */
+  it("still takes the completeness of a reading whose price it declined", () => {
+    const repo = repository();
+    session(repo, "agent:builder:1", "builder");
+    repo.usage.record([usage("agent:builder:1", { observedAt: NOW - 60_000, costMicroUsd: 5_000 })]);
+
+    repo.usage.record([
+      usage("agent:builder:1", {
+        observedAt: NOW,
+        inputTokens: 400,
+        costMicroUsd: undefined,
+        hasCost: false,
+        models: ["local-llm"],
+        unpricedModels: ["local-llm"],
+      }),
+    ]);
+
+    expect(repo.usage.latest("agent:builder:1")).toMatchObject({
+      inputTokens: 400,
+      costMicroUsd: 5_000,
+      hasCost: false,
+      unpricedModels: ["local-llm"],
+    });
+  });
 });
 
 describe("UsageStore candidates", () => {
@@ -221,6 +264,61 @@ describe("UsageStore rollup", () => {
     const summary = repo.usage.summary(day, NOW);
     expect(summary.totals).toMatchObject({ inputTokens: 250, costMicroUsd: 2_500, sessionCount: 1 });
     expect(summary.byModel.get("sonnet")).toMatchObject({ inputTokens: 250 });
+  });
+
+  /**
+   * The reading folded on each day is cumulative, so a session that lived across
+   * days used to be counted once per day: 100 on Monday plus 300-cumulative on
+   * Tuesday reported 400 for a session that had spent 300. The error grew with
+   * every day a session stayed alive.
+   */
+  it("counts a session that spans days once, not once per day", () => {
+    const repo = repository();
+    session(repo, "agent:builder:1", "builder");
+    const monday = Math.floor((NOW - 12 * DAY_MS) / DAY_MS) * DAY_MS;
+    const tuesday = monday + DAY_MS;
+    repo.usage.record([
+      usage("agent:builder:1", { observedAt: monday + 1_000, inputTokens: 100, costMicroUsd: 1_000 }),
+      usage("agent:builder:1", { observedAt: tuesday + 1_000, inputTokens: 300, costMicroUsd: 3_000 }),
+    ]);
+
+    repo.usage.rollupOlderThan(NOW - 7 * DAY_MS);
+
+    const summary = repo.usage.summary(monday, NOW);
+    expect(summary.totals).toMatchObject({ inputTokens: 300, costMicroUsd: 3_000, sessionCount: 1 });
+  });
+
+  /**
+   * Half a session folded and half still raw is the normal state at the horizon.
+   * The raw row is cumulative, so it has to be reduced by what was folded or the
+   * folded part gets counted a second time.
+   */
+  it("does not count the folded part again through the session's live reading", () => {
+    const repo = repository();
+    session(repo, "agent:builder:1", "builder");
+    const oldDay = Math.floor((NOW - 9 * DAY_MS) / DAY_MS) * DAY_MS;
+    repo.usage.record([usage("agent:builder:1", { observedAt: oldDay + 1_000, inputTokens: 100, costMicroUsd: 1_000 })]);
+    repo.usage.rollupOlderThan(NOW - 7 * DAY_MS);
+    repo.usage.record([usage("agent:builder:1", { observedAt: NOW, inputTokens: 260, costMicroUsd: 2_600 })]);
+
+    const summary = repo.usage.summary(oldDay, NOW);
+    expect(summary.totals).toMatchObject({ inputTokens: 260, costMicroUsd: 2_600, sessionCount: 1 });
+  });
+
+  /**
+   * A session counted by a folded day outside the range still has to be counted
+   * by its live reading inside it, or a window that starts after the fold horizon
+   * would report tokens belonging to no session at all.
+   */
+  it("counts a straddling session once whether or not the folded day is in range", () => {
+    const repo = repository();
+    session(repo, "agent:builder:1", "builder");
+    const oldDay = Math.floor((NOW - 9 * DAY_MS) / DAY_MS) * DAY_MS;
+    repo.usage.record([usage("agent:builder:1", { observedAt: oldDay + 1_000, inputTokens: 100 })]);
+    repo.usage.rollupOlderThan(NOW - 7 * DAY_MS);
+    repo.usage.record([usage("agent:builder:1", { observedAt: NOW, inputTokens: 260 })]);
+
+    expect(repo.usage.summary(NOW - DAY_MS, NOW).totals).toMatchObject({ inputTokens: 160, sessionCount: 1 });
   });
 
   it("is idempotent when the same day is rolled up twice", () => {

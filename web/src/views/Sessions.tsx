@@ -35,6 +35,19 @@ const SESSION_TOPICS: readonly ChangeTopic[] = ["sessions"];
 /** How long the typed agent filter waits before it becomes a URL change. */
 const FILTER_SETTLE_MS = 250;
 
+/** The query-string keys the list itself depends on; `q` drives the search panel. */
+const FILTER_KEYS = ["agentId", "state", "grade", "sort"] as const;
+
+/** A canonical query string of just those keys, so it can be re-parsed as one. */
+function filterSignature(params: URLSearchParams): string {
+  const filtered = new URLSearchParams();
+  for (const key of FILTER_KEYS) {
+    const value = params.get(key);
+    if (value) filtered.set(key, value);
+  }
+  return filtered.toString();
+}
+
 function readFilters(params: URLSearchParams): SessionListFilters {
   const state = params.get("state");
   const grade = params.get("grade");
@@ -73,9 +86,12 @@ export function SessionsView() {
   const navigateTo = useNavigate();
   const search = searchParams.toString();
 
-  // Rebuilt only when the query string changes, so the paged query does not
-  // restart on every unrelated render.
-  const filters = useMemo(() => readFilters(new URLSearchParams(search)), [search]);
+  // Derived from the filter params alone, not the whole query string. Keying on
+  // the latter rebuilt this object whenever `q` changed, which restarted the paged
+  // query: typing in the transcript search discarded every page the reader had
+  // loaded, along with their scroll position.
+  const filterKey = filterSignature(searchParams);
+  const filters = useMemo(() => readFilters(new URLSearchParams(filterKey)), [filterKey]);
   const fetchPage = useCallback((cursor?: string) => collectorApi.sessions(filters, cursor), [filters]);
   const { items, error, loading, loadingMore, hasMore, hasNewData, loadMore, reload } = usePagedQuery(
     fetchPage,

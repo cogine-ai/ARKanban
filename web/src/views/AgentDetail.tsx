@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { AgentActivityRollup, AgentRollupWindow, UpcomingSchedule } from "../../../src/contracts";
 import { collectorApi, type AgentDetail as AgentDetailData } from "../api";
 import { AgentCost, ROLLUP_WINDOWS } from "../components/AgentCost";
@@ -122,16 +122,25 @@ export function AgentDetailView({ agentId }: { agentId: string }) {
   const [detail, setDetail] = useState<AgentDetailData>();
   const [error, setError] = useState<string>();
 
+  // Four topics feed this page, so reloads overlap readily. Only the newest may
+  // write, or an earlier response would land on top of a later one.
+  const generation = useRef(0);
   const reload = useCallback(async () => {
+    const requested = (generation.current += 1);
     try {
-      setDetail(await collectorApi.agent(agentId));
+      const agent = await collectorApi.agent(agentId);
+      if (requested !== generation.current) return;
+      setDetail(agent);
       setError(undefined);
     } catch (cause) {
+      if (requested !== generation.current) return;
       setError(cause instanceof Error ? cause.message : String(cause));
     }
   }, [agentId]);
 
   useEffect(() => {
+    setDetail(undefined);
+    setError(undefined);
     void reload();
     return subscribeTopics(["agents", "sessions", "activities", "usage"], () => void reload());
   }, [reload, subscribeTopics]);

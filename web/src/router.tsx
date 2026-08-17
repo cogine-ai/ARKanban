@@ -83,7 +83,16 @@ export function matchPath(pattern: string, pathname: string): Record<string, str
   for (const [index, part] of patternParts.entries()) {
     const actual = pathParts[index]!;
     if (part.startsWith(":")) {
-      params[part.slice(1)] = decodeURIComponent(actual);
+      // A lone `%` makes `decodeURIComponent` throw. This runs during render with
+      // no boundary above it, so an unmatched route is a far better answer than a
+      // blank page.
+      let decoded: string;
+      try {
+        decoded = decodeURIComponent(actual);
+      } catch {
+        return undefined;
+      }
+      params[part.slice(1)] = decoded;
       continue;
     }
     if (part !== actual) return undefined;

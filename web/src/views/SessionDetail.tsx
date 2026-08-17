@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type {
   ActivityItem,
   ArchivedMessage,
@@ -86,7 +86,9 @@ function UsagePanel({ usage, coverage }: { usage?: SessionUsage; coverage: strin
               ? "This token lacks the usage scope."
               : coverage === "unreported"
                 ? "The Gateway was asked and reported no usage for this session. Its harness records no token counts, so there is nothing to price — not a session that cost nothing."
-                : "No reading collected for this session yet."}
+                : coverage === "error"
+                  ? "The last usage read failed. Nothing here has been measured yet."
+                  : "No reading collected for this session yet."}
         </p>
       </div>
     );
@@ -99,7 +101,7 @@ function UsagePanel({ usage, coverage }: { usage?: SessionUsage; coverage: strin
       <div className="fact-grid">
         <Fact
           label="COST"
-          value={`${formatCost(usage.costMicroUsd)}${usage.hasCost ? "" : "+"}`}
+          value={`${formatCost(usage.costMicroUsd)}${usage.hasCost || usage.costMicroUsd === undefined ? "" : "+"}`}
           title={usage.hasCost ? undefined : `At least this much; no price for ${usage.unpricedModels.join(", ") || "some models"}`}
         />
         <Fact label="TOKENS" value={formatTokens(tokens)} title={`${tokens.toLocaleString()} input + output`} />
@@ -219,21 +221,33 @@ export function SessionDetailView({ sessionKey }: { sessionKey: string }) {
   const [activities, setActivities] = useState<ActivityItem[]>();
   const [error, setError] = useState<string>();
 
+  // Change events can arrive faster than a fetch completes, and the key changes
+  // when the reader follows a link from here. Only the newest request may write:
+  // an earlier one landing later would show another session under this URL.
+  const generation = useRef(0);
   const reload = useCallback(async () => {
+    const requested = (generation.current += 1);
     try {
       const [session, timeline] = await Promise.all([
         collectorApi.session(sessionKey),
         collectorApi.sessionActivities(sessionKey),
       ]);
+      if (requested !== generation.current) return;
       setDetail(session);
       setActivities(timeline.activities);
       setError(undefined);
     } catch (cause) {
+      if (requested !== generation.current) return;
       setError(cause instanceof Error ? cause.message : String(cause));
     }
   }, [sessionKey]);
 
   useEffect(() => {
+    // Cleared first so a new session shows its loading state rather than the
+    // previous session's facts.
+    setDetail(undefined);
+    setActivities(undefined);
+    setError(undefined);
     void reload();
     return subscribeTopics(["sessions", "activities", "usage"], () => void reload());
   }, [reload, subscribeTopics]);

@@ -66,9 +66,14 @@ export function usePagedQuery<T>(
         if (requested !== generation.current) return;
         setError(cause instanceof Error ? cause.message : String(cause));
       } finally {
-        inFlight.current = false;
-        setLoading(false);
-        setLoadingMore(false);
+        // Only the newest request may report that loading finished. A superseded
+        // one settling here would clear the spinner while its replacement is still
+        // in flight, showing the empty-list state for a list that is about to fill.
+        if (requested === generation.current) {
+          inFlight.current = false;
+          setLoading(false);
+          setLoadingMore(false);
+        }
       }
     },
     [fetchPage],

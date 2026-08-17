@@ -76,6 +76,14 @@ export function CollectorProvider({ children }: { children: ReactNode }) {
     }
   }, [range]);
 
+  // Held in a ref so that invalidation, and the event stream that drives it, do
+  // not have to be rebuilt when `refresh` changes with the range. Reconnecting the
+  // stream to change a date range would drop the changes arriving in between.
+  const refreshRef = useRef(refresh);
+  useEffect(() => {
+    refreshRef.current = refresh;
+  }, [refresh]);
+
   const topicListeners = useRef(new Set<{ topics: readonly ChangeTopic[]; listener: () => void }>());
   const pendingTopics = useRef(new Set<ChangeTopic>());
 
@@ -90,11 +98,11 @@ export function CollectorProvider({ children }: { children: ReactNode }) {
   const flushInvalidation = useCallback(() => {
     const topics = new Set(pendingTopics.current);
     pendingTopics.current.clear();
-    if (topics.has("activities")) void refresh();
+    if (topics.has("activities")) void refreshRef.current();
     for (const entry of topicListeners.current) {
       if (entry.topics.some((topic) => topics.has(topic))) entry.listener();
     }
-  }, [refresh]);
+  }, []);
 
   const scheduleInvalidation = useCallback(
     (topics: readonly ChangeTopic[]) => {
@@ -105,8 +113,12 @@ export function CollectorProvider({ children }: { children: ReactNode }) {
     [flushInvalidation],
   );
 
+  // Refetching for a new range is separate from the stream's lifetime.
   useEffect(() => {
     void refresh();
+  }, [refresh]);
+
+  useEffect(() => {
     const events = new EventSource("/api/v1/events");
     events.addEventListener("status", (event) => {
       try {
@@ -131,7 +143,7 @@ export function CollectorProvider({ children }: { children: ReactNode }) {
       events.close();
       if (refreshTimer.current !== undefined) window.clearTimeout(refreshTimer.current);
     };
-  }, [refresh, scheduleInvalidation]);
+  }, [scheduleInvalidation]);
 
   useEffect(() => {
     try {

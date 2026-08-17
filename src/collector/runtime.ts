@@ -189,6 +189,7 @@ export class CollectorRuntime {
   private usageStatus: UsageSyncOutcome | undefined;
   private signalStatus: SignalRecomputeStatus | undefined;
   private sessionArchiveError?: string;
+  private pruneError?: string;
   private syncState: CollectorSyncState = "starting";
   private syncReasons: string[] = ["collector_starting"];
   private gatewayHello?: GatewayHello;
@@ -742,8 +743,11 @@ export class CollectorRuntime {
     return this.capabilities.snapshot();
   }
 
-  getArchiveDiagnostics(): { sessionArchiveError?: string } {
-    return this.sessionArchiveError ? { sessionArchiveError: this.sessionArchiveError } : {};
+  getArchiveDiagnostics(): { sessionArchiveError?: string; pruneError?: string } {
+    return {
+      ...(this.sessionArchiveError ? { sessionArchiveError: this.sessionArchiveError } : {}),
+      ...(this.pruneError ? { pruneError: this.pruneError } : {}),
+    };
   }
 
   private async syncSchedules(reason: string): Promise<void> {
@@ -1020,19 +1024,29 @@ export class CollectorRuntime {
     });
   }
 
+  /**
+   * Runs on a timer, so an exception here would reach the event loop with no
+   * frame to catch it and take the process down. A prune that fails is a
+   * database that keeps growing until the next pass, which is survivable.
+   */
   private prune(): void {
     const now = Date.now();
     const day = 24 * 60 * 60 * 1_000;
-    // Usage folds before sessions age out: rollup reads the agent through the
-    // session row, so deleting sessions first would strand the spend as
-    // unattributable.
-    this.repository.usage.rollupOlderThan(now - USAGE_ROLLUP_AFTER_DAYS * day);
-    this.repository.usage.pruneSnapshots(now - this.config.storage.usageRetentionDays * day);
-    this.repository.prune(now - this.config.storage.terminalRetentionDays * day);
-    this.repository.pruneSessions(now - this.config.storage.sessionRetentionDays * day);
-    // Transcripts have two gates: age here, and the size ceiling the sync loop
-    // enforces. Age runs first so eviction only ever has to handle real growth.
-    this.repository.transcripts.pruneOlderThan(now - this.config.storage.transcriptRetentionDays * day);
-    this.repository.transcripts.evictOldestSessions(this.config.storage.transcriptMaxBytes);
+    try {
+      // Usage folds before sessions age out: rollup reads the agent through the
+      // session row, so deleting sessions first would strand the spend as
+      // unattributable.
+      this.repository.usage.rollupOlderThan(now - USAGE_ROLLUP_AFTER_DAYS * day);
+      this.repository.usage.pruneSnapshots(now - this.config.storage.usageRetentionDays * day);
+      this.repository.prune(now - this.config.storage.terminalRetentionDays * day);
+      this.repository.pruneSessions(now - this.config.storage.sessionRetentionDays * day);
+      // Transcripts have two gates: age here, and the size ceiling the sync loop
+      // enforces. Age runs first so eviction only ever has to handle real growth.
+      this.repository.transcripts.pruneOlderThan(now - this.config.storage.transcriptRetentionDays * day);
+      this.repository.transcripts.evictOldestSessions(this.config.storage.transcriptMaxBytes);
+      this.pruneError = undefined;
+    } catch (error) {
+      this.pruneError = error instanceof Error ? error.message : String(error);
+    }
   }
 }

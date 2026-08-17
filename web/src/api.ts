@@ -23,6 +23,7 @@ export type TranscriptArchiveStatus = {
   enabled: boolean;
   retentionDays: number;
   maxBytes: number;
+  filePermissionsEnforced: boolean;
   messageCount: number;
   contentBytes: number;
   sync: { sessions: number; inserted: number; capacity: "ok" | "paused"; errorCode?: string; skipped?: string } | null;

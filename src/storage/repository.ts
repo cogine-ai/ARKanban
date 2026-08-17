@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import { mkdirSync } from "node:fs";
+import { chmodSync, mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import { DatabaseSync, type StatementSync } from "node:sqlite";
 import type {
@@ -290,6 +290,24 @@ function aggregateSettledGroups(
   return { groupsByAgent, outcomeCounts, totalSeries: groups.length };
 }
 
+/**
+ * Narrows a path to its owner, reporting whether the mode now holds.
+ *
+ * A file SQLite has not created yet needs no narrowing. Every other refusal —
+ * a directory owned by someone else, a volume without POSIX modes — is real:
+ * the mode does not hold, and the caller has to say so rather than crash, since
+ * refusing to start would leave the operator with no collector and no
+ * explanation of why.
+ */
+function restrictToOwner(target: string, mode: number): boolean {
+  try {
+    chmodSync(target, mode);
+    return true;
+  } catch (error) {
+    return (error as { code?: string }).code === "ENOENT";
+  }
+}
+
 function asString(value: unknown): string | undefined {
   return typeof value === "string" && value.length > 0 ? value : undefined;
 }
@@ -561,6 +579,12 @@ export class CollectorRepository {
   readonly transcripts: TranscriptArchive;
   readonly usage: UsageStore;
   readonly signals: SignalStore;
+  /**
+   * False when this filesystem would not hold the database to its owner, so the
+   * archive disclosure can say that the text is readable by other users here
+   * instead of implying a protection that is not in place.
+   */
+  readonly filePermissionsEnforced: boolean;
   private readonly db: DatabaseSync;
   private readonly listeners = new Set<(change: RepositoryChange) => void>();
   private readonly findFingerprint: StatementSync;
@@ -569,9 +593,22 @@ export class CollectorRepository {
   private currentRevision = 0;
 
   constructor(databasePath: string) {
-    mkdirSync(dirname(databasePath), { recursive: true });
+    mkdirSync(dirname(databasePath), { recursive: true, mode: 0o700 });
     this.db = new DatabaseSync(databasePath);
     this.db.exec("PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL; PRAGMA busy_timeout = 3000;");
+    // Overwrite deleted rows instead of leaving them legible in freed pages:
+    // retention and capacity eviction both delete transcript text, and neither
+    // can afford to VACUUM the whole file on every pass.
+    this.db.exec("PRAGMA secure_delete = ON;");
+    // Loopback does not isolate the other OS users on this machine, and this file
+    // holds conversation text. SQLite creates the database, WAL and SHM under the
+    // ambient umask, so each is narrowed once it exists. The file modes are what
+    // actually withhold the text; the directory is depth, and a directory this
+    // process does not own is not a reason to stop.
+    restrictToOwner(dirname(databasePath), 0o700);
+    this.filePermissionsEnforced = ["", "-wal", "-shm"].every((suffix) =>
+      restrictToOwner(`${databasePath}${suffix}`, 0o600),
+    );
     this.migration = applyMigrations(this.db, databasePath);
     this.transcripts = new TranscriptArchive(this.db);
     this.usage = new UsageStore(this.db);
@@ -1440,7 +1477,12 @@ export class CollectorRepository {
   }
 
   /** Activity timeline for one session, newest first. */
-  listSessionActivities(sessionKey: string, limit = 200): StoredActivity[] {
+  /**
+   * Projected like every other list: the stored row carries the Gateway's task ids
+   * and run refs, which this timeline has no use for and which the rest of the API
+   * keeps out of responses.
+   */
+  listSessionActivities(sessionKey: string, limit = 200): ActivityItem[] {
     const rows = this.db
       .prepare(`
         SELECT * FROM activities
@@ -1449,7 +1491,7 @@ export class CollectorRepository {
         LIMIT ?
       `)
       .all(sessionKey, sessionKey, limit) as ActivityRow[];
-    return rows.map(rowToStored);
+    return rows.map((row) => publicItem(rowToStored(row)));
   }
 
   /**
@@ -1480,22 +1522,29 @@ export class CollectorRepository {
 
   /**
    * Session archives outlive terminal Activity on purpose, so only archived
-   * sessions age out. Foreign keys are declared but not enforced, so dangling
-   * refs are cleared explicitly.
+   * sessions age out. Transcripts go first: they have no foreign key to ride out
+   * on, and `activities.session_ref` is a plain column, so both are cleaned up
+   * here rather than by the database.
    */
   pruneSessions(cutoff: number): number {
+    const doomed = (
+      this.db
+        .prepare("SELECT session_key FROM sessions WHERE archived = 1 AND last_activity_at < ?")
+        .all(cutoff) as Array<Record<string, unknown>>
+    ).map((row) => String(row.session_key));
+    if (doomed.length === 0) return 0;
+
+    this.transcripts.dropSessions(doomed);
     const result = this.db
       .prepare("DELETE FROM sessions WHERE archived = 1 AND last_activity_at < ?")
       .run(cutoff);
-    if (Number(result.changes) > 0) {
-      this.db
-        .prepare(`
-          UPDATE activities SET session_ref = NULL
-          WHERE session_ref IS NOT NULL
-            AND session_ref NOT IN (SELECT session_key FROM sessions)
-        `)
-        .run();
-    }
+    this.db
+      .prepare(`
+        UPDATE activities SET session_ref = NULL
+        WHERE session_ref IS NOT NULL
+          AND session_ref NOT IN (SELECT session_key FROM sessions)
+      `)
+      .run();
     return Number(result.changes);
   }
 

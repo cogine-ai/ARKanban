@@ -148,6 +148,33 @@ describe("transcript sync progress", () => {
     expect(repo.transcripts.syncState("agent:builder:one")).toMatchObject({ syncedCount: 3, complete: true });
   });
 
+  /**
+   * The end of a session's history is not the end of the session. Once the stored
+   * offset had nothing to advance to, it used to stay pointing at the page already
+   * read, and every later round re-requested that offset — so an active
+   * conversation's newest messages were never fetched again.
+   */
+  it("starts from the newest page again once a session's history runs out", async () => {
+    const repo = repository();
+    seedSession(repo, "agent:builder:one");
+    const offsets: Array<number | undefined> = [];
+    const request: HistoryRequest = async (_method, params) => {
+      const { offset } = params as { offset?: number };
+      offsets.push(offset);
+      return offset === undefined
+        ? { messages: [turn(0), turn(1)], hasMore: true, nextOffset: 2 }
+        : { messages: [turn(2)], hasMore: false };
+    };
+    const sync = synchronizer(repo, request);
+
+    await sync.runOnce(healthy);
+    await sync.runOnce(healthy);
+    expect(repo.transcripts.syncState("agent:builder:one")).toMatchObject({ syncedCount: 3, complete: true });
+
+    await sync.runOnce(healthy);
+    expect(offsets).toEqual([undefined, 2, undefined]);
+  });
+
   it("re-pulling an already stored page inserts nothing", async () => {
     const repo = repository();
     seedSession(repo, "agent:builder:one");

@@ -326,7 +326,12 @@ export class TranscriptArchive {
 
   recordSync(state: {
     sessionKey: string;
-    cursor?: string;
+    /**
+     * Absent leaves the stored token alone, which is what a failed round wants:
+     * backfill progress survives. `null` clears it, so the next round starts at
+     * the newest page again.
+     */
+    cursor?: string | null;
     lastSeq?: number;
     lastMessageId?: string;
     complete: boolean;
@@ -344,7 +349,7 @@ export class TranscriptArchive {
           COALESCE((SELECT SUM(content_bytes) FROM session_messages WHERE session_key = ?), 0),
           ?, ?, ?
         ON CONFLICT (session_key) DO UPDATE SET
-          cursor = COALESCE(excluded.cursor, session_transcript_sync.cursor),
+          cursor = CASE WHEN ? = 1 THEN excluded.cursor ELSE session_transcript_sync.cursor END,
           last_seq = COALESCE(excluded.last_seq, session_transcript_sync.last_seq),
           last_message_id = COALESCE(excluded.last_message_id, session_transcript_sync.last_message_id),
           synced_count = excluded.synced_count,
@@ -363,6 +368,7 @@ export class TranscriptArchive {
         state.complete ? 1 : 0,
         state.syncedAt,
         state.errorCode ?? null,
+        state.cursor === undefined ? 0 : 1,
       );
   }
 
@@ -395,7 +401,19 @@ export class TranscriptArchive {
 
   pruneOlderThan(cutoff: number): number {
     const result = this.db.prepare("DELETE FROM session_messages WHERE created_at < ?").run(cutoff);
-    return Number(result.changes);
+    const removed = Number(result.changes);
+    if (removed > 0) this.compactIndex();
+    return removed;
+  }
+
+  /**
+   * An FTS5 delete only appends a tombstone, so the index keeps its pages until
+   * it is merged. Capacity is measured from those pages: without this, deleting
+   * transcripts barely moves the number the budget is compared against, and an
+   * archive that has been emptied can still read as over budget.
+   */
+  private compactIndex(): void {
+    this.db.exec("INSERT INTO session_messages_fts(session_messages_fts) VALUES('optimize')");
   }
 
   /**
@@ -404,7 +422,7 @@ export class TranscriptArchive {
    * for review and actively misleading in search results.
    */
   evictOldestSessions(targetStoredBytes: number): { sessions: number; messages: number } {
-    let usage = this.usage();
+    const usage = this.usage();
     if (usage.storedBytes <= targetStoredBytes || usage.contentBytes === 0) {
       return { sessions: 0, messages: 0 };
     }
@@ -433,17 +451,52 @@ export class TranscriptArchive {
     if (doomed.length === 0) return { sessions: 0, messages: 0 };
 
     const statement = this.db.prepare("DELETE FROM session_messages WHERE session_key = ?");
+    // The watermark has to come back with the text. Left alone it would keep
+    // reporting the evicted messages as synced and complete, which both misleads
+    // the reader and makes the session ineligible for backfill once space frees up.
+    const resetWatermark = this.db.prepare(`
+      UPDATE session_transcript_sync
+      SET cursor = NULL, last_seq = NULL, last_message_id = NULL,
+          synced_count = 0, synced_bytes = 0, complete = 0
+      WHERE session_key = ?
+    `);
     let messages = 0;
     this.db.exec("BEGIN IMMEDIATE");
     try {
-      for (const sessionKey of doomed) messages += Number(statement.run(sessionKey).changes);
+      for (const sessionKey of doomed) {
+        messages += Number(statement.run(sessionKey).changes);
+        resetWatermark.run(sessionKey);
+      }
       this.db.exec("COMMIT");
     } catch (error) {
       this.db.exec("ROLLBACK");
       throw error;
     }
-    usage = this.usage();
+    this.compactIndex();
     return { sessions: doomed.length, messages };
+  }
+
+  /**
+   * Drops the transcripts of sessions that are being deleted.
+   *
+   * `session_messages` carries no foreign key — the FTS triggers need the row to
+   * still be there when they fire — so nothing removes these rows on its own.
+   * Left behind they would be unreachable through any session view yet still
+   * answer searches, which is text outliving the record it belongs to.
+   */
+  dropSessions(sessionKeys: readonly string[]): number {
+    if (sessionKeys.length === 0) return 0;
+    let removed = 0;
+    // Chunked to stay clear of the bound-parameter ceiling on a large prune.
+    for (let index = 0; index < sessionKeys.length; index += 500) {
+      const chunk = sessionKeys.slice(index, index + 500);
+      const placeholders = chunk.map(() => "?").join(", ");
+      removed += Number(
+        this.db.prepare(`DELETE FROM session_messages WHERE session_key IN (${placeholders})`).run(...chunk).changes,
+      );
+    }
+    if (removed > 0) this.compactIndex();
+    return removed;
   }
 
   /**

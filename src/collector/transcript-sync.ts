@@ -208,7 +208,11 @@ export class TranscriptSynchronizer {
     const lastSeq = writes.length > 0 ? Math.max(...writes.map((write) => write.seq)) : candidate.lastSeq;
     this.deps.archive.recordSync({
       sessionKey: candidate.sessionKey,
-      ...(page.nextOffset !== undefined ? { cursor: String(page.nextOffset) } : {}),
+      // A page with no next offset is the end of this session's history, so the
+      // token is cleared rather than left pointing at a page already read. Keeping
+      // it would send every later round back to that same offset, and the tail a
+      // live conversation keeps adding would never be fetched.
+      cursor: page.nextOffset !== undefined ? String(page.nextOffset) : null,
       ...(lastSeq !== undefined ? { lastSeq } : {}),
       complete: !page.hasMore,
       syncedAt: now,

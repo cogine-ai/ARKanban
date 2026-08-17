@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -25,6 +25,23 @@ function repository(): CollectorRepository {
   });
   return result;
 }
+
+describe("CollectorRepository file protection", () => {
+  it("holds the database to its owner", () => {
+    const directory = mkdtempSync(path.join(tmpdir(), "collector-perms-"));
+    const databasePath = path.join(directory, "collector.sqlite");
+    const repo = new CollectorRepository(databasePath);
+    cleanups.push(() => {
+      repo.close();
+      rmSync(directory, { recursive: true, force: true });
+    });
+
+    expect(repo.filePermissionsEnforced).toBe(true);
+    expect(statSync(databasePath).mode & 0o777).toBe(0o600);
+    expect(statSync(directory).mode & 0o777).toBe(0o700);
+  });
+
+});
 
 describe("CollectorRepository agents and sessions", () => {
   const session = (overrides: Partial<SessionWrite> & Pick<SessionWrite, "sessionKey">): SessionWrite => ({

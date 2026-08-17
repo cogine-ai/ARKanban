@@ -42,7 +42,20 @@ function ArchivePanel({ status }: { status?: TranscriptArchiveStatus }) {
           <dt>State</dt>
           <dd>{status.sync?.errorCode ?? status.sync?.skipped ?? "Healthy"}</dd>
         </div>
+        <div>
+          <dt>File access</dt>
+          <dd>{status.filePermissionsEnforced ? "This user only" : "Readable by other users"}</dd>
+        </div>
       </dl>
+      {status.filePermissionsEnforced ? null : (
+        // The panel's whole claim is that the text stays on this machine, which
+        // says nothing about who else on it can read the file. Where the mode
+        // could not be set, that gap is stated rather than left to be assumed.
+        <p className="archive-warning">
+          This filesystem would not restrict the database to your account, so other users on this machine can read the
+          stored conversations. Move the data directory to a volume that supports file permissions.
+        </p>
+      )}
       <p className="archive-erase">
         Erase everything with <code>openclaw-collector purge-transcripts --yes</code>
       </p>

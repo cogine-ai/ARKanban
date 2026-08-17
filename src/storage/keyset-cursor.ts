@@ -24,7 +24,14 @@ export type SessionSort = (typeof SESSION_SORTS)[number];
  * path it feeds is the contract: a future sort must land here before it lands in
  * `SESSION_SORTS`, never as a silent fallback to `lastActivity`.
  */
-export const DEFERRED_SESSION_SORTS: Record<string, string> = {};
+export const DEFERRED_SESSION_SORTS: Record<string, string> = Object.create(null);
+
+/**
+ * Session keys are short identifiers. The bound is here because the key arrives
+ * inside a cursor from the URL, and an unbounded one would be decoded and bound
+ * into a query for no reason.
+ */
+const MAX_CURSOR_SESSION_KEY = 512;
 
 export type KeysetCursor = {
   sort: SessionSort;
@@ -61,5 +68,6 @@ export function decodeCursor(raw: string, expectedSort: SessionSort): KeysetCurs
   if (typeof sort !== "string" || !isSessionSort(sort) || sort !== expectedSort) return undefined;
   if (typeof value !== "number" || !Number.isFinite(value)) return undefined;
   if (typeof sessionKey !== "string" || sessionKey.length === 0) return undefined;
+  if (sessionKey.length > MAX_CURSOR_SESSION_KEY) return undefined;
   return { sort, value, sessionKey };
 }

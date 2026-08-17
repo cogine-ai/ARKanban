@@ -635,3 +635,74 @@ describe("session signals HTTP API", () => {
     expect(response.json().signals).toMatchObject({ grade: "unscored", algorithmVersion: SIGNAL_ALGORITHM_VERSION });
   });
 });
+
+/**
+ * Binding to loopback only keeps other machines out. These cover the browser
+ * sitting on the same machine, which is the one client that can be talked into
+ * calling this API on someone else's behalf — and the API answers with full
+ * conversation text.
+ */
+describe("browser-facing guards", () => {
+  async function server(): Promise<FastifyInstance> {
+    const { runtime, config } = runtimeFixture();
+    const app = await createHttpServer(runtime, config);
+    cleanups.push(() => app.close());
+    return app;
+  }
+
+  it("refuses a request arriving under a host that is not loopback", async () => {
+    const app = await server();
+    // DNS rebinding: the browser connected to 127.0.0.1 while believing it is
+    // talking to the attacker's site, so it attaches that site's Host.
+    const response = await app.inject({
+      method: "GET",
+      url: "/api/v1/snapshot",
+      headers: { host: "attacker.example:47123" },
+    });
+
+    expect(response.statusCode).toBe(403);
+    expect(response.json()).toMatchObject({ error: "forbidden_host" });
+  });
+
+  it("accepts every loopback spelling, port included or not", async () => {
+    const app = await server();
+    for (const host of ["localhost", "localhost:47123", "127.0.0.1:47123", "[::1]:47123"]) {
+      const response = await app.inject({ method: "GET", url: "/healthz", headers: { host } });
+      expect(response.statusCode, host).toBe(200);
+    }
+  });
+
+  it("refuses a foreign Origin and a cross-site fetch", async () => {
+    const app = await server();
+    const foreign = await app.inject({
+      method: "GET",
+      url: "/api/v1/snapshot",
+      headers: { origin: "https://attacker.example" },
+    });
+    const crossSite = await app.inject({
+      method: "GET",
+      url: "/api/v1/snapshot",
+      headers: { "sec-fetch-site": "cross-site" },
+    });
+
+    expect(foreign.json()).toMatchObject({ error: "forbidden_origin" });
+    expect(crossSite.json()).toMatchObject({ error: "forbidden_cross_site" });
+  });
+
+  it("sends a policy that permits nothing off-origin, and no referrer", async () => {
+    const app = await server();
+    const response = await app.inject({ method: "GET", url: "/api/v1/snapshot" });
+
+    expect(response.headers["content-security-policy"]).toContain("default-src 'none'");
+    expect(response.headers["content-security-policy"]).toContain("frame-ancestors 'none'");
+    expect(response.headers["referrer-policy"]).toBe("no-referrer");
+  });
+
+  it("answers 400 for a repeated parameter instead of failing inside SQLite", async () => {
+    const app = await server();
+    const response = await app.inject({ method: "GET", url: "/api/v1/sessions?agentId=a&agentId=b" });
+
+    expect(response.statusCode).toBe(400);
+    expect(response.json()).toMatchObject({ error: "repeated_query_parameter", parameter: "agentId" });
+  });
+});

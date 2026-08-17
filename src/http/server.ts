@@ -1,7 +1,8 @@
 import { existsSync } from "node:fs";
+import type { ServerResponse } from "node:http";
 import path from "node:path";
 import fastifyStatic from "@fastify/static";
-import Fastify, { LogController, type FastifyInstance } from "fastify";
+import Fastify, { LogController, type FastifyError, type FastifyInstance } from "fastify";
 import type {
   AgentOverview,
   CollectorChange,
@@ -34,6 +35,67 @@ const SESSION_SIGNAL_GRADES: readonly SessionSignalGrade[] = ["A", "B", "C", "D"
 
 function sseEvent(event: string, data: unknown): string {
   return `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
+}
+
+/**
+ * Nothing is fetched from anywhere else, so everything but same-origin script,
+ * style and XHR is denied outright. Inline styles are not permitted either:
+ * React sets the `style` prop through the CSSStyleDeclaration API, which CSP
+ * does not police, so the app needs no exemption to keep working.
+ */
+const CONTENT_SECURITY_POLICY = [
+  "default-src 'none'",
+  "script-src 'self'",
+  "style-src 'self'",
+  "img-src 'self'",
+  "font-src 'self'",
+  "connect-src 'self'",
+  "base-uri 'none'",
+  "form-action 'none'",
+  "frame-ancestors 'none'",
+].join("; ");
+
+/**
+ * Binding to loopback keeps other machines out. It does nothing about a page in
+ * the operator's own browser: a hostile site can point its own hostname at
+ * 127.0.0.1, and the browser will then treat this API as that site's same
+ * origin — reading the session archive, which holds full conversation text.
+ * Every request must therefore arrive under a loopback authority.
+ *
+ * The port is deliberately not compared. A browser sends the port it actually
+ * connected to, so it carries no attacker-controlled signal, while pinning it
+ * would break a forwarded port for no gain.
+ */
+function loopbackAuthorities(configuredHost: string): ReadonlySet<string> {
+  return new Set(["localhost", "127.0.0.1", "::1", configuredHost.toLowerCase()]);
+}
+
+/** Extracts the host from an authority, tolerating `[::1]:port` and a bare IPv6 literal. */
+function authorityHost(value: string): string | undefined {
+  const trimmed = value.trim().toLowerCase();
+  if (!trimmed) return undefined;
+  if (trimmed.startsWith("[")) {
+    const end = trimmed.indexOf("]");
+    return end > 1 ? trimmed.slice(1, end) : undefined;
+  }
+  // More than one colon and no brackets means a bare IPv6 literal, which cannot
+  // also carry a port.
+  if (trimmed.indexOf(":") !== trimmed.lastIndexOf(":")) return trimmed;
+  const host = trimmed.split(":")[0];
+  return host || undefined;
+}
+
+function originHost(value: string): string | undefined {
+  try {
+    return authorityHost(new URL(value).host);
+  } catch {
+    return undefined;
+  }
+}
+
+/** A repeated header arrives as an array, which is not something a browser sends. */
+function singleHeader(value: string | string[] | undefined): string | undefined {
+  return typeof value === "string" ? value : undefined;
 }
 
 function isSessionState(value: string): value is SessionStateFilter {
@@ -110,6 +172,49 @@ export async function createHttpServer(
   const app = Fastify({
     logger: { level: process.env.LOG_LEVEL ?? "info" },
     logController: new LogController({ disableRequestLogging: true }),
+  });
+
+  const allowedHosts = loopbackAuthorities(config.server.host);
+  app.addHook("onRequest", async (request, reply) => {
+    reply.headers({
+      "content-security-policy": CONTENT_SECURITY_POLICY,
+      // Search terms travel in the query string, and a term is usually something
+      // the operator read in a transcript.
+      "referrer-policy": "no-referrer",
+      "x-content-type-options": "nosniff",
+      "cross-origin-opener-policy": "same-origin",
+      "cross-origin-resource-policy": "same-origin",
+    });
+
+    const host = singleHeader(request.headers.host);
+    if (!host || !allowedHosts.has(authorityHost(host) ?? "")) {
+      return reply.code(403).send({ error: "forbidden_host" });
+    }
+    // Absent on most same-origin GETs; when it is present it must agree. `null`
+    // is the opaque origin a sandboxed frame sends, which no local page needs.
+    const origin = singleHeader(request.headers.origin);
+    if (origin !== undefined && !allowedHosts.has(originHost(origin) ?? "")) {
+      return reply.code(403).send({ error: "forbidden_origin" });
+    }
+    if (singleHeader(request.headers["sec-fetch-site"]) === "cross-site") {
+      return reply.code(403).send({ error: "forbidden_cross_site" });
+    }
+    return undefined;
+  });
+
+  /**
+   * No route takes a parameter twice, and a repeat arrives as an array — which
+   * every parser below would treat as a string and hand to SQLite as one, where
+   * it fails as an unhandled 500. A typo'd URL deserves a 400.
+   */
+  app.addHook("onRequest", async (request, reply) => {
+    const repeated = Object.entries((request.query ?? {}) as Record<string, unknown>).find(([, value]) =>
+      Array.isArray(value),
+    );
+    if (repeated) {
+      return reply.code(400).send({ error: "repeated_query_parameter", parameter: repeated[0] });
+    }
+    return undefined;
   });
 
   app.get("/healthz", async () => ({ ok: true, version: "0.1.0" }));
@@ -343,6 +448,7 @@ export async function createHttpServer(
     enabled: runtime.config.storage.transcriptSync === "enabled",
     retentionDays: runtime.config.storage.transcriptRetentionDays,
     maxBytes: runtime.config.storage.transcriptMaxBytes,
+    filePermissionsEnforced: runtime.repository.filePermissionsEnforced,
     ...runtime.repository.transcripts.totals(),
   }));
 
@@ -372,9 +478,21 @@ export async function createHttpServer(
     } satisfies UsageSummary;
   });
 
+  /**
+   * A hijacked response is outside Fastify's connection tracking, so an open
+   * event stream would keep `close()` waiting for a browser tab to go away —
+   * which is to say, keep Ctrl-C from returning. Shutdown ends them itself.
+   */
+  const streams = new Set<ServerResponse>();
+  app.addHook("onClose", async () => {
+    for (const stream of streams) stream.end();
+    streams.clear();
+  });
+
   app.get("/api/v1/events", async (request, reply) => {
     reply.hijack();
     const response = reply.raw;
+    streams.add(response);
     response.writeHead(200, {
       "Content-Type": "text/event-stream; charset=utf-8",
       "Cache-Control": "no-cache, no-transform",
@@ -414,6 +532,7 @@ export async function createHttpServer(
       clearInterval(keepAlive);
       unsubscribeChanges();
       unsubscribeStatus();
+      streams.delete(response);
     });
   });
 
@@ -432,12 +551,19 @@ export async function createHttpServer(
     }));
   }
 
-  app.setErrorHandler((error, request, reply) => {
+  /**
+   * A 4xx from the framework describes the request and is worth returning. An
+   * unexpected 500 describes this process — its file paths, its SQL — and the
+   * client has no use for that, so only the log gets the detail.
+   */
+  app.setErrorHandler((error: FastifyError, request, reply) => {
     request.log.error({ err: error }, "request failed");
-    void reply.code(500).send({
-      error: "collector_request_failed",
-      message: error instanceof Error ? error.message : String(error),
-    });
+    const status = typeof error.statusCode === "number" ? error.statusCode : 500;
+    if (status >= 500) {
+      void reply.code(status).send({ error: "collector_request_failed" });
+      return;
+    }
+    void reply.code(status).send({ error: error.code ?? "request_rejected", message: error.message });
   });
   return app;
 }

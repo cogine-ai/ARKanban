@@ -45,7 +45,11 @@ export const HISTORY_PAGE_ALIASES = {
 
 type MessageField = keyof typeof MESSAGE_FIELD_ALIASES;
 
-const ROLES: Record<string, MessageRole> = {
+/**
+ * Null-prototype: the key is a Gateway-supplied string, and on a plain object
+ * `roles["constructor"]` would resolve up the prototype chain to a function.
+ */
+const ROLES: Record<string, MessageRole> = Object.assign(Object.create(null), {
   user: "user",
   human: "user",
   operator: "user",
@@ -61,7 +65,7 @@ const ROLES: Record<string, MessageRole> = {
   // to the underscored spelling above.
   toolresult: "tool",
   tooluse: "tool",
-};
+});
 
 function asString(value: unknown): string | undefined {
   return typeof value === "string" && value.trim() ? value.trim() : undefined;
@@ -74,6 +78,23 @@ function asTimestamp(value: unknown): number | undefined {
     if (Number.isFinite(parsed)) return parsed;
   }
   return undefined;
+}
+
+/** Anything older is a unit mismatch — seconds read as milliseconds — not a date. */
+const EARLIEST_PLAUSIBLE_MS = Date.UTC(2015, 0, 1);
+
+/**
+ * Bounds a message's timestamp by the moment the page was fetched.
+ *
+ * Age is what transcript retention deletes on. A seconds-epoch value read as
+ * milliseconds dates every message to 1970, and the first retention pass would
+ * then erase the whole archive; a future date would make it unreachable instead.
+ * Neither is a date this code can use, so it falls back to the observation time.
+ */
+function boundedTimestamp(value: unknown, observedAt: number): number | undefined {
+  const parsed = asTimestamp(value);
+  if (parsed === undefined || parsed < EARLIEST_PLAUSIBLE_MS) return undefined;
+  return Math.min(parsed, observedAt);
 }
 
 function asInteger(value: unknown): number | undefined {
@@ -214,7 +235,7 @@ export function projectHistoryPage(payload: Record<string, unknown>, options: Pr
       ...(asString(read("channel")) ? { channel: asString(read("channel"))! } : {}),
       ...(asString(read("toolName")) ? { toolName: asString(read("toolName"))! } : {}),
       content,
-      createdAt: asTimestamp(read("createdAt")) ?? options.observedAt,
+      createdAt: boundedTimestamp(read("createdAt"), options.observedAt) ?? options.observedAt,
       observedAt: options.observedAt,
     });
   }

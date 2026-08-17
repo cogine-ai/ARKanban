@@ -67,8 +67,11 @@ type AgentField = keyof typeof AGENT_FIELD_ALIASES;
  * but cannot arrive from this one, which is why `projectSession` decides them
  * from lineage instead; `group` has no counterpart here and stays `unknown`
  * rather than being flattened into `main`.
+ *
+ * Null-prototype: the key is a Gateway-supplied string, and on a plain object
+ * `hints["constructor"]` would resolve up the prototype chain to a function.
  */
-const KIND_HINTS: Record<string, SessionKindHint> = {
+const KIND_HINTS: Record<string, SessionKindHint> = Object.assign(Object.create(null), {
   main: "main",
   direct: "main",
   primary: "main",
@@ -78,7 +81,7 @@ const KIND_HINTS: Record<string, SessionKindHint> = {
   sub: "subagent",
   child: "subagent",
   global: "global",
-};
+});
 
 function asString(value: unknown): string | undefined {
   return typeof value === "string" && value.trim() ? value.trim() : undefined;
@@ -91,6 +94,24 @@ function asTimestamp(value: unknown): number | undefined {
     if (Number.isFinite(parsed)) return parsed;
   }
   return undefined;
+}
+
+/** Anything older is a unit mismatch — seconds read as milliseconds — not a date. */
+const EARLIEST_PLAUSIBLE_MS = Date.UTC(2015, 0, 1);
+
+/**
+ * Bounds a Gateway timestamp by the moment it was observed.
+ *
+ * A future date is clock skew, and it does real damage here: a session counts as
+ * needing rescoring while `computed_at < last_activity_at`, so one dated ahead of
+ * now is permanently stale — the recompute loop would rescore it every pass and
+ * never reach the rest of the backlog. A date from before this project existed is
+ * a wrong unit rather than a time, and is dropped so it cannot drive retention.
+ */
+function boundedTimestamp(value: unknown, observedAt: number): number | undefined {
+  const parsed = asTimestamp(value);
+  if (parsed === undefined || parsed < EARLIEST_PLAUSIBLE_MS) return undefined;
+  return Math.min(parsed, observedAt);
 }
 
 function asInteger(value: unknown): number | undefined {
@@ -220,8 +241,8 @@ export function projectSession(
     hasActiveRun: asFlag(read("hasActiveRun")),
     ...optional("placement", asString(read("placement"))),
     lineage,
-    ...optional("createdAt", asTimestamp(read("createdAt"))),
-    lastActivityAt: asTimestamp(read("lastActivityAt")) ?? observedAt,
+    ...optional("createdAt", boundedTimestamp(read("createdAt"), observedAt)),
+    lastActivityAt: boundedTimestamp(read("lastActivityAt"), observedAt) ?? observedAt,
     observedAt,
     coverage,
   };

@@ -131,6 +131,21 @@ describe("projectSession", () => {
     expect(write?.lastActivityAt).toBe(NOW - 500);
   });
 
+  /**
+   * A session is due for rescoring while `computed_at < last_activity_at`, so one
+   * dated in the future is permanently due: the recompute loop rescores it every
+   * pass and never reaches the rest of the backlog.
+   */
+  it("clamps an activity time from the future to the moment it was observed", () => {
+    expect(projectSession({ key: "agent:ops:skewed", updatedAt: NOW + 3_600_000 }, NOW)?.lastActivityAt).toBe(NOW);
+  });
+
+  it("ignores a seconds epoch, which is not a millisecond time", () => {
+    const write = projectSession({ key: "agent:ops:seconds", updatedAt: 1_775_000_000, createdAt: 1_774_000_000 }, NOW);
+    expect(write?.lastActivityAt).toBe(NOW);
+    expect(write?.createdAt).toBeUndefined();
+  });
+
   it("marks index coverage live and everything else unobserved", () => {
     expect(projectSession(fullSessionRow(), NOW)?.coverage).toEqual({
       index: "live",
@@ -154,6 +169,17 @@ describe("sessionKindHint", () => {
 
   it("returns unknown rather than guessing on unrecognised tokens", () => {
     expect(sessionKindHint("something-new", "agent:a:1")).toBe("unknown");
+  });
+
+  /**
+   * The token is a Gateway-supplied string used as a lookup key. On a plain object
+   * these names resolve up the prototype chain, and the function that came back was
+   * written to the sessions table as a kind — where SQLite refused to bind it and
+   * failed the entire archive round, silently stopping every downstream view.
+   */
+  it("does not resolve a kind through the prototype chain", () => {
+    expect(sessionKindHint("constructor", "agent:a:1")).toBe("unknown");
+    expect(sessionKindHint("__proto__", "agent:a:1")).toBe("unknown");
   });
 });
 

@@ -2,7 +2,13 @@ import { describe, expect, it } from "vitest";
 import { FieldInventory } from "../collector/field-inventory.js";
 import { flattenContent, messageRole, projectHistoryPage } from "./message-projector.js";
 
-const base = { sessionKey: "agent:builder:demo", observedAt: 5_000, seqBase: -1 };
+/**
+ * Real millisecond epochs, because the projector now refuses a timestamp from
+ * before this project existed: that is what a seconds-epoch looks like when it is
+ * read as milliseconds, and transcript retention deletes on age.
+ */
+const OBSERVED_AT = Date.UTC(2026, 7, 1, 12, 0, 0);
+const base = { sessionKey: "agent:builder:demo", observedAt: OBSERVED_AT, seqBase: -1 };
 
 describe("content flattening", () => {
   it("joins the text of structured content blocks", () => {
@@ -30,6 +36,18 @@ describe("role normalisation", () => {
   it("falls back to system for an unrecognised role", () => {
     expect(messageRole("narrator")).toBe("system");
   });
+
+  /**
+   * The role is a Gateway-supplied string used as a lookup key. On a plain object
+   * these names resolve up the prototype chain, and the function that came back
+   * was written to the archive as a role — where SQLite refused to bind it and
+   * took the whole sync round down with it.
+   */
+  it("does not resolve a role through the prototype chain", () => {
+    expect(messageRole("constructor")).toBe("system");
+    expect(messageRole("__proto__")).toBe("system");
+    expect(messageRole("toString")).toBe("system");
+  });
 });
 
 describe("history page projection", () => {
@@ -44,8 +62,8 @@ describe("history page projection", () => {
     const page = projectHistoryPage(
       {
         messages: [
-          { role: "user", content: "hello", timestamp: 1_000, __openclaw: { id: "m1", seq: 1 } },
-          { role: "assistant", content: "hi", timestamp: 2_000, __openclaw: { id: "m2", seq: 2 } },
+          { role: "user", content: "hello", timestamp: OBSERVED_AT - 4_000, __openclaw: { id: "m1", seq: 1 } },
+          { role: "assistant", content: "hi", timestamp: OBSERVED_AT - 3_000, __openclaw: { id: "m2", seq: 2 } },
         ],
         nextOffset: 200,
         hasMore: true,
@@ -56,7 +74,13 @@ describe("history page projection", () => {
     expect(page.hasMore).toBe(true);
     expect(page.nextOffset).toBe(200);
     expect(page.writes).toHaveLength(2);
-    expect(page.writes[0]).toMatchObject({ messageId: "m1", seq: 1, role: "user", content: "hello", createdAt: 1_000 });
+    expect(page.writes[0]).toMatchObject({
+      messageId: "m1",
+      seq: 1,
+      role: "user",
+      content: "hello",
+      createdAt: OBSERVED_AT - 4_000,
+    });
   });
 
   /**
@@ -150,6 +174,25 @@ describe("history page projection", () => {
     );
 
     expect(page.writes[0]!.sessionId).toBe("gen-2");
+  });
+
+  /**
+   * Age is what transcript retention deletes on, so a timestamp is not a display
+   * detail here. A seconds-epoch read as milliseconds dates every message to 1970,
+   * and the first retention pass would erase the archive.
+   */
+  it("refuses a timestamp that is a seconds epoch, and one from the future", () => {
+    const page = projectHistoryPage(
+      {
+        messages: [
+          { role: "user", content: "seconds", timestamp: 1_775_000_000, __openclaw: { seq: 1 } },
+          { role: "user", content: "ahead", timestamp: OBSERVED_AT + 60_000, __openclaw: { seq: 2 } },
+        ],
+      },
+      base,
+    );
+
+    expect(page.writes.map((write) => write.createdAt)).toEqual([OBSERVED_AT, OBSERVED_AT]);
   });
 
   it("reports which aliases matched so a real Gateway can be diffed against the guesses", () => {

@@ -49,7 +49,14 @@ const now = Date.now();
  * the same number here that the call used, or the paging verdict this prints is
  * about a request nobody made.
  */
-const requestLimit = Number.parseInt(process.argv[3] ?? "", 10) || HISTORY_PAGE_LIMIT;
+const limitArgument = (process.argv[3] ?? "").trim();
+// Whole positive integers only. `parseInt` reads `30x` as 30 and `-5` as -5, and
+// a negative limit makes every page look full — this script exists to report the
+// paging verdict, so it may not invent one out of a typo and say nothing.
+const requestLimit = /^[1-9]\d*$/.test(limitArgument) ? Number(limitArgument) : HISTORY_PAGE_LIMIT;
+if (limitArgument && requestLimit !== Number(limitArgument)) {
+  process.stderr.write(`ignoring limit "${limitArgument}"; using ${HISTORY_PAGE_LIMIT}\n`);
+}
 
 const MAX_DEPTH = 5;
 

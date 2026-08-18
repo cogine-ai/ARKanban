@@ -186,6 +186,40 @@ describe("SignalStore evidence", () => {
     expect(signals?.toolFailures).toBe(1);
   });
 
+  /**
+   * The state a session is in for the first rounds after transcripts are switched
+   * on: the archive holds the newest page, the events hold the whole run the
+   * collector watched. Scoring the page alone would drop the earlier failures and
+   * let the grade improve as the archive filled in.
+   */
+  it("keeps the older failures when the archive has only caught up to the newest turn", () => {
+    const repo = repository();
+    session(repo, "agent:builder:catching-up");
+    toolEvent(repo, "agent:builder:catching-up", "t1", "error", "exec", NOW - 9_000);
+    toolEvent(repo, "agent:builder:catching-up", "t2", "error", "exec", NOW - 8_000);
+    toolEvent(repo, "agent:builder:catching-up", "t3", "error", "deploy", NOW - 7_000);
+    toolResult(repo, "agent:builder:catching-up", 40, "search", false, NOW - 1_000);
+
+    const signals = repo.signals.recompute("agent:builder:catching-up", NOW);
+
+    expect(signals?.toolFailures).toBe(3);
+    expect(signals?.consecutiveFailureMax).toBe(3);
+  });
+
+  it("switches to the archive once it holds more than the events did", () => {
+    const repo = repository();
+    session(repo, "agent:builder:caught-up");
+    toolEvent(repo, "agent:builder:caught-up", "t1", "error", "exec", NOW - 9_000);
+    for (const [index, failed] of [true, true, false, false].entries()) {
+      toolResult(repo, "agent:builder:caught-up", index, "exec", failed, NOW - 8_000 + index);
+    }
+
+    const signals = repo.signals.recompute("agent:builder:caught-up", NOW);
+
+    // Two, not three: the event and the first archived result are the same call.
+    expect(signals?.toolFailures).toBe(2);
+  });
+
   it("leaves a compacted generation out rather than counting its results twice", () => {
     const repo = repository();
     session(repo, "agent:builder:compacted");

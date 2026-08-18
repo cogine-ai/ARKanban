@@ -2,6 +2,7 @@ import type { DatabaseSync } from "node:sqlite";
 import {
   SIGNAL_ALGORITHM_VERSION,
   computeSessionSignals,
+  tallyToolEvents,
   type ActivityEvidence,
   type SignalEvidence,
   type ToolEventEvidence,
@@ -182,8 +183,16 @@ export class SignalStore {
    * states the outcome outright in `is_error`; an observation only carries a
    * lifecycle phase whose failure vocabulary this codebase had to guess. Both
    * describe the same calls, so they are alternatives rather than additions —
-   * summing them would charge one failed call twice — and the transcript wins
-   * where it exists, because it is both authoritative and ordered.
+   * summing them would charge one failed call twice — so the one that settled
+   * more calls is the one scored, with the transcript taking a tie because its
+   * verdicts are stated rather than inferred.
+   *
+   * "Whichever saw more" rather than "the transcript whenever it has anything":
+   * an archive is built a page at a time, and a session mid-backfill holds only
+   * its newest page. Letting two archived results speak for a session whose
+   * events recorded ten would drop the older failures, the streak they formed and
+   * the retries after them — and the grade would improve as the archive grew,
+   * which is the opposite of what collecting more evidence should do.
    *
    * Ordering by `occurred_at` / `created_at` is what makes failure streaks and
    * retry loops readable at all.
@@ -265,12 +274,17 @@ export class SignalStore {
       };
     });
 
+    // Every archived row is a settled call by construction: it is there because
+    // the Gateway stated an outcome for it. Observations have to be counted,
+    // since a `start` with no recorded end settles nothing.
+    const settledObservations = tallyToolEvents(observedTools).settled;
+
     return {
       sessionKey: String(session.session_key),
       lastActivityAt: Number(session.last_activity_at ?? 0),
       hasActiveRun: Number(session.has_active_run ?? 0) === 1,
       activities,
-      toolEvents: archivedTools.length > 0 ? archivedTools : observedTools,
+      toolEvents: archivedTools.length >= settledObservations ? archivedTools : observedTools,
     };
   }
 

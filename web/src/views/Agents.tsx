@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useMemo } from "react";
 import type { ActivitySnapshot, AgentOverview, UpcomingSchedule } from "../../../src/contracts";
 import { AgentCost, ROLLUP_WINDOWS } from "../components/AgentCost";
 import { useScheduleNow } from "../hooks/use-schedule-now";
@@ -56,7 +56,6 @@ function AgentCard({ agent, live }: { agent: AgentOverview; live: LiveCounts }) 
           </span>
         </Link>
         <span className="agent-badges">
-          {agent.kind === "system" ? <span className="agent-badge system">SYSTEM</span> : null}
           {agent.origin === "observed" ? (
             <span className="agent-badge inferred" title="Inferred from observed activity; not in the Gateway roster">
               INFERRED
@@ -124,7 +123,6 @@ function AgentCard({ agent, live }: { agent: AgentOverview; live: LiveCounts }) 
 export function AgentsView() {
   const { snapshot } = useCollector();
   const { agents, error } = useAgents();
-  const [showSystem, setShowSystem] = useState(false);
 
   const live = useMemo(() => liveCountsByAgent(snapshot), [snapshot]);
 
@@ -139,41 +137,30 @@ export function AgentsView() {
     ));
   }, [agents, live]);
 
-  const primary = sorted.filter((agent) => agent.kind !== "system");
-  const system = sorted.filter((agent) => agent.kind === "system");
   const emptyCounts: LiveCounts = { running: 0, attention: 0, schedules: [] };
 
   return (
     <section className="surface view-surface">
       <div className="view-heading">
         <div><span className="eyebrow">AGENT ROSTER</span><h1>Agents</h1></div>
-        <span className="count-chip">{primary.length} agents{system.length > 0 ? ` · ${system.length} system` : ""}</span>
+        <span className="count-chip">{sorted.length} agents</span>
       </div>
 
       {error ? <div className="inline-error">{error}</div> : null}
 
-      {agents && primary.length === 0 && system.length === 0 ? (
+      {agents && sorted.length === 0 ? (
         <div className="simple-empty">No agent has been observed yet. The roster is built from the Gateway, not from configuration.</div>
       ) : null}
 
+      {/* One list, because the roster carries nothing that separates a built-in
+          agent from a configured one: `agents.list` publishes no kind at all on
+          2026.7.1-2, so every agent projects as `unknown`. A collapsed "System
+          agents" section was therefore a section that could never appear, and
+          inferring membership from something else — say, only ever triggered by
+          cron — would be a distinction this collector invented rather than read. */}
       <div className="agent-grid">
-        {primary.map((agent) => <AgentCard key={agent.id} agent={agent} live={live.get(agent.id) ?? emptyCounts} />)}
+        {sorted.map((agent) => <AgentCard key={agent.id} agent={agent} live={live.get(agent.id) ?? emptyCounts} />)}
       </div>
-
-      {system.length > 0 ? (
-        <div className="agent-system-group">
-          {/* Collapsed by default, matching how the OpenClaw client treats the
-              system roster: present, but not what an operator came to look at. */}
-          <button className="agent-system-toggle" onClick={() => setShowSystem((current) => !current)} aria-expanded={showSystem}>
-            <span aria-hidden="true">{showSystem ? "▾" : "▸"}</span> System agents ({system.length})
-          </button>
-          {showSystem ? (
-            <div className="agent-grid">
-              {system.map((agent) => <AgentCard key={agent.id} agent={agent} live={live.get(agent.id) ?? emptyCounts} />)}
-            </div>
-          ) : null}
-        </div>
-      ) : null}
     </section>
   );
 }

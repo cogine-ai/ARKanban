@@ -188,7 +188,7 @@ patch.totalTokens = deriveSessionTotalTokens({ usage: lastCallUsage, contextToke
 2. **消息级 `isError` 没被读**。`chat.history` 的工具结果带 `isError`——真机那 30 条里有 13 条带这个字段、其中 3 条为 true。派生信号现在从 activities/observations 推工具失败，而这里有 Gateway 直接给的结论。（同一批消息的 `usage` 全是零，见 §2.6，别指望它。）
 3. **`peakContextTokens` 没有数据源**，而 `sessions.list` 的 `totalTokens` 就是上下文占用量（§2.7）。要接的话得单独走一条不进成本聚合的写入路径——直接写进用量快照会让零 token 的会话进入成本视图。
 4. **audit 采集**完全没实现（§3）。
-5. **Agents 页的「系统 agent 折叠」没有数据来源**。`web/src/views/Agents.tsx` 按 `agent.kind === "system"` 分组，而名册里没有任何字段能区分内建 agent，真机上所有 agent 都会落在主列表。要么找别的信号（例如只由 cron 触发的 agent），要么去掉这个分组。
+5. ~~**Agents 页的「系统 agent 折叠」没有数据来源**~~ 已按后者处理：分组与 SYSTEM 徽号都已删除，规格第 7 节与 §9.6 同步修订。换别的信号（例如只由 cron 触发的 agent）是采集器自己编的区分，不做。`kind` 仍留在契约里，别的 Gateway 版本发这个字段时它就是诚实数据。
 
 ---
 

@@ -200,7 +200,6 @@ export function AgentDetailView({ agentId }: { agentId: string }) {
           </div>
         </div>
         <span className="agent-badges">
-          {agent.kind === "system" ? <span className="agent-badge system">SYSTEM</span> : null}
           {agent.origin === "observed" ? (
             <span className="agent-badge inferred" title="Inferred from observed activity; not in the Gateway roster">
               INFERRED

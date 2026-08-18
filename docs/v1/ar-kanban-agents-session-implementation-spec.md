@@ -658,7 +658,7 @@ web/src/state/use-paged-query.ts      （新增，供会话列表使用）
 每个 Agent 一张卡，四段信息：
 
 ```text
-身份    displayName · runtime · model · kind 标记（system 类需明确区分）
+身份    displayName · runtime · model
 此刻    活跃会话数 · 活跃 run 数 · 当前 attention 数
 近期    24h 与 7d 的完成数、成功率、平均时长
 未来    未来 1 小时的 cron 预测数（直接复用现有 UpcomingScheduleSnapshot）
@@ -667,7 +667,7 @@ web/src/state/use-paged-query.ts      （新增，供会话列表使用）
 
 「未来」这一段是本产品相对 AgentsView 的差异点：AgentsView 没有 Gateway 的调度视角，拿不到这个数。数据已经在 `ActivitySnapshot.schedule` 里算好了，直接按 `agentId` 分组即可。
 
-卡片排序默认按「当前活跃 → 最近活动时间」。`kind: "system"` 的 Agent 默认折叠，与 OpenClaw 客户端对 system roster 的处理保持一致。
+卡片排序默认按「当前活跃 → 最近活动时间」，**一个列表，不分区**。本规格早先要求把 `kind: "system"` 的 Agent 折叠起来（与 OpenClaw 客户端对 system roster 的处理一致），真机校准推翻了这条：`agents.list` 在 2026.7.1-2 上根本不发 `kind`，名册里也没有任何字段能区分内建 agent，于是每个 agent 都投影成 `unknown`，那个折叠区永远不会出现。换别的信号推断（例如「只由 cron 触发的算系统」）是这个采集器自己编出来的区分，不是从 Gateway 读到的事实，因此不做。`kind` 仍留在契约与 API 里：别的 Gateway 版本若真发这个字段，它是诚实数据，只是界面不再据此分区。
 
 Agent 详情页（`/agents/:agentId`）在卡片之上多出的那一层是**结局分布**：卡片给的是成功率，而成功率分不清「失败」「被取消」「超时」和「压根没有结论」。这四种情况要采取的行动完全不同，压成一个百分比就看不出来了。分布以按比例的色条呈现，未分类的一段与失败段并列可见——`unknown` 占了半数的 Agent，问题往往出在观测面而不是它本身。其余分段（此刻、成本、归属 cron、近期会话）复用总览卡的口径与组件，避免同一个数在两处算法不同。
 
@@ -823,7 +823,7 @@ openclaw-collector purge-transcripts --config <path>
 - 四个既有 View 的路径与旧行为等价。
 - 会话列表的筛选与排序可通过 URL 完整复原。
 - 会话列表在用户滚动期间不因 SSE 自动重排。
-- `kind: "system"` 的 Agent 默认折叠。
+- Agents 页只有一个名册列表：名册不提供任何能区分内建 agent 的字段，所以不存在 system 折叠区，也不用别的信号去猜。
 - 用量不可用时显示 coverage 状态，而不是显示 0。
 - 检索输入连打不产生每键一次请求：防抖后只发一次，被取代的在途请求被 abort，且取消不显示为错误。
 - 换一个查询词后，上一个词的命中行与命中数不再出现在结果块里。

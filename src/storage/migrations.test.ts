@@ -1,4 +1,4 @@
-import { existsSync, mkdtempSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -111,6 +111,29 @@ describe("schema migrations", () => {
 
     expect(existsSync(result.backupPath!)).toBe(true);
     expect(existsSync(stale)).toBe(false);
+  });
+
+  /**
+   * The copy cannot be taken under the write lock, because folding the WAL into
+   * the main file is not allowed inside a transaction. So two processes starting
+   * together can both get here, and the second may arrive after the first has
+   * finished migrating: overwriting then replaced the pre-migration copy with a
+   * post-migration one, under a name that promises the opposite. The same applies
+   * to a start that follows an upgrade which died partway.
+   */
+  it("keeps the pre-migration copy an earlier start had already taken", () => {
+    const databasePath = path.join(workspace(), "legacy.sqlite");
+    legacyDatabase(databasePath);
+    const backup = `${databasePath}.pre-v${TARGET_SCHEMA_VERSION}.bak`;
+    writeFileSync(backup, "the copy taken before the upgrade began");
+
+    const db = new DatabaseSync(databasePath);
+    cleanups.push(() => db.close());
+    const result = applyMigrations(db, databasePath);
+
+    expect(result.applied.length).toBeGreaterThan(0);
+    expect(result.backupPath).toBe(backup);
+    expect(readFileSync(backup, "utf8")).toBe("the copy taken before the upgrade began");
   });
 
   /**

@@ -6,6 +6,7 @@ import { CollectorRepository } from "../storage/repository.js";
 import {
   BACKFILL_SESSION_BUDGET,
   ROUND_REQUEST_BUDGET,
+  TRANSCRIPT_SYNC_MS,
   TranscriptSynchronizer,
   classifyHistoryFailure,
   type HistoryRequest,
@@ -373,8 +374,10 @@ describe("transcript sync capacity", () => {
       "agent:builder:cold": [turn(0), turn(1), turn(2)],
     });
     // Tight enough to be over budget, loose enough that dropping the cold session
-    // gets back under it.
-    const sync = synchronizer(repo, request, { maxBytes: Math.floor(repo.transcripts.usage().storedBytes * 0.6) });
+    // gets back under it — measured, not estimated: two equal sessions here keep
+    // 68% of their pages after one of them goes, because index and FTS pages do
+    // not shrink in step with the text they cover.
+    const sync = synchronizer(repo, request, { maxBytes: Math.floor(repo.transcripts.usage().storedBytes * 0.8) });
 
     const outcome = await sync.runOnce(healthy);
 
@@ -427,6 +430,38 @@ describe("transcript sync capacity", () => {
     const written = repo.transcripts.usage().contentBytes - measured.contentBytes;
     expect(written).toBeGreaterThan(0);
     expect(sync.archiveBytes).toBe(measured.storedBytes + Math.round(written * overhead));
+  });
+
+  /**
+   * A tail read asks for the newest page every round, so the same messages come
+   * back over and over. `withoutKnown` filters them only when the Gateway gives a
+   * message an id; otherwise the idempotency key drops them at the insert and the
+   * file does not grow. Charging the estimate for those writes anyway made an idle
+   * session climb towards the ceiling on text that was already stored, until the
+   * archive started evicting transcripts to make room for nothing.
+   */
+  it("does not charge the estimate for a page it already had", async () => {
+    const repo = repository();
+    seedSession(repo, "agent:builder:live", { lastActivityAt: NOW });
+    // Numbered but not identified, which is what makes the duplicates reach the
+    // insert instead of being filtered before it.
+    const unidentified = (seq: number) => ({
+      role: "user",
+      content: `message ${seq}`,
+      timestamp: NOW - 1_000 + seq,
+      __openclaw: { seq },
+    });
+    const { request } = gateway({ "agent:builder:live": [unidentified(0), unidentified(1)] });
+    const sync = synchronizer(repo, request);
+
+    const first = await sync.runOnce(healthy);
+    const afterFirst = sync.archiveBytes;
+    const second = await sync.runOnce({ ...healthy, now: NOW + TRANSCRIPT_SYNC_MS });
+
+    expect(first.inserted).toBe(2);
+    expect(afterFirst).toBeGreaterThan(0);
+    expect(second.inserted).toBe(0);
+    expect(sync.archiveBytes).toBe(afterFirst);
   });
 
   /**

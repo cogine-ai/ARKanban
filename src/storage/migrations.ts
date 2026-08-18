@@ -388,9 +388,17 @@ function hasContent(db: DatabaseSync): boolean {
 
 function backupBeforeMigration(db: DatabaseSync, databasePath: string, target: number): string | undefined {
   if (!existsSync(databasePath)) return undefined;
+  const backupPath = `${databasePath}.pre-v${target}.bak`;
+  // The copy cannot be taken under the write lock — folding the WAL into the main
+  // file is not permitted inside a transaction — so two processes starting at the
+  // same moment can both reach this point, and the second may arrive after the
+  // first has already migrated. Overwriting then replaced the pre-migration copy
+  // with a post-migration one under a name that says otherwise, which is the one
+  // way this file can fail the only job it has. Whatever is already here was
+  // copied before this target's migration by definition, so it is kept.
+  if (existsSync(backupPath)) return backupPath;
   // WAL content must be folded into the main file before it can be copied.
   db.exec("PRAGMA wal_checkpoint(TRUNCATE)");
-  const backupPath = `${databasePath}.pre-v${target}.bak`;
   copyFileSync(databasePath, backupPath);
   chmodSync(backupPath, 0o600);
   return backupPath;

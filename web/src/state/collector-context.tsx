@@ -83,7 +83,23 @@ export function CollectorProvider({ children }: { children: ReactNode }) {
   const [streamGeneration, setStreamGeneration] = useState(0);
   const refreshTimer = useRef<number | undefined>(undefined);
 
-  const retryLive = useCallback(() => setStreamGeneration((generation) => generation + 1), []);
+  /**
+   * A manual retry starts a fresh cycle rather than leaving the notice as it was.
+   *
+   * Without this the banner kept saying the stream had stopped while the new one
+   * was still connecting, so the click looked like it had done nothing. `lostAt`
+   * survives on purpose: what is on screen is as old as the original loss, and
+   * restamping it would understate how stale the page is if the retry fails too.
+   */
+  const retryLive = useCallback(() => {
+    setLive((current) => ({ state: "connecting", attempts: 0, ...(current.lostAt ? { lostAt: current.lostAt } : {}) }));
+    // The banner the click responds to is written from this, and a failure that has
+    // been superseded by an attempt in flight would otherwise sit next to a notice
+    // that has already gone. Either outcome restates it: the stream reports its own
+    // errors, and the refresh that follows a successful open reports the rest.
+    setError(undefined);
+    setStreamGeneration((generation) => generation + 1);
+  }, []);
 
   const refresh = useCallback(async () => {
     try {

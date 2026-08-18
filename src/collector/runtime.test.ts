@@ -286,6 +286,81 @@ describe("CollectorRuntime", () => {
   });
 
   /**
+   * A Gateway with nothing running yet cannot be asked about `chat.history`: the
+   * probe has to name a session, and there is none to name. That left the verdict
+   * unknown for the rest of the connection, so a build that does not advertise the
+   * method archived nothing for as long as it stayed up — however many sessions
+   * started in the meantime. The probe is retried as the sessions arrive.
+   */
+  it("probes chat.history once the first session shows up, not only at connect", async () => {
+    const server = new WebSocketServer({ host: "127.0.0.1", port: 0 });
+    await once(server, "listening");
+    const address = server.address();
+    if (!address || typeof address === "string") throw new Error("mock gateway did not bind TCP");
+    const historyAsked: Array<Record<string, unknown>> = [];
+    let sessionsListed = 0;
+    server.on("connection", (socket) => {
+      socket.send(JSON.stringify({ type: "event", event: "connect.challenge", payload: { nonce: "late-probe", ts: Date.now() } }));
+      socket.on("message", (raw) => {
+        const request = JSON.parse(raw.toString()) as { id: string; method: string; params?: Record<string, unknown> };
+        const respond = (payload: unknown) => socket.send(JSON.stringify({ type: "res", id: request.id, ok: true, payload }));
+        const refuse = (message: string) =>
+          socket.send(JSON.stringify({ type: "res", id: request.id, ok: false, error: { code: "METHOD_NOT_FOUND", message } }));
+        if (request.method === "connect") respond({ type: "hello-ok", protocol: 4, server: { version: "runtime-test", connId: "late" }, features: { methods: ["tasks.list", "sessions.list", "sessions.subscribe"], events: ["task", "agent", "sessions.changed", "session.tool"] }, snapshot: {}, auth: { role: "operator", scopes: ["operator.read"] }, policy: { maxPayload: 1_000_000, maxBufferedBytes: 1_000_000, tickIntervalMs: 30_000 } });
+        else if (request.method === "sessions.subscribe") respond({ subscribed: true });
+        else if (request.method === "tasks.list") respond({ tasks: [] });
+        else if (request.method === "sessions.list") {
+          sessionsListed += 1;
+          // Idle at connect, busy a moment later.
+          const sessions =
+            sessionsListed === 1
+              ? []
+              : [{ key: "agent:builder:late", agentId: "builder", label: "Session", status: "running", hasActiveRun: true, startedAt: 1_000 }];
+          respond({ sessions, hasMore: false, nextOffset: sessions.length });
+        } else if (request.method === "chat.history") {
+          historyAsked.push(request.params ?? {});
+          respond({ sessionKey: request.params?.sessionKey, sessionId: "gen-late", messages: [] });
+        } else refuse(`unknown method ${request.method}`);
+      });
+    });
+
+    const directory = mkdtempSync(path.join(tmpdir(), "collector-runtime-late-probe-"));
+    const config: ResolvedCollectorConfig = {
+      gateway: { name: "test", url: `ws://127.0.0.1:${address.port}`, tokenEnv: "TEST_GATEWAY_TOKEN", token: "test-token" },
+      server: { host: "127.0.0.1", port: 47_127 },
+      storage: {
+        path: path.join(directory, "collector.sqlite"),
+        terminalRetentionDays: 1,
+        usageRetentionDays: 14,
+        sessionRetentionDays: 90,
+        transcriptRetentionDays: 180,
+        transcriptMaxBytes: 64 * 1024 * 1024,
+        transcriptSync: "enabled",
+      },
+      reconcile: { tasksMs: 60_000, sessionsMs: 150 },
+      ui: { recentLimit: 200 },
+      configPath: path.join(directory, "config.json"),
+    };
+    const runtime = new CollectorRuntime(config);
+    cleanups.push(async () => {
+      await runtime.stop();
+      for (const socket of server.clients) socket.terminate();
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+      rmSync(directory, { recursive: true, force: true });
+    });
+    runtime.start();
+
+    await vi.waitFor(() => expect(runtime.getCapabilities()["chat.history"]).toBe("live"), { timeout: 5_000 });
+    // The verdict came from the session that appeared after connect. Nothing was
+    // asked before it existed: a probe about an invented key reports on the key.
+    expect(sessionsListed).toBeGreaterThan(1);
+    expect(historyAsked.map((params) => params.sessionKey)).toEqual(
+      historyAsked.map(() => "agent:builder:late"),
+    );
+    expect(historyAsked[0]).toMatchObject({ limit: 1 });
+  });
+
+  /**
    * A deletion is the one change a client cannot infer. Retention runs on its own
    * six-hour timer, and on an idle collector nothing else emits a frame — so rows
    * this pass removed stayed on an open page, listed and linkable and gone, until

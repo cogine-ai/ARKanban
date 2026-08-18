@@ -59,8 +59,10 @@ describe("TranscriptArchive", () => {
     seedSession(repo, "agent:builder:one");
     const batch = [message({ seq: 0, content: "first" }), message({ seq: 1, content: "second" })];
 
-    expect(repo.transcripts.append(batch)).toEqual({ inserted: 2, skipped: 0, divergent: 0 });
-    expect(repo.transcripts.append(batch)).toEqual({ inserted: 0, skipped: 2, divergent: 0 });
+    expect(repo.transcripts.append(batch)).toEqual({ inserted: 2, insertedBytes: 11, skipped: 0, divergent: 0 });
+    // No bytes on the replay: the second call wrote nothing, so a caller sizing
+    // the archive from this number does not grow it for a page it re-read.
+    expect(repo.transcripts.append(batch)).toEqual({ inserted: 0, insertedBytes: 0, skipped: 2, divergent: 0 });
     expect(repo.transcripts.listMessages("agent:builder:one")).toHaveLength(2);
   });
 
@@ -116,7 +118,7 @@ describe("TranscriptArchive", () => {
 
     const second = repo.transcripts.append([message({ seq: 0, content: "a different wording entirely" })]);
 
-    expect(second).toEqual({ inserted: 0, skipped: 1, divergent: 1 });
+    expect(second).toEqual({ inserted: 0, insertedBytes: 0, skipped: 1, divergent: 1 });
     const stored = repo.transcripts.listMessages("agent:builder:one");
     expect(stored).toHaveLength(1);
     expect(stored[0]).toMatchObject({ content: "the original wording", divergent: true });
@@ -129,7 +131,7 @@ describe("TranscriptArchive", () => {
 
     const second = repo.transcripts.append([message({ seq: 0, content: "unchanged" })]);
 
-    expect(second).toEqual({ inserted: 0, skipped: 1, divergent: 0 });
+    expect(second).toEqual({ inserted: 0, insertedBytes: 0, skipped: 1, divergent: 0 });
     expect(repo.transcripts.listMessages("agent:builder:one")[0]).toMatchObject({ divergent: false });
   });
 
@@ -178,12 +180,43 @@ describe("TranscriptArchive", () => {
 
     const before = repo.transcripts.usage();
     expect(before.storedBytes).toBeGreaterThan(0);
-    const evicted = repo.transcripts.evictOldestSessions(Math.floor(before.storedBytes * 0.6));
+    const evicted = repo.transcripts.evictOldestSessions(Math.floor(before.storedBytes * 0.8));
 
     expect(evicted.sessions).toBe(1);
     expect(evicted.reachedTarget).toBe(true);
     expect(repo.transcripts.listMessages("agent:builder:old")).toEqual([]);
     expect(repo.transcripts.listMessages("agent:builder:new")).toHaveLength(40);
+  });
+
+  /**
+   * Half the text does not free half the pages. Indexes and FTS segments are
+   * allocated in whole blocks, and their cost per message rises as the archive
+   * gets smaller — a two-session archive here keeps 68% of its pages after losing
+   * 50% of its text. A content-byte estimate cannot see that, so it reported the
+   * ceiling as met while the file was still over it, and the caller went back to
+   * archiving into an archive with no room. The verdict is measured after the
+   * pages have actually been released.
+   */
+  it("reports the ceiling as missed when freeing the text did not free the pages", () => {
+    const repo = repository();
+    seedSession(repo, "agent:builder:old", "builder", 1_000);
+    seedSession(repo, "agent:builder:new", "builder", 9_000);
+    const bulk = (sessionKey: string) =>
+      Array.from({ length: 40 }, (_unused, index) =>
+        message({ sessionKey, seq: index, content: `padding ${"x".repeat(500)} ${index}` }),
+      );
+    repo.transcripts.append(bulk("agent:builder:old"));
+    repo.transcripts.append(bulk("agent:builder:new"));
+
+    const before = repo.transcripts.usage();
+    // Removing one of two equal sessions clears half the text, which is more than
+    // this target asks for in content terms and still not enough in page terms.
+    const target = Math.floor(before.storedBytes * 0.6);
+    const evicted = repo.transcripts.evictOldestSessions(target);
+
+    expect(evicted.sessions).toBe(1);
+    expect(evicted.reachedTarget).toBe(false);
+    expect(repo.transcripts.usage().storedBytes).toBeGreaterThan(target);
   });
 
   /**
@@ -227,7 +260,7 @@ describe("TranscriptArchive", () => {
     repo.transcripts.append(bulk("agent:builder:cold"));
 
     const before = repo.transcripts.usage();
-    const evicted = repo.transcripts.evictOldestSessions(Math.floor(before.storedBytes * 0.6), {
+    const evicted = repo.transcripts.evictOldestSessions(Math.floor(before.storedBytes * 0.8), {
       protectSince: 7_000,
     });
 

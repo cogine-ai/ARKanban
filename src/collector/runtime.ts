@@ -531,6 +531,10 @@ export class CollectorRuntime {
       this.deriveSyncState();
       this.emitStatus();
     }
+    // Outside the boundary above so it can neither delay the snapshot nor be
+    // mistaken for a session-sync failure: by now the archive holds whatever this
+    // pass found, which is the only thing the `chat.history` probe was missing.
+    await this.settleHistoryProbe();
   }
 
   /**
@@ -648,6 +652,28 @@ export class CollectorRuntime {
     const probed = this.capabilities.stateOf("chat.history");
     if (probed !== "unknown") return probed === "live";
     return new Set(this.gatewayHello?.features.methods ?? []).has("chat.history");
+  }
+
+  /**
+   * Retries the `chat.history` probe until it has a verdict.
+   *
+   * The probe has to name a session that exists, so the one taken on connect
+   * cannot form a call while the archive is still empty — and on a Gateway that
+   * does not advertise the method, the connection would then archive nothing for
+   * as long as it stayed up, which is the failure probing was added to remove. A
+   * transient failure had the same shape: `error` is not `live`, so one bad moment
+   * at connect disabled transcripts until the next reconnect.
+   *
+   * Called from the session pass because that is where the missing precondition
+   * arrives. `probeAll` skips methods already settled, so this costs one request
+   * per pass only while the answer is genuinely unknown, and nothing afterwards.
+   */
+  private async settleHistoryProbe(): Promise<void> {
+    if (this.config.storage.transcriptSync !== "enabled") return;
+    const state = this.capabilities.stateOf("chat.history");
+    if (state !== "unknown" && state !== "error") return;
+    if (this.repository.mostRecentSessionKey() === undefined) return;
+    await this.probeCapabilities();
   }
 
   /** Counts and watermarks only; never message text. */

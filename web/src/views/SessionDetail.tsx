@@ -211,6 +211,14 @@ function TranscriptPanel({ sessionKey, revision }: { sessionKey: string; revisio
       return;
     }
     const controller = new AbortController();
+    // Matches for the term that was in the box a keystroke ago are not an answer
+    // to this one. The count beside the field is drawn from them, so leaving them
+    // up reports the old query's tally against the new query's text.
+    //
+    // `error` is deliberately left alone: it also carries a failure to load the
+    // transcript itself, and clearing it here would erase the only explanation
+    // for an empty panel.
+    setHits(undefined);
     setSearching(true);
     const timer = setTimeout(() => {
       void (async () => {

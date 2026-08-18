@@ -42,6 +42,12 @@ export function TranscriptSearch({ query, agentId }: { query: string; agentId?: 
     // Aborted rather than merely ignored: a superseded trigram query is work the
     // server is doing for an answer nobody will read.
     const controller = new AbortController();
+    // The hits on screen answer the previous query. Leaving them up while the next
+    // one runs shows them under a different search term — and the snippet around
+    // each match is cut for the term in the box, so a stale hit is rendered as
+    // though the new term were somewhere in it.
+    setResult(undefined);
+    setError(undefined);
     setSearching(true);
     void (async () => {
       try {

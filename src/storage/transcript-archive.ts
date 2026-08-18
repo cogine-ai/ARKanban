@@ -134,8 +134,8 @@ export class TranscriptArchive {
    * is what the flag exists to prevent: a transcript that reads as a faithful copy
    * while upstream has since said something else in that turn.
    */
-  append(writes: MessageWrite[]): { inserted: number; skipped: number; divergent: number } {
-    if (writes.length === 0) return { inserted: 0, skipped: 0, divergent: 0 };
+  append(writes: MessageWrite[]): { inserted: number; insertedBytes: number; skipped: number; divergent: number } {
+    if (writes.length === 0) return { inserted: 0, insertedBytes: 0, skipped: 0, divergent: 0 };
     const statement = this.db.prepare(`
       INSERT INTO session_messages (
         session_key, session_id, message_id, seq, role, channel, tool_name,
@@ -150,10 +150,12 @@ export class TranscriptArchive {
       WHERE session_key = ? AND seq = ? AND session_id = ? AND divergent = 0 AND content <> ?
     `);
     let inserted = 0;
+    let insertedBytes = 0;
     let divergent = 0;
     this.db.exec("BEGIN IMMEDIATE");
     try {
       for (const write of writes) {
+        const contentBytes = Buffer.byteLength(write.content, "utf8");
         const result = statement.run(
           write.sessionKey,
           write.sessionId ?? "",
@@ -163,12 +165,19 @@ export class TranscriptArchive {
           write.channel ?? null,
           write.toolName ?? null,
           write.content,
-          Buffer.byteLength(write.content, "utf8"),
+          contentBytes,
           write.createdAt,
           write.observedAt,
         );
         if (Number(result.changes) > 0) {
           inserted += 1;
+          // Reported so the caller's capacity estimate can grow by what landed
+          // rather than by what it offered. A page the archive already held adds
+          // nothing to the file, and counting it did: a Gateway that does not
+          // number or id its messages has every tail re-read look like new bytes,
+          // and the estimate walked up to the ceiling on rows that were never
+          // written.
+          insertedBytes += contentBytes;
           continue;
         }
         divergent += Number(
@@ -180,7 +189,7 @@ export class TranscriptArchive {
       this.db.exec("ROLLBACK");
       throw error;
     }
-    return { inserted, skipped: writes.length - inserted, divergent };
+    return { inserted, insertedBytes, skipped: writes.length - inserted, divergent };
   }
 
   /**
@@ -496,10 +505,10 @@ export class TranscriptArchive {
       doomed.push(String(candidate.session_key));
       contentBudget -= Number(candidate.bytes);
     }
-    // Whatever is left owing after every unprotected session has been taken is
-    // held by sessions this pass refuses to touch.
-    const reachedTarget = contentBudget <= 0;
-    if (doomed.length === 0) return { sessions: 0, messages: 0, reachedTarget };
+    // With nothing left to take, whatever is still owing is held by the sessions
+    // this pass refuses to touch — the estimate is the only answer available,
+    // since no delete happened to measure.
+    if (doomed.length === 0) return { sessions: 0, messages: 0, reachedTarget: contentBudget <= 0 };
 
     const statement = this.db.prepare("DELETE FROM session_messages WHERE session_key = ?");
     // The watermark has to come back with the text. Left alone it would keep
@@ -524,6 +533,12 @@ export class TranscriptArchive {
       throw error;
     }
     this.compactIndex();
+    // Measured, not predicted. The selection above works in content bytes scaled
+    // by a ratio, while the budget is in database pages, and pages are allocated
+    // in whole blocks that a content estimate cannot see. Saying "full" is a claim
+    // that new messages are not being stored, so it is worth one more `dbstat`
+    // walk on a path that has just deleted whole sessions anyway.
+    const reachedTarget = this.usage().storedBytes <= targetStoredBytes;
     return { sessions: doomed.length, messages, reachedTarget };
   }
 

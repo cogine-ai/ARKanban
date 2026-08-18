@@ -1551,13 +1551,6 @@ export class CollectorRepository {
    * here rather than by the database.
    */
   pruneSessions(cutoff: number): number {
-    const doomed = (
-      this.db
-        .prepare("SELECT session_key FROM sessions WHERE archived = 1 AND last_activity_at < ?")
-        .all(cutoff) as Array<Record<string, unknown>>
-    ).map((row) => String(row.session_key));
-    if (doomed.length === 0) return 0;
-
     // Three deletes that only make sense together. Run separately, a crash
     // between them left the database in a state no code accounts for: a session
     // whose transcript is gone but which still lists as archived and searchable,
@@ -1566,17 +1559,29 @@ export class CollectorRepository {
     let messages = 0;
     this.db.exec("BEGIN IMMEDIATE");
     try {
-      messages = this.transcripts.dropSessionsInTransaction(doomed);
-      removed = Number(
-        this.db.prepare("DELETE FROM sessions WHERE archived = 1 AND last_activity_at < ?").run(cutoff).changes,
-      );
-      this.db
-        .prepare(`
-          UPDATE activities SET session_ref = NULL
-          WHERE session_ref IS NOT NULL
-            AND session_ref NOT IN (SELECT session_key FROM sessions)
-        `)
-        .run();
+      // Chosen under the write lock, so the keys whose messages are dropped are
+      // the same rows the delete below removes. Read beforehand, another writer
+      // could archive a session in between: the predicate would then take a row
+      // whose transcript was never in the list, leaving text behind with no
+      // session to reach it by.
+      const doomed = (
+        this.db
+          .prepare("SELECT session_key FROM sessions WHERE archived = 1 AND last_activity_at < ?")
+          .all(cutoff) as Array<Record<string, unknown>>
+      ).map((row) => String(row.session_key));
+      if (doomed.length > 0) {
+        messages = this.transcripts.dropSessionsInTransaction(doomed);
+        removed = Number(
+          this.db.prepare("DELETE FROM sessions WHERE archived = 1 AND last_activity_at < ?").run(cutoff).changes,
+        );
+        this.db
+          .prepare(`
+            UPDATE activities SET session_ref = NULL
+            WHERE session_ref IS NOT NULL
+              AND session_ref NOT IN (SELECT session_key FROM sessions)
+          `)
+          .run();
+      }
       this.db.exec("COMMIT");
     } catch (error) {
       this.db.exec("ROLLBACK");

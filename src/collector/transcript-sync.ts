@@ -273,9 +273,13 @@ export class TranscriptSynchronizer {
     });
 
     const writes = this.withoutKnown(candidate.sessionKey, page.writes);
-    const { inserted } = this.deps.archive.append(writes);
-    const contentBytes = writes.reduce((total, write) => total + Buffer.byteLength(write.content, "utf8"), 0);
-    this.storedBytes += Math.round(contentBytes * this.overhead);
+    const { inserted, insertedBytes } = this.deps.archive.append(writes);
+    // Only what the insert actually kept. A tail read re-fetches the newest page
+    // every round, and `withoutKnown` can only filter it when the Gateway gives
+    // messages an id; otherwise the duplicates are dropped by the idempotency key
+    // and the file does not grow, so charging the estimate for them would march it
+    // to the ceiling on a session that had stopped changing.
+    this.storedBytes += Math.round(insertedBytes * this.overhead);
 
     // Backfill pages walk backwards, so their sequence numbers sit below the
     // watermark. Reporting this page's own maximum would move the watermark down,

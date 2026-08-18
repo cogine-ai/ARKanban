@@ -35,6 +35,26 @@ describe("projectUsageRow", () => {
   });
 
   /**
+   * The store keeps the newest reading per session, so a reading dated in the
+   * future is never superseded: without this bound one skewed value froze a
+   * session's tokens and cost at that figure permanently.
+   */
+  it("bounds a reading dated ahead of the moment it was read", () => {
+    const skewed = projectUsageRow(
+      { sessionKey: "s", inputTokens: 5, outputTokens: 5, observedAt: OBSERVED_AT + 86_400_000 },
+      { observedAt: OBSERVED_AT },
+    );
+    expect(skewed?.observedAt).toBe(OBSERVED_AT);
+
+    // Seconds read as milliseconds is a wrong unit, not a date in 1970.
+    const seconds = projectUsageRow(
+      { sessionKey: "s", inputTokens: 5, outputTokens: 5, observedAt: Math.floor(OBSERVED_AT / 1000) },
+      { observedAt: OBSERVED_AT },
+    );
+    expect(seconds?.observedAt).toBe(OBSERVED_AT);
+  });
+
+  /**
    * The row shape `sessions.usage` actually returns: the figures are nested in a
    * `usage` object, cost is dollars under `totalCost`, models arrive as
    * `{ provider, model }` pairs, and the unpriced signal is a count.

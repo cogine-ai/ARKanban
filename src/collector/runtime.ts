@@ -12,7 +12,7 @@ import type {
   SourceCoverage,
   UpcomingScheduleSnapshot,
 } from "../contracts.js";
-import type { ResolvedCollectorConfig } from "../config.js";
+import { redactEndpoint, type ResolvedCollectorConfig } from "../config.js";
 import {
   agentIdFromSessionKey,
   attemptPatch,
@@ -290,7 +290,9 @@ export class CollectorRuntime {
       syncReasons: [...this.syncReasons],
       gateway: {
         name: this.config.gateway.name,
-        endpoint: this.config.gateway.url,
+        // Redacted for the same reason the CLI redacts it: `ws://user:pass@host`
+        // is a legal endpoint, and this field is read by a browser page.
+        endpoint: redactEndpoint(this.config.gateway.url),
         connected: this.gateway.isConnected,
         ...(this.gatewayHello?.server.version ? { serverVersion: this.gatewayHello.server.version } : {}),
         ...(this.gatewayHello?.protocol ? { protocolVersion: this.gatewayHello.protocol } : {}),
@@ -553,7 +555,7 @@ export class CollectorRuntime {
     } catch (error) {
       // Recorded as a diagnostic rather than through setSource: source states feed
       // deriveSyncState, and the archive is not allowed to change sync state.
-      this.sessionArchiveError = error instanceof Error ? error.message : String(error);
+      this.sessionArchiveError = storageErrorCode(error);
     }
   }
 
@@ -662,16 +664,29 @@ export class CollectorRuntime {
       };
     } finally {
       this.usageSyncing = false;
-      this.repository.setUsageCoverage(this.usageStatus?.coverage ?? "not_observed");
-      this.repository.setUnreportedUsageSessions(this.usage.unreportedSessions());
-      if ((this.usageStatus?.recorded ?? 0) > 0 || this.usageStatus?.costRefreshed) {
-        this.emitChange({
-          epoch: this.repository.epoch,
-          revision: this.repository.revision,
-          topics: ["usage"],
-          ids: [],
-          reasons: ["usage_sync"],
-        });
+      // Guarded, and skipped once stopping. A round in flight when the process
+      // shuts down reaches this after the database has been closed, and an
+      // exception thrown from a `finally` leaves the enclosing catch behind: it
+      // surfaces as an unhandled rejection from the timer that has no caller to
+      // see it, which is enough to take the process down over bookkeeping nobody
+      // is waiting for.
+      if (!this.stopped) {
+        try {
+          this.repository.setUsageCoverage(this.usageStatus?.coverage ?? "not_observed");
+          this.repository.setUnreportedUsageSessions(this.usage.unreportedSessions());
+          if ((this.usageStatus?.recorded ?? 0) > 0 || this.usageStatus?.costRefreshed) {
+            this.emitChange({
+              epoch: this.repository.epoch,
+              revision: this.repository.revision,
+              topics: ["usage"],
+              ids: [],
+              reasons: ["usage_sync"],
+            });
+          }
+        } catch {
+          // Coverage is re-derived on the next round, so a lost write costs a
+          // stale badge for a minute rather than the collector.
+        }
       }
     }
   }
@@ -1060,7 +1075,25 @@ export class CollectorRuntime {
       this.repository.transcripts.evictOldestSessions(this.config.storage.transcriptMaxBytes);
       this.pruneError = undefined;
     } catch (error) {
-      this.pruneError = error instanceof Error ? error.message : String(error);
+      this.pruneError = storageErrorCode(error);
     }
   }
+}
+
+/**
+ * A storage failure reduced to something safe to serve.
+ *
+ * These reach `/api/v1/diagnostics/field-coverage`, and a SQLite message names
+ * the database file — which is a path through the operator's home directory, and
+ * sometimes a fragment of the statement that failed. The code is what tells an
+ * operator whether the disk is full or the file is locked, which is the whole
+ * reason the field is there.
+ */
+function storageErrorCode(error: unknown): string {
+  if (error instanceof Error) {
+    const code = (error as { code?: unknown }).code;
+    if (typeof code === "string" && code) return code;
+    return error.name;
+  }
+  return "unknown_error";
 }

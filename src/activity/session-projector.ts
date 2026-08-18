@@ -2,6 +2,7 @@ import type { SessionCoverage, SessionKindHint } from "../contracts.js";
 import { FieldInventory, pick } from "../collector/field-inventory.js";
 import type { AgentWrite, SessionWrite } from "../storage/repository.js";
 import { agentIdFromSessionKey, type RawSessionRow } from "./projector.js";
+import { boundedTimestamp } from "./timestamps.js";
 
 /**
  * Projects raw Gateway rows into Session and Agent archive records.
@@ -85,33 +86,6 @@ const KIND_HINTS: Record<string, SessionKindHint> = Object.assign(Object.create(
 
 function asString(value: unknown): string | undefined {
   return typeof value === "string" && value.trim() ? value.trim() : undefined;
-}
-
-function asTimestamp(value: unknown): number | undefined {
-  if (typeof value === "number" && Number.isFinite(value)) return value;
-  if (typeof value === "string" && value.trim()) {
-    const parsed = Date.parse(value);
-    if (Number.isFinite(parsed)) return parsed;
-  }
-  return undefined;
-}
-
-/** Anything older is a unit mismatch — seconds read as milliseconds — not a date. */
-const EARLIEST_PLAUSIBLE_MS = Date.UTC(2015, 0, 1);
-
-/**
- * Bounds a Gateway timestamp by the moment it was observed.
- *
- * A future date is clock skew, and it does real damage here: a session counts as
- * needing rescoring while `computed_at < last_activity_at`, so one dated ahead of
- * now is permanently stale — the recompute loop would rescore it every pass and
- * never reach the rest of the backlog. A date from before this project existed is
- * a wrong unit rather than a time, and is dropped so it cannot drive retention.
- */
-function boundedTimestamp(value: unknown, observedAt: number): number | undefined {
-  const parsed = asTimestamp(value);
-  if (parsed === undefined || parsed < EARLIEST_PLAUSIBLE_MS) return undefined;
-  return Math.min(parsed, observedAt);
 }
 
 function asInteger(value: unknown): number | undefined {

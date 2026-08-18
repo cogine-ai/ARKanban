@@ -1,5 +1,6 @@
 import { FieldInventory, pick } from "../collector/field-inventory.js";
 import type { UsageWrite } from "../storage/usage-store.js";
+import { boundedTimestamp } from "./timestamps.js";
 
 /**
  * Projects `sessions.usage` and `usage.cost` replies into usage writes.
@@ -146,7 +147,10 @@ export function projectUsageRow(raw: unknown, options: ProjectUsageOptions): Usa
   const hasCost = costMicroUsd !== undefined && unpricedModels.length === 0 && unpricedCount === 0;
 
   const peakContextTokens = asNumber(read("peakContextTokens"));
-  const observedAt = asNumber(read("observedAt")) ?? options.observedAt;
+  // Bounded like every other projected time. A reading dated ahead of now is
+  // never superseded — the store keeps the newest observation — so one skewed
+  // value would freeze this session's usage at that figure for good.
+  const observedAt = boundedTimestamp(read("observedAt"), options.observedAt) ?? options.observedAt;
 
   const tokens = {
     inputTokens: asTokens(inputTokens),

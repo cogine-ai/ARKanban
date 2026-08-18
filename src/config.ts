@@ -113,6 +113,20 @@ export function loadConfig(
   const host = stringValue(server.host, DEFAULTS.server.host, "server.host");
   if (host !== "127.0.0.1" && host !== "::1") throw new Error("server.host must be loopback (127.0.0.1 or ::1)");
 
+  // Checked here rather than at the first connection attempt, because a typo
+  // otherwise surfaced as an invalid-URL stack from the line that prints the
+  // startup banner — with the HTTP server already listening.
+  const gatewayUrl = stringValue(gateway.url, DEFAULTS.gateway.url, "gateway.url");
+  let gatewayScheme: string;
+  try {
+    gatewayScheme = new URL(gatewayUrl).protocol;
+  } catch {
+    throw new Error(`gateway.url is not a URL: ${gatewayUrl}`);
+  }
+  if (gatewayScheme !== "ws:" && gatewayScheme !== "wss:") {
+    throw new Error(`gateway.url must be ws:// or wss://, got ${gatewayScheme}//`);
+  }
+
   const configuredStoragePath = stringValue(storage.path, DEFAULTS.storage.path, "storage.path");
   const terminalRetentionDays = numberValue(
     storage.terminalRetentionDays,
@@ -164,7 +178,7 @@ export function loadConfig(
   return {
     gateway: {
       name: stringValue(gateway.name, DEFAULTS.gateway.name, "gateway.name"),
-      url: stringValue(gateway.url, DEFAULTS.gateway.url, "gateway.url"),
+      url: gatewayUrl,
       tokenEnv,
       token: token ?? "",
     },
@@ -219,8 +233,20 @@ export function transcriptNotice(config: ResolvedCollectorConfig): string {
   ].join("\n");
 }
 
+/**
+ * The endpoint without anything that could carry a credential.
+ *
+ * Total by construction: this is what error paths and banners print, so a string
+ * that will not parse must come back as a placeholder rather than throw out of
+ * the code that was reporting something else.
+ */
 export function redactEndpoint(url: string): string {
-  const parsed = new URL(url);
+  let parsed: URL;
+  try {
+    parsed = new URL(url);
+  } catch {
+    return "<unparseable endpoint>";
+  }
   parsed.username = "";
   parsed.password = "";
   parsed.search = "";

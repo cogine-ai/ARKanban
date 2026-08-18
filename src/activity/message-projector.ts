@@ -1,6 +1,7 @@
 import type { MessageRole } from "../contracts.js";
 import { FieldInventory, pick } from "../collector/field-inventory.js";
 import type { MessageWrite } from "../storage/transcript-archive.js";
+import { boundedTimestamp } from "./timestamps.js";
 
 /**
  * Projects raw `chat.history` rows into archive writes.
@@ -69,32 +70,6 @@ const ROLES: Record<string, MessageRole> = Object.assign(Object.create(null), {
 
 function asString(value: unknown): string | undefined {
   return typeof value === "string" && value.trim() ? value.trim() : undefined;
-}
-
-function asTimestamp(value: unknown): number | undefined {
-  if (typeof value === "number" && Number.isFinite(value)) return value;
-  if (typeof value === "string" && value.trim()) {
-    const parsed = Date.parse(value);
-    if (Number.isFinite(parsed)) return parsed;
-  }
-  return undefined;
-}
-
-/** Anything older is a unit mismatch — seconds read as milliseconds — not a date. */
-const EARLIEST_PLAUSIBLE_MS = Date.UTC(2015, 0, 1);
-
-/**
- * Bounds a message's timestamp by the moment the page was fetched.
- *
- * Age is what transcript retention deletes on. A seconds-epoch value read as
- * milliseconds dates every message to 1970, and the first retention pass would
- * then erase the whole archive; a future date would make it unreachable instead.
- * Neither is a date this code can use, so it falls back to the observation time.
- */
-function boundedTimestamp(value: unknown, observedAt: number): number | undefined {
-  const parsed = asTimestamp(value);
-  if (parsed === undefined || parsed < EARLIEST_PLAUSIBLE_MS) return undefined;
-  return Math.min(parsed, observedAt);
 }
 
 function asInteger(value: unknown): number | undefined {

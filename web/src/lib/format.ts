@@ -68,6 +68,23 @@ export function localZoneLabel(): string {
     : resolved.timeZone;
 }
 
+/**
+ * The local calendar date as `YYYY-MM-DD`, to compare against a Gateway span.
+ *
+ * Built from the date parts rather than through a locale. `toLocaleDateString("en-CA")`
+ * happens to produce this order in current engines, but the order is CLDR data,
+ * not a guarantee — and an engine that ordered it differently would not fail, it
+ * would just stop recognising today and label every priced window with a date.
+ */
+export function calendarDay(value: number = Date.now()): string {
+  const date = new Date(value);
+  return [
+    date.getFullYear(),
+    String(date.getMonth() + 1).padStart(2, "0"),
+    String(date.getDate()).padStart(2, "0"),
+  ].join("-");
+}
+
 export function formatHourMinute(value: number): string {
   return new Intl.DateTimeFormat(undefined, { hour: "2-digit", minute: "2-digit" }).format(value);
 }

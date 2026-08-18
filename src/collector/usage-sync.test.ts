@@ -7,6 +7,7 @@ import {
   COST_SYNC_MS,
   localDateLabel,
   localUtcOffset,
+  utcOffsetLabel,
   UsageSynchronizer,
   type UsageRequest,
 } from "./usage-sync.js";
@@ -298,6 +299,32 @@ describe("UsageSynchronizer cost", () => {
     // labels the window with.
     expect(sync.costSpan("24h")).toEqual({ from: localDateLabel(NOW), to: localDateLabel(NOW) });
     expect(sync.costSpan("7d")).toEqual({ from: "2026-08-12", to: "2026-08-18" });
+  });
+
+  /**
+   * The pattern is the Gateway's own: `^UTC[+-]\d{1,2}(?::[0-5]\d)?$`, and a
+   * string that misses it is not rejected — the day range silently becomes a UTC
+   * one. A host in a zone nobody developed from would then be priced on the wrong
+   * day and say nothing about it, so the format is checked from zones rather than
+   * from wherever this suite happens to run.
+   */
+  it("writes an offset the Gateway accepts from any zone, including UTC itself", () => {
+    const accepted = /^UTC[+-]\d{1,2}(?::[0-5]\d)?$/;
+    const zones: Array<[number, string]> = [
+      [0, "UTC+0"],
+      [480, "UTC+8"],
+      [-300, "UTC-5"],
+      [330, "UTC+5:30"],
+      [-210, "UTC-3:30"],
+      [-570, "UTC-9:30"],
+      [840, "UTC+14"],
+      [-720, "UTC-12"],
+    ];
+
+    for (const [minutes, expected] of zones) {
+      expect(utcOffsetLabel(minutes)).toBe(expected);
+      expect(utcOffsetLabel(minutes)).toMatch(accepted);
+    }
   });
 
   /** One entry the Gateway could not price makes the whole range a floor. */

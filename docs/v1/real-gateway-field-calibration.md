@@ -189,11 +189,12 @@ sessions.usage 参数（additionalProperties: false）
                       cacheReadCost, cacheWriteCost, missingCostEntries }
 ```
 
-三条容易踩的：
+四条容易踩的：
 
 1. **不发 `agentScope: "all"` 就只统计默认 agent**。handler 里是 `requestedAgentId ?? specificKeyAgentId ?? resolveDefaultAgentId(config)`，一个跨 agent 的总览必须显式声明作用域，而它又不能与 `key`/`agentId` 同时出现。
 2. **`limit` 只截断 `sessions` 数组，不影响聚合**（`if (entryIndex < limit) sessions.push(...)`，聚合循环跑遍范围内全部条目）。所以成本这次调用发 `limit: 1`：分解照样完整，回包却小。
-3. **只有日历天，没有滚动窗口**。`range` 最小 `7d`，单日只能 `startDate === endDate`；`mode` 默认 UTC，`gateway` 用宿主机本地日，`specific` 用你给的偏移。我们发 `mode: "specific"` + 本机偏移，把「哪一天」钉死在采集端；回包会把 `startDate`/`endDate` 回显，界面就按这个跨度标签，不把一天的花费挂在写着 24h 的标签下。
+3. **`utcOffset` 写错不会报错**。schema 的 pattern 是 `^UTC[+-]\d{1,2}(?::[0-5]\d)?$`（`schema-BuOFpc7K.js`），而 handler 侧的 `parseUtcOffsetToMinutes` 一旦解析失败就**静默退回 `mode: "utc"`**（`usage-Suf4MGML.js`），不抛错。也就是说格式错了的后果不是调用失败，是被按 UTC 日定价、界面照样显示。`UTC+0`（宿主机在 UTC 时的输出）和 `UTC+5:30` 都在 pattern 内，已按几个时区断言过格式。
+4. **只有日历天，没有滚动窗口**。`range` 最小 `7d`，单日只能 `startDate === endDate`；`mode` 默认 UTC，`gateway` 用宿主机本地日，`specific` 用你给的偏移。我们发 `mode: "specific"` + 本机偏移，把「哪一天」钉死在采集端；回包会把 `startDate`/`endDate` 回显，界面就按这个跨度标签，不把一天的花费挂在写着 24h 的标签下。
 
 顺带：`aggregates.messages` 有 `{ total, user, assistant, toolCalls, toolResults, errors }`——这是除 `chat.history` 的 `isError` 之外，另一处 Gateway 直接给出的错误计数。
 

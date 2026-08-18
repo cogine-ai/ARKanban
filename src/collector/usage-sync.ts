@@ -112,16 +112,26 @@ function costRequest(window: AgentRollupWindow, now: number): Record<string, unk
   return { ...common, startDate: today, endDate: today };
 }
 
-/** `UTC+8`, `UTC-4`, `UTC+5:30` — the only offset form the schema accepts. */
-export function localUtcOffset(now: number): string {
-  // `getTimezoneOffset` counts minutes to add to local time to reach UTC, so the
-  // sign is the reverse of how the offset is written.
-  const minutes = -new Date(now).getTimezoneOffset();
-  const sign = minutes < 0 ? "-" : "+";
-  const absolute = Math.abs(minutes);
+/**
+ * `UTC+8`, `UTC-4`, `UTC+5:30`, `UTC+0` — the only offset form the schema accepts.
+ *
+ * Separate from the clock so it can be tested from zones the developer's machine
+ * is not in. The Gateway matches `^UTC[+-]\d{1,2}(?::[0-5]\d)?$` and, on a string
+ * that misses, falls back to UTC days **without an error** — so a host in a zone
+ * this got wrong would be quietly priced on the wrong day rather than told.
+ */
+export function utcOffsetLabel(offsetMinutes: number): string {
+  const sign = offsetMinutes < 0 ? "-" : "+";
+  const absolute = Math.abs(offsetMinutes);
   const hours = Math.floor(absolute / 60);
   const rest = absolute % 60;
   return `UTC${sign}${hours}${rest === 0 ? "" : `:${String(rest).padStart(2, "0")}`}`;
+}
+
+export function localUtcOffset(now: number): string {
+  // `getTimezoneOffset` counts minutes to add to local time to reach UTC, so the
+  // sign is the reverse of how the offset is written.
+  return utcOffsetLabel(-new Date(now).getTimezoneOffset());
 }
 
 /** The local calendar date, in the `YYYY-MM-DD` form the schema requires. */

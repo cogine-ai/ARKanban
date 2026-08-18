@@ -1558,18 +1558,34 @@ export class CollectorRepository {
     ).map((row) => String(row.session_key));
     if (doomed.length === 0) return 0;
 
-    this.transcripts.dropSessions(doomed);
-    const result = this.db
-      .prepare("DELETE FROM sessions WHERE archived = 1 AND last_activity_at < ?")
-      .run(cutoff);
-    this.db
-      .prepare(`
-        UPDATE activities SET session_ref = NULL
-        WHERE session_ref IS NOT NULL
-          AND session_ref NOT IN (SELECT session_key FROM sessions)
-      `)
-      .run();
-    return Number(result.changes);
+    // Three deletes that only make sense together. Run separately, a crash
+    // between them left the database in a state no code accounts for: a session
+    // whose transcript is gone but which still lists as archived and searchable,
+    // or Activity rows pointing at a session key that no longer exists.
+    let removed = 0;
+    let messages = 0;
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      messages = this.transcripts.dropSessionsInTransaction(doomed);
+      removed = Number(
+        this.db.prepare("DELETE FROM sessions WHERE archived = 1 AND last_activity_at < ?").run(cutoff).changes,
+      );
+      this.db
+        .prepare(`
+          UPDATE activities SET session_ref = NULL
+          WHERE session_ref IS NOT NULL
+            AND session_ref NOT IN (SELECT session_key FROM sessions)
+        `)
+        .run();
+      this.db.exec("COMMIT");
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
+    // Index maintenance, deliberately outside the transaction that had to be
+    // atomic: merging FTS tombstones is what makes the freed pages measurable.
+    if (messages > 0) this.transcripts.compactIndex();
+    return removed;
   }
 
   private listSettledInRange(rangeStart: number, rangeEnd: number): StoredActivity[] {

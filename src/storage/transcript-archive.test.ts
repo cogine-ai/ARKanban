@@ -59,8 +59,8 @@ describe("TranscriptArchive", () => {
     seedSession(repo, "agent:builder:one");
     const batch = [message({ seq: 0, content: "first" }), message({ seq: 1, content: "second" })];
 
-    expect(repo.transcripts.append(batch)).toEqual({ inserted: 2, skipped: 0 });
-    expect(repo.transcripts.append(batch)).toEqual({ inserted: 0, skipped: 2 });
+    expect(repo.transcripts.append(batch)).toEqual({ inserted: 2, skipped: 0, divergent: 0 });
+    expect(repo.transcripts.append(batch)).toEqual({ inserted: 0, skipped: 2, divergent: 0 });
     expect(repo.transcripts.listMessages("agent:builder:one")).toHaveLength(2);
   });
 
@@ -101,6 +101,36 @@ describe("TranscriptArchive", () => {
     const narrowed = repo.transcripts.search({ text: "登录", agentId: "builder" });
     expect(narrowed.mode).toBe("fallback");
     expect(narrowed.hits).toHaveLength(1);
+  });
+
+  /**
+   * §7.2 of the amendment: where the Gateway has rewritten a range that was
+   * already synced, the local copy keeps what it stored first and marks it. The
+   * flag was declared and never written, so a rewritten turn read as a faithful
+   * copy of something upstream no longer says.
+   */
+  it("keeps the first version and flags it when the same position comes back different", () => {
+    const repo = repository();
+    seedSession(repo, "agent:builder:one");
+    repo.transcripts.append([message({ seq: 0, content: "the original wording" })]);
+
+    const second = repo.transcripts.append([message({ seq: 0, content: "a different wording entirely" })]);
+
+    expect(second).toEqual({ inserted: 0, skipped: 1, divergent: 1 });
+    const stored = repo.transcripts.listMessages("agent:builder:one");
+    expect(stored).toHaveLength(1);
+    expect(stored[0]).toMatchObject({ content: "the original wording", divergent: true });
+  });
+
+  it("does not flag a re-fetch that brought back the same text", () => {
+    const repo = repository();
+    seedSession(repo, "agent:builder:one");
+    repo.transcripts.append([message({ seq: 0, content: "unchanged" })]);
+
+    const second = repo.transcripts.append([message({ seq: 0, content: "unchanged" })]);
+
+    expect(second).toEqual({ inserted: 0, skipped: 1, divergent: 0 });
+    expect(repo.transcripts.listMessages("agent:builder:one")[0]).toMatchObject({ divergent: false });
   });
 
   it("refuses an unbounded short query instead of scanning the whole archive", () => {

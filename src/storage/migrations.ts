@@ -1,4 +1,5 @@
-import { chmodSync, copyFileSync, existsSync } from "node:fs";
+import { chmodSync, copyFileSync, existsSync, readdirSync, rmSync } from "node:fs";
+import path from "node:path";
 import type { DatabaseSync } from "node:sqlite";
 
 export type Migration = {
@@ -204,6 +205,9 @@ const agentsSessionSurface: Migration = {
         FOREIGN KEY (session_key) REFERENCES sessions(session_key) ON DELETE CASCADE
       );
 
+      -- Created here and dropped again by v4. Left in place because a shipped
+      -- migration describes what a database at that version actually contains,
+      -- and rewriting it would make v2 a lie about every database that ran it.
       CREATE TABLE session_message_stats (
         session_key TEXT NOT NULL,
         direction TEXT NOT NULL,
@@ -327,7 +331,30 @@ const usageRollupIncrements: Migration = {
   },
 };
 
-export const MIGRATIONS: readonly Migration[] = [baseline, agentsSessionSurface, usageRollupIncrements];
+/**
+ * Version 4 drops a table nothing ever wrote to.
+ *
+ * `session_message_stats` was created with the rest of the session surface for a
+ * per-channel message breakdown that has not been built: no code writes it and no
+ * code reads it. An empty table is not neutral — it reads as a breakdown that
+ * exists and happens to be empty, which is a different claim from "never
+ * collected", and the same conflation this project refuses everywhere else. It
+ * comes back with the collection path that fills it.
+ */
+const dropUnusedMessageStats: Migration = {
+  version: 4,
+  name: "drop-unused-message-stats",
+  up(db) {
+    db.exec("DROP TABLE IF EXISTS session_message_stats");
+  },
+};
+
+export const MIGRATIONS: readonly Migration[] = [
+  baseline,
+  agentsSessionSurface,
+  usageRollupIncrements,
+  dropUnusedMessageStats,
+];
 
 export const TARGET_SCHEMA_VERSION = MIGRATIONS.reduce(
   (highest, migration) => Math.max(highest, migration.version),
@@ -369,27 +396,94 @@ function backupBeforeMigration(db: DatabaseSync, databasePath: string, target: n
   return backupPath;
 }
 
+function pendingFrom(version: number): Migration[] {
+  return MIGRATIONS.filter((migration) => migration.version > version).sort(
+    (left, right) => left.version - right.version,
+  );
+}
+
+/**
+ * Refuses a database written by a newer build.
+ *
+ * Silently accepting one means running the current code against a schema it has
+ * never seen: columns it does not know about, and constraints it will violate.
+ * Downgrades are not supported, and saying so is the only safe answer.
+ */
+function assertNotNewer(version: number): void {
+  if (version > TARGET_SCHEMA_VERSION) {
+    throw new Error(
+      `Database schema is v${version} but this build understands v${TARGET_SCHEMA_VERSION}. ` +
+        "It was written by a newer Collector; downgrading is not supported. Run the newer build, " +
+        "or move this database aside to start a fresh one.",
+    );
+  }
+}
+
+/**
+ * Removes migration backups other than the one just taken.
+ *
+ * A backup is a whole copy of the database, transcript text included. Kept
+ * forever, they outlive the retention window they were copied from: text that
+ * `transcriptRetentionDays` promised to delete stays readable in a file beside
+ * the database, and only `purge-transcripts` ever removed it. One generation back
+ * is the trade — enough to recover from an upgrade that went wrong, without
+ * accumulating conversations nobody can see or search.
+ */
+function pruneOldBackups(databasePath: string, keep: string | undefined): void {
+  const directory = path.dirname(databasePath);
+  const prefix = `${path.basename(databasePath)}.pre-v`;
+  let entries: string[];
+  try {
+    entries = readdirSync(directory);
+  } catch {
+    return;
+  }
+  for (const entry of entries) {
+    if (!entry.startsWith(prefix) || !entry.endsWith(".bak")) continue;
+    const full = path.join(directory, entry);
+    if (full === keep) continue;
+    // A backup that cannot be removed is not a reason to refuse to start; the
+    // next pass will try again.
+    try {
+      rmSync(full, { force: true });
+    } catch {
+      continue;
+    }
+  }
+}
+
 /**
  * Brings the database up to `TARGET_SCHEMA_VERSION`.
  *
  * Every pending migration runs inside one transaction. A failure rolls the whole
  * upgrade back and rethrows so the process fails closed rather than starting on
  * a half-migrated database. An existing database is copied to
- * `<path>.pre-v<target>.bak` (mode 0600) before the first statement runs.
+ * `<path>.pre-v<target>.bak` (mode 0600) before the first statement runs, and
+ * earlier backups are removed once the upgrade succeeds.
  */
 export function applyMigrations(db: DatabaseSync, databasePath: string): MigrationResult {
-  const from = readSchemaVersion(db);
-  const pending = MIGRATIONS.filter((migration) => migration.version > from).sort(
-    (left, right) => left.version - right.version,
-  );
-  if (pending.length === 0) {
-    return { from, to: from, applied: [] };
+  const observed = readSchemaVersion(db);
+  assertNotNewer(observed);
+  if (pendingFrom(observed).length === 0) {
+    return { from: observed, to: observed, applied: [] };
   }
 
+  // Taken before the write lock: folding the WAL into the main file is not
+  // permitted inside a transaction, and copying without it would back up a
+  // database missing its most recent writes.
   const backupPath = hasContent(db) ? backupBeforeMigration(db, databasePath, TARGET_SCHEMA_VERSION) : undefined;
 
   db.exec("BEGIN IMMEDIATE");
+  let from: number;
+  let pending: Migration[];
   try {
+    // Re-read under the write lock. Two processes starting together both saw the
+    // old version a moment ago, and the one that arrives second used to try
+    // creating tables that now exist and fail on a database that is in fact
+    // perfectly migrated.
+    from = readSchemaVersion(db);
+    assertNotNewer(from);
+    pending = pendingFrom(from);
     for (const migration of pending) migration.up(db);
     db.exec("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)");
     db.prepare("INSERT OR REPLACE INTO meta(key, value) VALUES ('schema_version', ?)").run(
@@ -400,6 +494,8 @@ export function applyMigrations(db: DatabaseSync, databasePath: string): Migrati
     db.exec("ROLLBACK");
     throw error;
   }
+
+  pruneOldBackups(databasePath, backupPath);
 
   return {
     from,

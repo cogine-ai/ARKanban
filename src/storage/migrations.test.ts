@@ -1,4 +1,4 @@
-import { existsSync, mkdtempSync, rmSync, statSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -92,6 +92,67 @@ describe("schema migrations", () => {
 
     expect(result.applied).toEqual([]);
     expect(result.from).toBe(TARGET_SCHEMA_VERSION);
+  });
+
+  /**
+   * A backup is a whole copy of the database, transcript text included. Kept
+   * forever they outlive the retention window they were copied from, and
+   * `purge-transcripts` was the only thing that ever removed them.
+   */
+  it("keeps only the backup from the upgrade that just succeeded", () => {
+    const databasePath = path.join(workspace(), "legacy.sqlite");
+    legacyDatabase(databasePath);
+    const stale = `${databasePath}.pre-v2.bak`;
+    writeFileSync(stale, "an older upgrade's copy, transcripts and all");
+
+    const db = new DatabaseSync(databasePath);
+    cleanups.push(() => db.close());
+    const result = applyMigrations(db, databasePath);
+
+    expect(existsSync(result.backupPath!)).toBe(true);
+    expect(existsSync(stale)).toBe(false);
+  });
+
+  /**
+   * A schema written by a newer build means columns this code does not know about
+   * and constraints it will violate. Downgrades are not supported, so the only
+   * safe answer is to say so rather than open it.
+   */
+  it("refuses a database from a newer build instead of running against it", () => {
+    const databasePath = path.join(workspace(), "from-the-future.sqlite");
+    const db = new DatabaseSync(databasePath);
+    cleanups.push(() => db.close());
+    db.exec("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)");
+    db.prepare("INSERT INTO meta(key, value) VALUES ('schema_version', ?)").run(
+      String(TARGET_SCHEMA_VERSION + 1),
+    );
+
+    expect(() => applyMigrations(db, databasePath)).toThrow(/newer Collector|not supported/);
+  });
+
+  it("starts cleanly on a database another process has already migrated", () => {
+    const databasePath = path.join(workspace(), "raced.sqlite");
+    legacyDatabase(databasePath);
+    const first = new CollectorRepository(databasePath);
+    cleanups.push(() => first.close());
+
+    const db = new DatabaseSync(databasePath);
+    cleanups.push(() => db.close());
+    const result = applyMigrations(db, databasePath);
+
+    expect(result.applied).toEqual([]);
+    expect(readSchemaVersion(db)).toBe(TARGET_SCHEMA_VERSION);
+  });
+
+  it("drops the message-stats table nothing ever wrote to", () => {
+    const databasePath = path.join(workspace(), "stats.sqlite");
+    const db = new DatabaseSync(databasePath);
+    cleanups.push(() => db.close());
+
+    applyMigrations(db, databasePath);
+
+    const table = db.prepare("SELECT name FROM sqlite_master WHERE name = 'session_message_stats'").get();
+    expect(table).toBeUndefined();
   });
 
   it("rolls back and fails closed when a migration throws", () => {

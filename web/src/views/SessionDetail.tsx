@@ -268,6 +268,17 @@ function TranscriptPanel({ sessionKey, revision }: { sessionKey: string; revisio
                   superseded
                 </span>
               ) : null}
+              {/* The archive keeps the version it stored first. Saying so is the
+                  point of the flag: without it the page reads as a faithful copy
+                  of a turn the Gateway has since worded differently. */}
+              {message.divergent ? (
+                <span
+                  className="transcript-divergent"
+                  title="The Gateway later returned different text for this position; the version archived first is shown"
+                >
+                  rewritten upstream
+                </span>
+              ) : null}
             </header>
             <p className="transcript-body">
               <TranscriptText text={message.content} highlight={query} />

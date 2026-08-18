@@ -269,11 +269,14 @@ migrations[]         —— 有序数组，每项 { version, up(db) }
 
 ```text
 读取 schema_version
+→ 若高于目标版本：拒绝启动并说明降级不受支持（否则等于让当前代码跑在它没见过的 schema 上）
 → 若低于目标版本：复制数据库文件到 <path>.pre-v<N>.bak（0600）
-→ 在单个事务内顺序执行待应用的 migration
-→ 写入新的 schema_version
+→ 在单个事务内：再读一次 schema_version（写锁下的权威值）→ 顺序执行待应用的 migration → 写入新的 schema_version
 → 失败则整体回滚并 fail closed，不带着半迁移的库启动
+→ 成功后删除其余 <path>.pre-v*.bak，只留本次这一份
 ```
+
+事务内重读版本号是为并发启动准备的：两个进程几乎同时读到旧版本，后到的那个原先会去建已经存在的表，然后在一个其实完全迁移好的库上假失败。备份只留一代，是因为备份是含全部正文的完整库副本：永久保留会让它活过 `transcriptRetentionDays` 承诺删掉的那段正文——文本就躺在数据库旁边的文件里可读可搜，此前只有 `purge-transcripts` 会删它。
 
 v1 基线库视为 version 1；本次交付 version 2。
 
@@ -363,15 +366,11 @@ CREATE TABLE session_signals (
   FOREIGN KEY (session_key) REFERENCES sessions(session_key) ON DELETE CASCADE
 );
 
-CREATE TABLE session_message_stats (
-  session_key TEXT NOT NULL,
-  direction TEXT NOT NULL,
-  channel TEXT NOT NULL,
-  outcome TEXT NOT NULL,
-  count INTEGER NOT NULL,
-  last_event_at INTEGER NOT NULL,
-  PRIMARY KEY (session_key, direction, channel, outcome)
-);
+-- 已随迁移 v4 删除：这张表在 v2 建了，但没有任何写入路径，也没有任何读取方。
+-- 空表不是中性的——它读起来像「这套按渠道的消息分解存在，只是暂时没数据」，
+-- 与「从未采集」是两个不同的断言，正是本项目在别处一律拒绝的那种塌缩。
+-- 等真正实现填充它的采集路径时再连表一起加回来。
+-- CREATE TABLE session_message_stats (...);
 
 -- 会话正文归档（local_archive）
 CREATE TABLE session_messages (
@@ -706,7 +705,7 @@ Agent 详情页（`/agents/:agentId`）在卡片之上多出的那一层是**结
 
 `sessionId` 变化意味着同一 `sessionKey` 下 transcript 换代（compaction 或重建）。此时不覆盖旧消息，而是给旧消息打上 `superseded_by_session_id`，新代际从 `seq = 0` 重新开始。理由是压缩前的原始对话往往正是回顾时想看的内容，直接覆盖等于让归档失去意义。
 
-Gateway 侧若重写了已同步区间的内容，本地保留先到的版本并记 `divergent` 标记，不做自动覆盖。
+Gateway 侧若重写了已同步区间的内容，本地保留先到的版本并记 `divergent` 标记，不做自动覆盖。实现落在 `append()`：插入冲突后再判一次正文是否真的不同，不同才置 `divergent = 1`（相同则连写都不发生）。这个标记必须在阅读器里露出来（消息头的 `rewritten upstream`），否则等于没标——页面会读起来像某个上游早已改口的回合的忠实副本。
 
 ### 7.3 读取与搜索
 

@@ -113,8 +113,8 @@ function parseLimit(
   fallback: number = SESSION_PAGE_LIMIT_DEFAULT,
 ): number | undefined {
   if (raw === undefined) return fallback;
-  const parsed = Number(raw);
-  if (!Number.isSafeInteger(parsed) || parsed < 1 || parsed > max) return undefined;
+  const parsed = parseCount(raw);
+  if (parsed === undefined || parsed < 1 || parsed > max) return undefined;
   return parsed;
 }
 
@@ -124,8 +124,34 @@ function parseLimit(
  */
 function parseTimestamp(raw: string | undefined): number | undefined | null {
   if (raw === undefined) return undefined;
+  const parsed = parseCount(raw);
+  return parsed === undefined ? null : parsed;
+}
+
+/**
+ * A non-negative integer, or undefined for anything else.
+ *
+ * `Number("")` and `Number(" ")` are both zero, which would read `?since=` as
+ * the epoch and `?limit=` as a limit of nothing. An empty parameter is a caller
+ * mistake, and saying so is better than guessing what they meant.
+ */
+function parseCount(raw: string): number | undefined {
+  if (raw.trim().length === 0) return undefined;
   const parsed = Number(raw);
-  return Number.isSafeInteger(parsed) && parsed >= 0 ? parsed : null;
+  return Number.isSafeInteger(parsed) && parsed >= 0 ? parsed : undefined;
+}
+
+/**
+ * An identifier to filter on, or undefined when the caller sent nothing usable.
+ *
+ * `?agentId=` reaches here as an empty string, and passing that through asks the
+ * database for rows belonging to an agent named "". The empty result is
+ * indistinguishable from an agent that has done nothing, so a cleared filter in
+ * the URL would read as a silent, wrong answer.
+ */
+function filterValue(raw: string | undefined): string | undefined {
+  const trimmed = raw?.trim();
+  return trimmed ? trimmed : undefined;
 }
 
 /** Same three-way contract, for a message sequence number rather than a time. */
@@ -161,8 +187,8 @@ function settledRange(value: string | undefined): SettledRange | undefined {
 
 function settledRangeEnd(value: string | undefined): number | undefined {
   if (value === undefined) return Date.now();
-  const parsed = Number(value);
-  return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : undefined;
+  const parsed = parseCount(value);
+  return parsed !== undefined && parsed > 0 ? parsed : undefined;
 }
 
 export async function createHttpServer(
@@ -172,6 +198,12 @@ export async function createHttpServer(
   const app = Fastify({
     logger: { level: process.env.LOG_LEVEL ?? "info" },
     logController: new LogController({ disableRequestLogging: true }),
+    // A hijacked event stream is a socket Fastify no longer tracks, so `close()`
+    // waits on it forever unless the sockets are torn down as well. `preClose`
+    // below ends the streams politely; this is what covers the ones already
+    // half-gone, and together they are the difference between Ctrl-C returning
+    // and Ctrl-C needing a second signal.
+    forceCloseConnections: true,
   });
 
   const allowedHosts = loopbackAuthorities(config.server.host);
@@ -331,8 +363,9 @@ export async function createHttpServer(
       if (!cursor) return reply.code(400).send({ error: "invalid_cursor", sort: resolvedSort });
     }
 
+    const agentId = filterValue(request.query.agentId);
     return runtime.repository.listSessionsPage({
-      ...(request.query.agentId !== undefined ? { agentId: request.query.agentId } : {}),
+      ...(agentId !== undefined ? { agentId } : {}),
       ...(state !== undefined ? { state } : {}),
       ...(grade !== undefined ? { grade } : {}),
       ...(sinceMs !== undefined ? { since: sinceMs } : {}),
@@ -417,7 +450,9 @@ export async function createHttpServer(
     const to = parseTimestamp(request.query.to);
     if (from === null || to === null) return reply.code(400).send({ error: "invalid_time_range" });
 
-    const narrowed = request.query.agentId !== undefined || request.query.sessionKey !== undefined || from !== undefined;
+    const agentId = filterValue(request.query.agentId);
+    const sessionKey = filterValue(request.query.sessionKey);
+    const narrowed = agentId !== undefined || sessionKey !== undefined || from !== undefined;
     // A query too short for the trigram index can only be served by a LIKE scan.
     // Refusing the unnarrowed case is deliberate: the alternative is a full-archive
     // scan that looks like a hang.
@@ -431,8 +466,8 @@ export async function createHttpServer(
 
     return runtime.repository.transcripts.search({
       text,
-      ...(request.query.agentId !== undefined ? { agentId: request.query.agentId } : {}),
-      ...(request.query.sessionKey !== undefined ? { sessionKey: request.query.sessionKey } : {}),
+      ...(agentId !== undefined ? { agentId } : {}),
+      ...(sessionKey !== undefined ? { sessionKey } : {}),
       ...(from !== undefined ? { from } : {}),
       ...(to !== undefined ? { to } : {}),
       limit,
@@ -482,14 +517,25 @@ export async function createHttpServer(
    * A hijacked response is outside Fastify's connection tracking, so an open
    * event stream would keep `close()` waiting for a browser tab to go away —
    * which is to say, keep Ctrl-C from returning. Shutdown ends them itself.
+   *
+   * `preClose`, not `onClose`: Fastify's own `onClose` hook runs first and awaits
+   * the HTTP server, which is exactly what the open stream is preventing, so an
+   * `onClose` hook here is only reached after the deadlock it was meant to avoid.
    */
   const streams = new Set<ServerResponse>();
-  app.addHook("onClose", async () => {
+  app.addHook("preClose", async () => {
     for (const stream of streams) stream.end();
     streams.clear();
   });
 
-  app.get("/api/v1/events", async (request, reply) => {
+  /**
+   * `HEAD` cannot be served from the streaming handler: it hijacks the response
+   * and writes a body, so the twin route Fastify generates by default answers a
+   * `curl -I` or a health check by hanging until the client gives up.
+   */
+  app.head("/api/v1/events", async (_request, reply) => reply.code(405).header("allow", "GET").send());
+
+  app.get("/api/v1/events", { exposeHeadRoute: false }, async (request, reply) => {
     reply.hijack();
     const response = reply.raw;
     streams.add(response);

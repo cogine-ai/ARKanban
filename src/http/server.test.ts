@@ -54,6 +54,25 @@ describe("settled group HTTP API", () => {
     expect(response.json()).toMatchObject({ range: "7d", complete: false, totalRuns: 0, totalSeries: 0 });
   });
 
+  /**
+   * `ws://user:pass@host` is a legal endpoint, and this response is read by a
+   * browser page. The CLI has always redacted it; these routes had not.
+   */
+  it("does not serve the Gateway credentials to the page", async () => {
+    const { runtime, config } = runtimeFixture();
+    config.gateway.url = "ws://operator:hunter2@127.0.0.1:18789/rpc?token=abc";
+    const app = await createHttpServer(runtime, config);
+    cleanups.push(() => app.close());
+
+    for (const url of ["/api/v1/meta", "/api/v1/diagnostics/field-coverage"]) {
+      const body = (await app.inject({ method: "GET", url })).body;
+      expect(body).not.toContain("hunter2");
+      expect(body).not.toContain("operator:");
+      expect(body).not.toContain("token=abc");
+      expect(body).toContain("ws://127.0.0.1:18789/rpc");
+    }
+  });
+
   it("rejects invalid ranges and range endpoints", async () => {
     const { runtime, config } = runtimeFixture();
     const app = await createHttpServer(runtime, config);
@@ -137,6 +156,32 @@ describe("sessions and agents HTTP API", () => {
 
     expect(response.statusCode).toBe(400);
     expect(response.json()).toMatchObject({ error: "invalid_time_range" });
+  });
+
+  /**
+   * `Number("")` is zero, so an empty bound used to read as the epoch and an
+   * empty limit as a limit of nothing.
+   */
+  it("does not read an empty numeric parameter as zero", async () => {
+    const app = await serverWith([session({ sessionKey: "a" })]);
+
+    expect((await app.inject({ method: "GET", url: "/api/v1/sessions?since=" })).statusCode).toBe(400);
+    expect((await app.inject({ method: "GET", url: "/api/v1/sessions?limit=" })).statusCode).toBe(400);
+    expect((await app.inject({ method: "GET", url: "/api/v1/settled-groups?rangeEnd=" })).statusCode).toBe(400);
+  });
+
+  /**
+   * A filter cleared in the URL arrives as an empty string. Asking the database
+   * for the sessions of an agent named "" answers nothing, which reads as an
+   * agent that has done nothing rather than as no filter at all.
+   */
+  it("treats a blank agent filter as no filter", async () => {
+    const app = await serverWith([session({ sessionKey: "a", agentId: "builder" })]);
+
+    const response = await app.inject({ method: "GET", url: "/api/v1/sessions?agentId=" });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json().items).toHaveLength(1);
   });
 
   it("serves a single session archive and 404s for an unknown key", async () => {
@@ -705,4 +750,51 @@ describe("browser-facing guards", () => {
     expect(response.statusCode).toBe(400);
     expect(response.json()).toMatchObject({ error: "repeated_query_parameter", parameter: "agentId" });
   });
+});
+
+describe("event stream lifecycle", () => {
+  /**
+   * `inject` cannot hold a hijacked stream open, so these listen for real.
+   *
+   * Both cases are about a socket Fastify has stopped tracking. Neither is
+   * visible from a unit test that only ever asks for a response body.
+   */
+  async function listening(): Promise<{ app: FastifyInstance; origin: string }> {
+    const { runtime, config } = runtimeFixture();
+    const app = await createHttpServer(runtime, config);
+    // Port 0: the suite may run in parallel with a real collector.
+    await app.listen({ host: "127.0.0.1", port: 0 });
+    const address = app.server.address();
+    const port = typeof address === "object" && address ? address.port : 0;
+    cleanups.push(() => app.close());
+    return { app, origin: `http://127.0.0.1:${port}` };
+  }
+
+  it("closes while an event stream is still connected", async () => {
+    const { app, origin } = await listening();
+    const abort = new AbortController();
+    const stream = await fetch(`${origin}/api/v1/events`, { signal: abort.signal });
+    await stream.body!.getReader().read();
+
+    // Fastify's own onClose hook awaits the HTTP server, and the server awaits
+    // this socket, so ending the streams any later than preClose never happens.
+    await Promise.race([
+      app.close(),
+      new Promise((_resolve, reject) => setTimeout(() => reject(new Error("close deadlocked")), 5_000)),
+    ]);
+
+    abort.abort();
+  }, 10_000);
+
+  it("answers HEAD on the event stream instead of hanging", async () => {
+    const { origin } = await listening();
+
+    const response = await Promise.race([
+      fetch(`${origin}/api/v1/events`, { method: "HEAD" }),
+      new Promise<never>((_resolve, reject) => setTimeout(() => reject(new Error("HEAD hung")), 5_000)),
+    ]);
+
+    expect(response.status).toBe(405);
+    expect(response.headers.get("allow")).toBe("GET");
+  }, 10_000);
 });

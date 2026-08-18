@@ -35,6 +35,39 @@ export function formatDateTime(value?: number): string {
   }).format(value);
 }
 
+/**
+ * A timestamp nobody has to interpret: full date, seconds, and the zone it is in.
+ *
+ * The compact forms above drop the zone to stay readable in a list, which is fine
+ * while every row is read in one place and wrong as soon as an archive is read
+ * from another — "11:54" alone does not say whose 11:54 it was. This is the form
+ * to reach for wherever the exact instant is the point, such as a tooltip on a
+ * transcript line.
+ */
+export function formatExact(value?: number): string {
+  if (!value) return "Not observed";
+  return new Intl.DateTimeFormat(undefined, {
+    year: "numeric",
+    month: "short",
+    day: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    timeZoneName: "short",
+  }).format(value);
+}
+
+/** Names the zone the clock times on screen are in, so it can be said once. */
+export function localZoneLabel(): string {
+  const resolved = new Intl.DateTimeFormat(undefined, { timeZoneName: "short" }).resolvedOptions();
+  const abbreviation = new Intl.DateTimeFormat(undefined, { timeZoneName: "short" })
+    .formatToParts(Date.now())
+    .find((part) => part.type === "timeZoneName")?.value;
+  return abbreviation && abbreviation !== resolved.timeZone
+    ? `${resolved.timeZone} (${abbreviation})`
+    : resolved.timeZone;
+}
+
 export function formatHourMinute(value: number): string {
   return new Intl.DateTimeFormat(undefined, { hour: "2-digit", minute: "2-digit" }).format(value);
 }

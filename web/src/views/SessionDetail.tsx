@@ -6,19 +6,35 @@ import type {
   SessionUsage,
   TranscriptSyncState,
 } from "../../../src/contracts";
-import { collectorApi, type SessionDetail as SessionDetailData } from "../api";
+import {
+  collectorApi,
+  isAbortError,
+  TRANSCRIPT_PAGE_SIZE,
+  type SessionDetail as SessionDetailData,
+} from "../api";
 import { GradeChip } from "../components/GradeChip";
+import { Timestamp } from "../components/Timestamp";
 import { TranscriptText } from "../components/TranscriptText";
 import {
   formatBytes,
   formatCost,
   formatDateTime,
+  formatExact,
   formatRelative,
   formatTokens,
+  localZoneLabel,
   outcomeLabel,
 } from "../lib/format";
 import { Link } from "../router";
 import { useCollector } from "../state/collector-context";
+
+/**
+ * How long typing settles before the archive is searched.
+ *
+ * Matches the list filters on `/sessions`, so the two search boxes on the same
+ * page do not settle at visibly different speeds.
+ */
+const SEARCH_SETTLE_MS = 250;
 
 /** A label/value pair, rendering "not reported" rather than collapsing the row. */
 function Fact({ label, value, title }: { label: string; value?: string | number; title?: string }) {
@@ -194,22 +210,40 @@ function TranscriptPanel({ sessionKey, revision }: { sessionKey: string; revisio
       setHits(undefined);
       return;
     }
-    let active = true;
+    const controller = new AbortController();
+    // Matches for the term that was in the box a keystroke ago are not an answer
+    // to this one. The count beside the field is drawn from them, so leaving them
+    // up reports the old query's tally against the new query's text.
+    //
+    // `error` is deliberately left alone: it also carries a failure to load the
+    // transcript itself, and clearing it here would erase the only explanation
+    // for an empty panel.
+    setHits(undefined);
     setSearching(true);
     const timer = setTimeout(() => {
       void (async () => {
         try {
-          const result = await collectorApi.searchMessages({ q: needle, sessionKey }, 200);
-          if (active) setHits(result.hits.map((hit) => hit.message));
+          const result = await collectorApi.searchMessages(
+            { q: needle, sessionKey },
+            { limit: TRANSCRIPT_PAGE_SIZE, signal: controller.signal },
+          );
+          // An abort only rejects a request still in flight. One that had already
+          // answered runs its continuation regardless, so the request has to say
+          // whether it is still the one being asked before it writes to the panel.
+          if (controller.signal.aborted) return;
+          setHits(result.hits.map((hit) => hit.message));
         } catch (cause) {
-          if (active) setError(cause instanceof Error ? cause.message : String(cause));
+          // A cancelled search is not a failure to report; the next keystroke's
+          // search is already on its way.
+          if (isAbortError(cause) || controller.signal.aborted) return;
+          setError(cause instanceof Error ? cause.message : String(cause));
         } finally {
-          if (active) setSearching(false);
+          if (!controller.signal.aborted) setSearching(false);
         }
       })();
-    }, 200);
+    }, SEARCH_SETTLE_MS);
     return () => {
-      active = false;
+      controller.abort();
       clearTimeout(timer);
     };
   }, [query, sessionKey]);
@@ -233,6 +267,12 @@ function TranscriptPanel({ sessionKey, revision }: { sessionKey: string; revisio
             : `${sync.syncedCount} messages · ${formatBytes(sync.syncedBytes)} · ${sync.complete ? "complete" : "partial"}${sync.syncedAt ? ` · synced ${formatRelative(sync.syncedAt)}` : ""}`}
         {sync?.errorCode ? ` · last sync failed (${sync.errorCode})` : ""}
       </p>
+      {/* Said once for the whole list instead of on every line: a transcript is
+          read as a sequence of clock times, and those times mean nothing unless
+          the reader knows the zone they are being shown in. */}
+      {messages && messages.length > 0 ? (
+        <p className="transcript-zone muted">Times shown in {localZoneLabel()}.</p>
+      ) : null}
 
       {error ? <div className="inline-error">{error}</div> : null}
 
@@ -262,10 +302,21 @@ function TranscriptPanel({ sessionKey, revision }: { sessionKey: string; revisio
             <header>
               <span className="transcript-role">{message.role}</span>
               {message.toolName ? <span className="transcript-tool">{message.toolName}</span> : null}
-              <span className="muted">{formatDateTime(message.createdAt)}</span>
+              <Timestamp className="muted" value={message.createdAt} />
               {message.supersededBySessionId ? (
                 <span className="transcript-superseded" title={`Replaced by generation ${message.supersededBySessionId}`}>
                   superseded
+                </span>
+              ) : null}
+              {/* The archive keeps the version it stored first. Saying so is the
+                  point of the flag: without it the page reads as a faithful copy
+                  of a turn the Gateway has since worded differently. */}
+              {message.divergent ? (
+                <span
+                  className="transcript-divergent"
+                  title="The Gateway later returned different text for this position; the version archived first is shown"
+                >
+                  rewritten upstream
                 </span>
               ) : null}
             </header>
@@ -278,7 +329,7 @@ function TranscriptPanel({ sessionKey, revision }: { sessionKey: string; revisio
 
       {!searchActive && remaining > 0 ? (
         <button type="button" className="transcript-more" onClick={() => void extend()} disabled={loadingMore}>
-          {loadingMore ? "Loading…" : `Load ${Math.min(remaining, 200)} more`}
+          {loadingMore ? "Loading…" : `Load ${Math.min(remaining, TRANSCRIPT_PAGE_SIZE)} more`}
         </button>
       ) : null}
     </div>
@@ -395,8 +446,16 @@ export function SessionDetailView({ sessionKey }: { sessionKey: string }) {
             <Fact label="CATEGORY" value={detail.category} />
             <Fact label="PLACEMENT" value={detail.placement} />
             <Fact label="ACTIVITIES" value={detail.activityCount} />
-            <Fact label="CREATED" value={detail.createdAt ? formatDateTime(detail.createdAt) : undefined} />
-            <Fact label="LAST ACTIVITY" value={formatDateTime(detail.lastActivityAt)} />
+            <Fact
+              label="CREATED"
+              value={detail.createdAt ? formatDateTime(detail.createdAt) : undefined}
+              title={detail.createdAt ? formatExact(detail.createdAt) : undefined}
+            />
+            <Fact
+              label="LAST ACTIVITY"
+              value={formatDateTime(detail.lastActivityAt)}
+              title={formatExact(detail.lastActivityAt)}
+            />
           </div>
           {/* Coverage per source, so a blank field reads as "not observed"
               rather than "not there". */}

@@ -4,6 +4,7 @@ import type {
   ActivityPhase,
   ActivitySnapshot,
   AgentRollupWindow,
+  ChangeTopic,
   CollectorStatus,
   CollectorSyncState,
   SettledGroupSnapshot,
@@ -59,6 +60,7 @@ import {
   type UsageSyncOutcome,
 } from "./usage-sync.js";
 import {
+  ACTIVE_WINDOW_MS,
   classifyHistoryFailure,
   TRANSCRIPT_SYNC_MS,
   TranscriptSynchronizer,
@@ -529,6 +531,10 @@ export class CollectorRuntime {
       this.deriveSyncState();
       this.emitStatus();
     }
+    // Outside the boundary above so it can neither delay the snapshot nor be
+    // mistaken for a session-sync failure: by now the archive holds whatever this
+    // pass found, which is the only thing the `chat.history` probe was missing.
+    await this.settleHistoryProbe();
   }
 
   /**
@@ -599,7 +605,7 @@ export class CollectorRuntime {
       this.transcriptStatus = await this.transcripts.runOnce({
         now: Date.now(),
         connected: this.gateway.isConnected,
-        available: new Set(this.gatewayHello?.features.methods ?? []).has("chat.history"),
+        available: this.historyAvailable(),
         primaryHealthy: this.sources.get("sessions")?.state === "live",
       });
       // An open transcript has no other way to learn that this round added to it:
@@ -628,6 +634,56 @@ export class CollectorRuntime {
       };
     } finally {
       this.transcriptSyncing = false;
+    }
+  }
+
+  /**
+   * Whether `chat.history` can be called.
+   *
+   * A probe that actually made the call wins over the advertisement, in both
+   * directions. Discovery is deliberately conservative — the amendment's §4.3 is
+   * explicit that absence does not imply unavailability, which is why
+   * `sessions.usage` is probed — and treating a missing entry as a verdict meant a
+   * Gateway build that simply does not list `chat.history` archived nothing at
+   * all, silently and with no path back. The advertisement is still what answers
+   * before any probe has returned.
+   */
+  private historyAvailable(): boolean {
+    const probed = this.capabilities.stateOf("chat.history");
+    if (probed !== "unknown") return probed === "live";
+    return new Set(this.gatewayHello?.features.methods ?? []).has("chat.history");
+  }
+
+  /**
+   * Retries the `chat.history` probe until it has a verdict.
+   *
+   * The probe has to name a session that exists, so the one taken on connect
+   * cannot form a call while the archive is still empty — and on a Gateway that
+   * does not advertise the method, the connection would then archive nothing for
+   * as long as it stayed up, which is the failure probing was added to remove. A
+   * transient failure had the same shape: `error` is not `live`, so one bad moment
+   * at connect disabled transcripts until the next reconnect.
+   *
+   * Called from the session pass because that is where the missing precondition
+   * arrives. `probeAll` skips methods already settled, so this costs one request
+   * per pass only while the answer is genuinely unknown, and nothing afterwards.
+   *
+   * Gated on `stopped` and wrapped, for the same reason the usage round is:
+   * `stop()` closes the database without waiting for a pass already in flight, so
+   * a shutdown landing mid-request leaves this reading a closed handle. The timer
+   * calls the pass with `void` and has no caller to see the rejection, which is
+   * enough to take the process down over a probe nobody was waiting for.
+   */
+  private async settleHistoryProbe(): Promise<void> {
+    if (this.stopped || this.config.storage.transcriptSync !== "enabled") return;
+    const state = this.capabilities.stateOf("chat.history");
+    if (state !== "unknown" && state !== "error") return;
+    try {
+      if (this.repository.mostRecentSessionKey() === undefined) return;
+      await this.probeCapabilities();
+    } catch {
+      // The verdict stays unknown and the next pass tries again, which is what
+      // this method is for.
     }
   }
 
@@ -750,7 +806,10 @@ export class CollectorRuntime {
   private async probeCapabilities(): Promise<void> {
     if (!this.gateway.isConnected) return;
     try {
-      await this.capabilities.probeAll(async (method, params) => this.gateway.request(method, params));
+      const sessionKey = this.repository.mostRecentSessionKey();
+      await this.capabilities.probeAll(async (method, params) => this.gateway.request(method, params), {
+        ...(sessionKey ? { sessionKey } : {}),
+      });
     } catch {
       // probeAll already classifies per-method outcomes; a throw here would only
       // come from the caller itself and must not affect sync state.
@@ -1061,21 +1120,51 @@ export class CollectorRuntime {
   private prune(): void {
     const now = Date.now();
     const day = 24 * 60 * 60 * 1_000;
+    const topics = new Set<ChangeTopic>();
     try {
       // Usage folds before sessions age out: rollup reads the agent through the
       // session row, so deleting sessions first would strand the spend as
       // unattributable.
-      this.repository.usage.rollupOlderThan(now - USAGE_ROLLUP_AFTER_DAYS * day);
-      this.repository.usage.pruneSnapshots(now - this.config.storage.usageRetentionDays * day);
-      this.repository.prune(now - this.config.storage.terminalRetentionDays * day);
-      this.repository.pruneSessions(now - this.config.storage.sessionRetentionDays * day);
+      const rolled = this.repository.usage.rollupOlderThan(now - USAGE_ROLLUP_AFTER_DAYS * day);
+      const snapshots = this.repository.usage.pruneSnapshots(now - this.config.storage.usageRetentionDays * day);
+      if (rolled.snapshots > 0 || snapshots > 0) topics.add("usage");
+      if (this.repository.prune(now - this.config.storage.terminalRetentionDays * day) > 0) {
+        topics.add("activities");
+      }
+      if (this.repository.pruneSessions(now - this.config.storage.sessionRetentionDays * day) > 0) {
+        // A dropped session takes its transcript with it, since nothing else
+        // would ever reach those messages again.
+        topics.add("sessions");
+        topics.add("messages");
+      }
       // Transcripts have two gates: age here, and the size ceiling the sync loop
       // enforces. Age runs first so eviction only ever has to handle real growth.
-      this.repository.transcripts.pruneOlderThan(now - this.config.storage.transcriptRetentionDays * day);
-      this.repository.transcripts.evictOldestSessions(this.config.storage.transcriptMaxBytes);
+      const aged = this.repository.transcripts.pruneOlderThan(
+        now - this.config.storage.transcriptRetentionDays * day,
+      );
+      const evicted = this.repository.transcripts.evictOldestSessions(this.config.storage.transcriptMaxBytes, {
+        protectSince: now - ACTIVE_WINDOW_MS,
+      });
+      if (aged > 0 || evicted.messages > 0) topics.add("messages");
+      // This pass is where the archive's real page cost gets re-measured: it has
+      // just deleted rows the sync loop cannot see, and its own estimate would
+      // still be counting them.
+      this.transcripts.markUsageStale();
       this.pruneError = undefined;
     } catch (error) {
       this.pruneError = storageErrorCode(error);
+    }
+    // Deletions are the one change a client cannot infer. On an idle collector
+    // nothing else emits a frame, so rows this pass removed stayed on an open
+    // page — listed, linkable and gone — until someone reloaded by hand.
+    if (topics.size > 0) {
+      this.emitChange({
+        epoch: this.repository.epoch,
+        revision: this.repository.revision,
+        topics: [...topics],
+        ids: [],
+        reasons: ["retention_prune"],
+      });
     }
   }
 }

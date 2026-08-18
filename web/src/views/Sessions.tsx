@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type UIEvent } from "react";
 import type { ChangeTopic, SessionSignalGrade, SessionSummary } from "../../../src/contracts";
 import type { SessionSort } from "../../../src/storage/keyset-cursor";
 import { collectorApi, type SessionListFilters } from "../api";
@@ -7,6 +7,7 @@ import { TranscriptSearch } from "../components/TranscriptSearch";
 import { AGENT_COLORS } from "../lib/board";
 import { formatRelative, hash, shortAgent } from "../lib/format";
 import { Link, useLocation, useNavigate } from "../router";
+import { useMeasuredHeight } from "../state/use-measured-height";
 import { usePagedQuery } from "../state/use-paged-query";
 
 /**
@@ -29,7 +30,11 @@ const OVERSCAN = 8;
 const ROW_HEIGHT = 44;
 /** Below this, plain rendering is cheaper than the windowing bookkeeping. */
 const VIRTUALIZE_ABOVE = 100;
-const VIEWPORT_HEIGHT = 560;
+/**
+ * Only used until the list has been measured. The height itself belongs to CSS,
+ * which can size the list against the window; see `.session-list` for the bounds.
+ */
+const VIEWPORT_HEIGHT_FALLBACK = 560;
 
 const SESSION_TOPICS: readonly ChangeTopic[] = ["sessions"];
 /** How long the typed agent filter waits before it becomes a URL change. */
@@ -134,8 +139,9 @@ export function SessionsView() {
   const [scrollTop, setScrollTop] = useState(0);
   const viewport = useRef<HTMLDivElement>(null);
   const virtualized = items.length > VIRTUALIZE_ABOVE;
+  const viewportHeight = useMeasuredHeight(viewport, VIEWPORT_HEIGHT_FALLBACK, virtualized);
   const first = virtualized ? Math.max(0, Math.floor(scrollTop / ROW_HEIGHT) - OVERSCAN) : 0;
-  const visibleCount = virtualized ? Math.ceil(VIEWPORT_HEIGHT / ROW_HEIGHT) + OVERSCAN * 2 : items.length;
+  const visibleCount = virtualized ? Math.ceil(viewportHeight / ROW_HEIGHT) + OVERSCAN * 2 : items.length;
   const visible = items.slice(first, first + visibleCount);
 
   return (
@@ -215,10 +221,7 @@ export function SessionsView() {
           ref={viewport}
           data-virtualized={virtualized ? "true" : "false"}
           {...(virtualized
-            ? {
-                style: { height: VIEWPORT_HEIGHT, overflowY: "auto" as const },
-                onScroll: () => setScrollTop(viewport.current?.scrollTop ?? 0),
-              }
+            ? { onScroll: (event: UIEvent<HTMLDivElement>) => setScrollTop(event.currentTarget.scrollTop) }
             : {})}
         >
           {virtualized ? <div style={{ height: first * ROW_HEIGHT }} aria-hidden="true" /> : null}

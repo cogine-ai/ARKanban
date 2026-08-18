@@ -5,6 +5,7 @@ import path from "node:path";
 import { WebSocketServer, type WebSocket } from "ws";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { ResolvedCollectorConfig } from "../config.js";
+import type { CollectorRepository } from "../storage/repository.js";
 import { CollectorRuntime } from "./runtime.js";
 
 const cleanups: Array<() => Promise<void> | void> = [];
@@ -217,5 +218,322 @@ describe("CollectorRuntime", () => {
     });
     expect(cronListLimit).toBe(200);
     expect(changeReasons).toContain("schedule_gateway_connected");
+  });
+
+  /**
+   * Discovery is conservative by design, and the amendment's §4.3 is explicit that
+   * a method missing from `features.methods` may still answer — which is why
+   * `sessions.usage` is probed rather than assumed. `chat.history` was assumed:
+   * on a build that does not list it, transcript sync reported `unavailable` every
+   * round and archived nothing, with no probe and no retry to get out of it.
+   */
+  it("probes chat.history when discovery does not mention it", async () => {
+    const server = new WebSocketServer({ host: "127.0.0.1", port: 0 });
+    await once(server, "listening");
+    const address = server.address();
+    if (!address || typeof address === "string") throw new Error("mock gateway did not bind TCP");
+    const historyAsked: Array<Record<string, unknown>> = [];
+    server.on("connection", (socket) => {
+      socket.send(JSON.stringify({ type: "event", event: "connect.challenge", payload: { nonce: "probe-test", ts: Date.now() } }));
+      socket.on("message", (raw) => {
+        const request = JSON.parse(raw.toString()) as { id: string; method: string; params?: Record<string, unknown> };
+        const respond = (payload: unknown) => socket.send(JSON.stringify({ type: "res", id: request.id, ok: true, payload }));
+        const refuse = (message: string) =>
+          socket.send(JSON.stringify({ type: "res", id: request.id, ok: false, error: { code: "METHOD_NOT_FOUND", message } }));
+        // Advertises only the three required methods, exactly as a build that
+        // keeps its discovery list short would.
+        if (request.method === "connect") respond({ type: "hello-ok", protocol: 4, server: { version: "runtime-test", connId: "probe" }, features: { methods: ["tasks.list", "sessions.list", "sessions.subscribe"], events: ["task", "agent", "sessions.changed", "session.tool"] }, snapshot: {}, auth: { role: "operator", scopes: ["operator.read"] }, policy: { maxPayload: 1_000_000, maxBufferedBytes: 1_000_000, tickIntervalMs: 30_000 } });
+        else if (request.method === "sessions.subscribe") respond({ subscribed: true });
+        else if (request.method === "tasks.list") respond({ tasks: [] });
+        else if (request.method === "sessions.list") respond({ sessions: [{ key: "agent:builder:one", agentId: "builder", label: "Session", status: "running", hasActiveRun: true, startedAt: 1_000 }], hasMore: false, nextOffset: 1 });
+        else if (request.method === "chat.history") {
+          historyAsked.push(request.params ?? {});
+          respond({ sessionKey: request.params?.sessionKey, sessionId: "gen-one", messages: [] });
+        } else refuse(`unknown method ${request.method}`);
+      });
+    });
+
+    const directory = mkdtempSync(path.join(tmpdir(), "collector-runtime-probe-"));
+    const config: ResolvedCollectorConfig = {
+      gateway: { name: "test", url: `ws://127.0.0.1:${address.port}`, tokenEnv: "TEST_GATEWAY_TOKEN", token: "test-token" },
+      server: { host: "127.0.0.1", port: 47_126 },
+      storage: {
+        path: path.join(directory, "collector.sqlite"),
+        terminalRetentionDays: 1,
+        usageRetentionDays: 14,
+        sessionRetentionDays: 90,
+        transcriptRetentionDays: 180,
+        transcriptMaxBytes: 64 * 1024 * 1024,
+        transcriptSync: "enabled",
+      },
+      reconcile: { tasksMs: 60_000, sessionsMs: 60_000 },
+      ui: { recentLimit: 200 },
+      configPath: path.join(directory, "config.json"),
+    };
+    const runtime = new CollectorRuntime(config);
+    cleanups.push(async () => {
+      await runtime.stop();
+      for (const socket of server.clients) socket.terminate();
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+      rmSync(directory, { recursive: true, force: true });
+    });
+    runtime.start();
+
+    await vi.waitFor(() => expect(runtime.getCapabilities()["chat.history"]).toBe("live"), { timeout: 5_000 });
+    // Probed against a session the collector had actually seen: asking about an
+    // invented key would report on that key, not on the method.
+    expect(historyAsked[0]).toMatchObject({ sessionKey: "agent:builder:one", limit: 1 });
+  });
+
+  /**
+   * A Gateway with nothing running yet cannot be asked about `chat.history`: the
+   * probe has to name a session, and there is none to name. That left the verdict
+   * unknown for the rest of the connection, so a build that does not advertise the
+   * method archived nothing for as long as it stayed up — however many sessions
+   * started in the meantime. The probe is retried as the sessions arrive.
+   */
+  it("probes chat.history once the first session shows up, not only at connect", async () => {
+    const server = new WebSocketServer({ host: "127.0.0.1", port: 0 });
+    await once(server, "listening");
+    const address = server.address();
+    if (!address || typeof address === "string") throw new Error("mock gateway did not bind TCP");
+    const historyAsked: Array<Record<string, unknown>> = [];
+    let sessionsListed = 0;
+    server.on("connection", (socket) => {
+      socket.send(JSON.stringify({ type: "event", event: "connect.challenge", payload: { nonce: "late-probe", ts: Date.now() } }));
+      socket.on("message", (raw) => {
+        const request = JSON.parse(raw.toString()) as { id: string; method: string; params?: Record<string, unknown> };
+        const respond = (payload: unknown) => socket.send(JSON.stringify({ type: "res", id: request.id, ok: true, payload }));
+        const refuse = (message: string) =>
+          socket.send(JSON.stringify({ type: "res", id: request.id, ok: false, error: { code: "METHOD_NOT_FOUND", message } }));
+        if (request.method === "connect") respond({ type: "hello-ok", protocol: 4, server: { version: "runtime-test", connId: "late" }, features: { methods: ["tasks.list", "sessions.list", "sessions.subscribe"], events: ["task", "agent", "sessions.changed", "session.tool"] }, snapshot: {}, auth: { role: "operator", scopes: ["operator.read"] }, policy: { maxPayload: 1_000_000, maxBufferedBytes: 1_000_000, tickIntervalMs: 30_000 } });
+        else if (request.method === "sessions.subscribe") respond({ subscribed: true });
+        else if (request.method === "tasks.list") respond({ tasks: [] });
+        else if (request.method === "sessions.list") {
+          sessionsListed += 1;
+          // Idle at connect, busy a moment later.
+          const sessions =
+            sessionsListed === 1
+              ? []
+              : [{ key: "agent:builder:late", agentId: "builder", label: "Session", status: "running", hasActiveRun: true, startedAt: 1_000 }];
+          respond({ sessions, hasMore: false, nextOffset: sessions.length });
+        } else if (request.method === "chat.history") {
+          historyAsked.push(request.params ?? {});
+          respond({ sessionKey: request.params?.sessionKey, sessionId: "gen-late", messages: [] });
+        } else refuse(`unknown method ${request.method}`);
+      });
+    });
+
+    const directory = mkdtempSync(path.join(tmpdir(), "collector-runtime-late-probe-"));
+    const config: ResolvedCollectorConfig = {
+      gateway: { name: "test", url: `ws://127.0.0.1:${address.port}`, tokenEnv: "TEST_GATEWAY_TOKEN", token: "test-token" },
+      server: { host: "127.0.0.1", port: 47_127 },
+      storage: {
+        path: path.join(directory, "collector.sqlite"),
+        terminalRetentionDays: 1,
+        usageRetentionDays: 14,
+        sessionRetentionDays: 90,
+        transcriptRetentionDays: 180,
+        transcriptMaxBytes: 64 * 1024 * 1024,
+        transcriptSync: "enabled",
+      },
+      reconcile: { tasksMs: 60_000, sessionsMs: 150 },
+      ui: { recentLimit: 200 },
+      configPath: path.join(directory, "config.json"),
+    };
+    const runtime = new CollectorRuntime(config);
+    cleanups.push(async () => {
+      await runtime.stop();
+      for (const socket of server.clients) socket.terminate();
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+      rmSync(directory, { recursive: true, force: true });
+    });
+    runtime.start();
+
+    await vi.waitFor(() => expect(runtime.getCapabilities()["chat.history"]).toBe("live"), { timeout: 5_000 });
+    // The verdict came from the session that appeared after connect. Nothing was
+    // asked before it existed: a probe about an invented key reports on the key.
+    expect(sessionsListed).toBeGreaterThan(1);
+    expect(historyAsked.map((params) => params.sessionKey)).toEqual(
+      historyAsked.map(() => "agent:builder:late"),
+    );
+    expect(historyAsked[0]).toMatchObject({ limit: 1 });
+  });
+
+  /**
+   * `stop()` closes the database without waiting for a pass already in flight, and
+   * the timers call those passes with `void` — nothing is holding the promise, so a
+   * throw after the close becomes an unhandled rejection and takes the process down
+   * on the way out. Anything the session pass does after its own try boundary has
+   * to survive the database going away underneath it.
+   */
+  it("shuts down cleanly while a session pass is still in flight", async () => {
+    const server = new WebSocketServer({ host: "127.0.0.1", port: 0 });
+    await once(server, "listening");
+    const address = server.address();
+    if (!address || typeof address === "string") throw new Error("mock gateway did not bind TCP");
+    let sessionsListed = 0;
+    server.on("connection", (socket) => {
+      socket.send(JSON.stringify({ type: "event", event: "connect.challenge", payload: { nonce: "shutdown", ts: Date.now() } }));
+      socket.on("message", (raw) => {
+        const request = JSON.parse(raw.toString()) as { id: string; method: string; params?: Record<string, unknown> };
+        const respond = (payload: unknown) => socket.send(JSON.stringify({ type: "res", id: request.id, ok: true, payload }));
+        if (request.method === "connect") respond({ type: "hello-ok", protocol: 4, server: { version: "runtime-test", connId: "shutdown" }, features: { methods: ["tasks.list", "sessions.list", "sessions.subscribe"], events: ["task", "agent", "sessions.changed", "session.tool"] }, snapshot: {}, auth: { role: "operator", scopes: ["operator.read"] }, policy: { maxPayload: 1_000_000, maxBufferedBytes: 1_000_000, tickIntervalMs: 30_000 } });
+        else if (request.method === "sessions.subscribe") respond({ subscribed: true });
+        else if (request.method === "tasks.list") respond({ tasks: [] });
+        else if (request.method === "sessions.list") {
+          sessionsListed += 1;
+          // The first page lands so the archive holds a session — the state in
+          // which the probe below has something to ask about. The second is held
+          // open, which is what puts a pass in flight when the stop arrives.
+          if (sessionsListed === 1) {
+            respond({ sessions: [{ key: "agent:builder:one", agentId: "builder", label: "Session", status: "running", hasActiveRun: true, startedAt: 1_000 }], hasMore: false, nextOffset: 1 });
+          }
+        }
+      });
+    });
+
+    const rejections: unknown[] = [];
+    const onRejection = (reason: unknown) => rejections.push(reason);
+    process.on("unhandledRejection", onRejection);
+
+    const directory = mkdtempSync(path.join(tmpdir(), "collector-runtime-shutdown-"));
+    const config: ResolvedCollectorConfig = {
+      gateway: { name: "test", url: `ws://127.0.0.1:${address.port}`, tokenEnv: "TEST_GATEWAY_TOKEN", token: "test-token" },
+      server: { host: "127.0.0.1", port: 47_128 },
+      storage: {
+        path: path.join(directory, "collector.sqlite"),
+        terminalRetentionDays: 1,
+        usageRetentionDays: 14,
+        sessionRetentionDays: 90,
+        transcriptRetentionDays: 180,
+        transcriptMaxBytes: 64 * 1024 * 1024,
+        transcriptSync: "enabled",
+      },
+      reconcile: { tasksMs: 60_000, sessionsMs: 120 },
+      ui: { recentLimit: 200 },
+      configPath: path.join(directory, "config.json"),
+    };
+    const runtime = new CollectorRuntime(config);
+    // The stop is part of the test, so the cleanup must not repeat it: `stop()`
+    // closes the database handle and closing it twice throws.
+    cleanups.push(async () => {
+      process.off("unhandledRejection", onRejection);
+      for (const socket of server.clients) socket.terminate();
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+      rmSync(directory, { recursive: true, force: true });
+    });
+    runtime.start();
+
+    await vi.waitFor(() => expect(sessionsListed).toBeGreaterThan(1), { timeout: 5_000 });
+    await runtime.stop();
+    // Long enough for the held request to be rejected by the stop and for whatever
+    // the pass does afterwards to run against the closed database.
+    await new Promise<void>((resolve) => setTimeout(resolve, 200));
+
+    expect(rejections).toEqual([]);
+  });
+
+  /**
+   * A deletion is the one change a client cannot infer. Retention runs on its own
+   * six-hour timer, and on an idle collector nothing else emits a frame — so rows
+   * this pass removed stayed on an open page, listed and linkable and gone, until
+   * someone reloaded by hand.
+   */
+  it("tells clients to refetch what retention deleted", async () => {
+    const directory = mkdtempSync(path.join(tmpdir(), "collector-runtime-prune-"));
+    const config: ResolvedCollectorConfig = {
+      gateway: { name: "test", url: "ws://127.0.0.1:1", tokenEnv: "TEST_GATEWAY_TOKEN", token: "test-token" },
+      server: { host: "127.0.0.1", port: 47_127 },
+      storage: {
+        path: path.join(directory, "collector.sqlite"),
+        terminalRetentionDays: 1,
+        usageRetentionDays: 14,
+        sessionRetentionDays: 90,
+        transcriptRetentionDays: 180,
+        transcriptMaxBytes: 64 * 1024 * 1024,
+        transcriptSync: "enabled",
+      },
+      reconcile: { tasksMs: 60_000, sessionsMs: 60_000 },
+      ui: { recentLimit: 200 },
+      configPath: path.join(directory, "config.json"),
+    };
+    // Never started: the prune pass is what is under test, and a gateway would
+    // only add frames of its own.
+    const runtime = new CollectorRuntime(config);
+    cleanups.push(async () => {
+      await runtime.stop();
+      rmSync(directory, { recursive: true, force: true });
+    });
+
+    const day = 24 * 60 * 60 * 1_000;
+    const longAgo = Date.now() - 200 * day;
+    const repository = (runtime as unknown as { repository: CollectorRepository }).repository;
+    repository.upsertSessions([
+      {
+        sessionKey: "agent:builder:ancient",
+        agentId: "builder",
+        label: "Ancient session",
+        kindHint: "main",
+        archived: true,
+        hasActiveRun: false,
+        lineage: {},
+        lastActivityAt: longAgo,
+        observedAt: longAgo,
+        coverage: { index: "live", detail: "not_observed", usage: "not_observed", messages: "live" },
+      },
+    ]);
+    repository.transcripts.append([
+      {
+        sessionKey: "agent:builder:ancient",
+        seq: 0,
+        role: "user",
+        content: "long forgotten",
+        createdAt: longAgo,
+        observedAt: longAgo,
+      },
+    ]);
+
+    const frames: Array<{ topics?: string[]; reasons: string[] }> = [];
+    const unsubscribe = runtime.subscribeChanges((change) => frames.push(change));
+    (runtime as unknown as { prune: () => void }).prune();
+    unsubscribe();
+
+    expect(frames).toHaveLength(1);
+    expect(frames[0]?.reasons).toEqual(["retention_prune"]);
+    expect([...(frames[0]?.topics ?? [])].sort()).toEqual(["messages", "sessions"]);
+    expect(repository.transcripts.listMessages("agent:builder:ancient")).toEqual([]);
+  });
+
+  it("stays quiet when a prune pass deleted nothing", async () => {
+    const directory = mkdtempSync(path.join(tmpdir(), "collector-runtime-prune-quiet-"));
+    const config: ResolvedCollectorConfig = {
+      gateway: { name: "test", url: "ws://127.0.0.1:1", tokenEnv: "TEST_GATEWAY_TOKEN", token: "test-token" },
+      server: { host: "127.0.0.1", port: 47_128 },
+      storage: {
+        path: path.join(directory, "collector.sqlite"),
+        terminalRetentionDays: 1,
+        usageRetentionDays: 14,
+        sessionRetentionDays: 90,
+        transcriptRetentionDays: 180,
+        transcriptMaxBytes: 64 * 1024 * 1024,
+        transcriptSync: "enabled",
+      },
+      reconcile: { tasksMs: 60_000, sessionsMs: 60_000 },
+      ui: { recentLimit: 200 },
+      configPath: path.join(directory, "config.json"),
+    };
+    const runtime = new CollectorRuntime(config);
+    cleanups.push(async () => {
+      await runtime.stop();
+      rmSync(directory, { recursive: true, force: true });
+    });
+
+    const frames: unknown[] = [];
+    const unsubscribe = runtime.subscribeChanges((change) => frames.push(change));
+    (runtime as unknown as { prune: () => void }).prune();
+    unsubscribe();
+
+    expect(frames).toEqual([]);
   });
 });

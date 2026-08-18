@@ -230,7 +230,8 @@ describe("UsageSynchronizer cost", () => {
     expect(outcome.costRefreshed).toBe(true);
     expect(gateway.calls.filter((call) => call.method === "usage.cost")).toHaveLength(2);
     expect(sync.costFor("24h", "builder")).toBe(7_000);
-    expect(sync.getCostCoverage()).toBe("live");
+    expect(sync.getCostCoverage("24h")).toBe("live");
+    expect(sync.getCostCoverage("7d")).toBe("live");
   });
 
   it("re-prices on its own slower cadence, not every usage round", async () => {
@@ -255,7 +256,8 @@ describe("UsageSynchronizer cost", () => {
     const outcome = await sync.runOnce({ ...LIVE, now: NOW, costState: "unavailable" });
 
     expect(outcome).toMatchObject({ recorded: 2, coverage: "live", costRefreshed: false });
-    expect(sync.getCostCoverage()).toBe("unavailable");
+    expect(sync.getCostCoverage("24h")).toBe("unavailable");
+    expect(sync.getCostCoverage("7d")).toBe("unavailable");
     expect(gateway.calls.some((call) => call.method === "usage.cost")).toBe(false);
   });
 
@@ -276,7 +278,41 @@ describe("UsageSynchronizer cost", () => {
     await sync.runOnce({ ...LIVE, now: NOW + COST_SYNC_MS });
 
     expect(sync.costFor("24h", "builder")).toBe(7_000);
-    expect(sync.getCostCoverage()).toBe("error");
+    expect(sync.getCostCoverage("24h")).toBe("error");
+  });
+
+  /**
+   * The windows are separate requests that fail separately. Building a fresh pair
+   * and swapping both in meant the failed window arrived as an empty map — its
+   * prices silently gone — while the round reported `live` on the strength of the
+   * window that did answer, which is a figure presented as priced when nothing
+   * priced it.
+   */
+  it("degrades only the window whose request failed", async () => {
+    const repo = repository();
+    seed(repo, 1);
+    let failWindow: number | undefined;
+    const gateway = recordingGateway({
+      cost: async (_method, params) => {
+        // The 24h call asks for the shorter range, which is how the two are told
+        // apart without depending on call order.
+        const span = Number(params.to) - Number(params.from);
+        if (failWindow !== undefined && span === failWindow) throw new Error("boom");
+        return { agents: [{ agentId: "builder", costMicroUsd: span === 24 * 60 * 60_000 ? 7_000 : 30_000 }] };
+      },
+    });
+    const sync = synchronizer(repo, gateway.request);
+    await sync.runOnce({ ...LIVE, now: NOW });
+    expect(sync.costFor("7d", "builder")).toBe(30_000);
+
+    failWindow = 24 * 60 * 60_000;
+    await sync.runOnce({ ...LIVE, now: NOW + COST_SYNC_MS });
+
+    expect(sync.getCostCoverage("24h")).toBe("error");
+    expect(sync.getCostCoverage("7d")).toBe("live");
+    // The window that failed keeps the price it last knew rather than blanking it.
+    expect(sync.costFor("24h", "builder")).toBe(7_000);
+    expect(sync.costFor("7d", "builder")).toBe(30_000);
   });
 
   it("forgets prices when the connection generation changes", async () => {
@@ -288,6 +324,7 @@ describe("UsageSynchronizer cost", () => {
 
     sync.resetCost();
     expect(sync.costFor("24h", "builder")).toBeUndefined();
-    expect(sync.getCostCoverage()).toBe("not_observed");
+    expect(sync.getCostCoverage("24h")).toBe("not_observed");
+    expect(sync.getCostCoverage("7d")).toBe("not_observed");
   });
 });

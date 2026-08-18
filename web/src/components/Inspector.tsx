@@ -3,7 +3,7 @@ import { motion } from "motion/react";
 import { useEffect, useState, type ReactNode } from "react";
 import type { ActivityDetail } from "../../../src/contracts";
 import { collectorApi } from "../api";
-import { formatRelative, formatTime, outcomeLabel } from "../lib/format";
+import { formatExact, formatRelative, formatTime, outcomeLabel } from "../lib/format";
 
 function InspectorSection({ title, children }: { title: string; children: ReactNode }) {
   return <section className="inspector-section"><h3>{title}</h3>{children}</section>;
@@ -54,7 +54,7 @@ export function Inspector({ id, onClose }: { id: string; onClose: () => void }) 
                 </InspectorSection>
                 <InspectorSection title="TIMELINE">
                   <div className="timeline">
-                    {detail.timeline.length === 0 ? <p className="muted">No state transition has been retained yet.</p> : detail.timeline.map((entry) => <div className="timeline-entry" key={entry.id}><span /><div><b>{entry.kind}</b><small>{entry.toolName ?? entry.status ?? entry.phase ?? entry.source}</small></div><time>{formatTime(entry.occurredAt)}</time></div>)}
+                    {detail.timeline.length === 0 ? <p className="muted">No state transition has been retained yet.</p> : detail.timeline.map((entry) => <div className="timeline-entry" key={entry.id}><span /><div><b>{entry.kind}</b><small>{entry.toolName ?? entry.status ?? entry.phase ?? entry.source}</small></div><time dateTime={new Date(entry.occurredAt).toISOString()} title={formatExact(entry.occurredAt)}>{formatTime(entry.occurredAt)}</time></div>)}
                   </div>
                 </InspectorSection>
                 <InspectorSection title="RELATIONSHIPS">

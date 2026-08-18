@@ -2,7 +2,7 @@ import { AnimatePresence, motion } from "motion/react";
 import type { SettledGroupSummary, SettledPriorityTier, SettledRange } from "../../../src/contracts";
 import { useCellLayout } from "../hooks/use-cell-layout";
 import { PRIORITY_ORDER, SERIES_TONE } from "../lib/board";
-import { formatDateTime, formatRelative } from "../lib/format";
+import { formatDateTime, formatExact, formatRelative } from "../lib/format";
 import { applyCellQuota, type CellLayout } from "../settled-layout";
 
 function SeriesGroupCard({
@@ -44,7 +44,7 @@ function SeriesGroupCard({
         {group.blockedCount > 0 ? ` · blocked ${group.blockedCount}` : ""}
       </span>
       {matching ? <span className="series-match">{group.runCount} matching runs</span> : null}
-      {layout.mode === "wide" ? <span className="series-confidence">Same displayed title · {formatDateTime(group.latestEndedAt)}</span> : null}
+      {layout.mode === "wide" ? <span className="series-confidence" title={formatExact(group.latestEndedAt)}>Same displayed title · {formatDateTime(group.latestEndedAt)}</span> : null}
     </motion.button>
   );
 }

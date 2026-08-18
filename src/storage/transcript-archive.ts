@@ -57,6 +57,19 @@ export type ArchiveUsage = {
   storedBytes: number;
 };
 
+export type EvictionOutcome = {
+  sessions: number;
+  messages: number;
+  /**
+   * False when the protected sessions alone still exceed the ceiling.
+   *
+   * The caller needs this to tell "made room" apart from "there is no more room
+   * to make", because the two call for opposite behaviour: carry on archiving, or
+   * stop and say so.
+   */
+  reachedTarget: boolean;
+};
+
 type Row = Record<string, unknown>;
 
 function asString(value: unknown): string | undefined {
@@ -115,9 +128,14 @@ export class TranscriptArchive {
   /**
    * Idempotent on `(session_key, seq, session_id)`. Re-fetching a range of
    * history is a no-op rather than a source of duplicate rows.
+   *
+   * When a re-fetch brings back *different* text for a position already stored,
+   * the stored version is kept and flagged. Discarding the difference in silence
+   * is what the flag exists to prevent: a transcript that reads as a faithful copy
+   * while upstream has since said something else in that turn.
    */
-  append(writes: MessageWrite[]): { inserted: number; skipped: number } {
-    if (writes.length === 0) return { inserted: 0, skipped: 0 };
+  append(writes: MessageWrite[]): { inserted: number; insertedBytes: number; skipped: number; divergent: number } {
+    if (writes.length === 0) return { inserted: 0, insertedBytes: 0, skipped: 0, divergent: 0 };
     const statement = this.db.prepare(`
       INSERT INTO session_messages (
         session_key, session_id, message_id, seq, role, channel, tool_name,
@@ -125,10 +143,19 @@ export class TranscriptArchive {
       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT (session_key, seq, session_id) DO NOTHING
     `);
+    // Only reached when the insert conflicted, and a no-op unless the text
+    // actually differs from what is stored.
+    const markDivergent = this.db.prepare(`
+      UPDATE session_messages SET divergent = 1
+      WHERE session_key = ? AND seq = ? AND session_id = ? AND divergent = 0 AND content <> ?
+    `);
     let inserted = 0;
+    let insertedBytes = 0;
+    let divergent = 0;
     this.db.exec("BEGIN IMMEDIATE");
     try {
       for (const write of writes) {
+        const contentBytes = Buffer.byteLength(write.content, "utf8");
         const result = statement.run(
           write.sessionKey,
           write.sessionId ?? "",
@@ -138,18 +165,31 @@ export class TranscriptArchive {
           write.channel ?? null,
           write.toolName ?? null,
           write.content,
-          Buffer.byteLength(write.content, "utf8"),
+          contentBytes,
           write.createdAt,
           write.observedAt,
         );
-        inserted += Number(result.changes);
+        if (Number(result.changes) > 0) {
+          inserted += 1;
+          // Reported so the caller's capacity estimate can grow by what landed
+          // rather than by what it offered. A page the archive already held adds
+          // nothing to the file, and counting it did: a Gateway that does not
+          // number or id its messages has every tail re-read look like new bytes,
+          // and the estimate walked up to the ceiling on rows that were never
+          // written.
+          insertedBytes += contentBytes;
+          continue;
+        }
+        divergent += Number(
+          markDivergent.run(write.sessionKey, write.seq, write.sessionId ?? "", write.content).changes,
+        );
       }
       this.db.exec("COMMIT");
     } catch (error) {
       this.db.exec("ROLLBACK");
       throw error;
     }
-    return { inserted, skipped: writes.length - inserted };
+    return { inserted, insertedBytes, skipped: writes.length - inserted, divergent };
   }
 
   /**
@@ -413,8 +453,11 @@ export class TranscriptArchive {
    * it is merged. Capacity is measured from those pages: without this, deleting
    * transcripts barely moves the number the budget is compared against, and an
    * archive that has been emptied can still read as over budget.
+   *
+   * Public because a caller that owns the surrounding transaction deletes through
+   * `dropSessionsInTransaction` and has to do this part itself, after committing.
    */
-  private compactIndex(): void {
+  compactIndex(): void {
     this.db.exec("INSERT INTO session_messages_fts(session_messages_fts) VALUES('optimize')");
   }
 
@@ -422,23 +465,35 @@ export class TranscriptArchive {
    * Capacity eviction drops whole sessions, oldest first. Trimming individual
    * messages would leave half-conversations behind, which are close to worthless
    * for review and actively misleading in search results.
+   *
+   * `protectSince` shields sessions that are still producing messages, and with
+   * them the conversation someone is most likely reading right now. Without it an
+   * over-budget archive tore up the newest session, the next sync round pulled it
+   * straight back, and the round after that evicted it again — the archive spent
+   * its whole request budget shredding and refetching the same transcript. When
+   * the protected sessions alone exceed the ceiling, `reachedTarget` is false and
+   * nothing further is deleted: the caller is expected to stop archiving and say
+   * so, which is the honest end of a full disk.
    */
-  evictOldestSessions(targetStoredBytes: number): { sessions: number; messages: number } {
+  evictOldestSessions(targetStoredBytes: number, options: { protectSince?: number } = {}): EvictionOutcome {
     const usage = this.usage();
     if (usage.storedBytes <= targetStoredBytes || usage.contentBytes === 0) {
-      return { sessions: 0, messages: 0 };
+      return { sessions: 0, messages: 0, reachedTarget: true };
     }
+    const protectSince = options.protectSince ?? Number.POSITIVE_INFINITY;
     const candidates = this.db
       .prepare(`
         SELECT m.session_key AS session_key,
                SUM(m.content_bytes) AS bytes,
-               COALESCE(s.last_activity_at, MIN(m.created_at)) AS activity
+               COALESCE(s.last_activity_at, MIN(m.created_at)) AS activity,
+               COALESCE(s.has_active_run, 0) AS active_run
         FROM session_messages m
         LEFT JOIN sessions s ON s.session_key = m.session_key
         GROUP BY m.session_key
+        HAVING active_run = 0 AND activity < ?
         ORDER BY activity ASC
       `)
-      .all() as Row[];
+      .all(protectSince === Number.POSITIVE_INFINITY ? Number.MAX_SAFE_INTEGER : protectSince) as Row[];
 
     // storedBytes includes index overhead, so scale the content-byte budget by the
     // observed ratio instead of comparing the two directly.
@@ -450,7 +505,10 @@ export class TranscriptArchive {
       doomed.push(String(candidate.session_key));
       contentBudget -= Number(candidate.bytes);
     }
-    if (doomed.length === 0) return { sessions: 0, messages: 0 };
+    // With nothing left to take, whatever is still owing is held by the sessions
+    // this pass refuses to touch — the estimate is the only answer available,
+    // since no delete happened to measure.
+    if (doomed.length === 0) return { sessions: 0, messages: 0, reachedTarget: contentBudget <= 0 };
 
     const statement = this.db.prepare("DELETE FROM session_messages WHERE session_key = ?");
     // The watermark has to come back with the text. Left alone it would keep
@@ -475,7 +533,13 @@ export class TranscriptArchive {
       throw error;
     }
     this.compactIndex();
-    return { sessions: doomed.length, messages };
+    // Measured, not predicted. The selection above works in content bytes scaled
+    // by a ratio, while the budget is in database pages, and pages are allocated
+    // in whole blocks that a content estimate cannot see. Saying "full" is a claim
+    // that new messages are not being stored, so it is worth one more `dbstat`
+    // walk on a path that has just deleted whole sessions anyway.
+    const reachedTarget = this.usage().storedBytes <= targetStoredBytes;
+    return { sessions: doomed.length, messages, reachedTarget };
   }
 
   /**
@@ -489,6 +553,29 @@ export class TranscriptArchive {
   dropSessions(sessionKeys: readonly string[]): number {
     if (sessionKeys.length === 0) return 0;
     let removed = 0;
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      removed = this.dropSessionsInTransaction(sessionKeys);
+      this.db.exec("COMMIT");
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
+    if (removed > 0) this.compactIndex();
+    return removed;
+  }
+
+  /**
+   * The delete without the transaction, for a caller that owns one.
+   *
+   * Session retention deletes transcripts, session rows and the Activity
+   * references that point at them; those have to land together or not at all, so
+   * the transaction has to belong to the caller. The FTS compaction is index
+   * maintenance rather than part of that atomicity, and is the caller's to run
+   * after committing.
+   */
+  dropSessionsInTransaction(sessionKeys: readonly string[]): number {
+    let removed = 0;
     // Chunked to stay clear of the bound-parameter ceiling on a large prune.
     for (let index = 0; index < sessionKeys.length; index += 500) {
       const chunk = sessionKeys.slice(index, index + 500);
@@ -497,7 +584,6 @@ export class TranscriptArchive {
         this.db.prepare(`DELETE FROM session_messages WHERE session_key IN (${placeholders})`).run(...chunk).changes,
       );
     }
-    if (removed > 0) this.compactIndex();
     return removed;
   }
 

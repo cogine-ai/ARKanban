@@ -1202,6 +1202,20 @@ export class CollectorRepository {
   }
 
   /**
+   * The most recently active session key, or none if none has been observed.
+   *
+   * Exists for capability probing: `chat.history` needs a session to ask about,
+   * and asking about an invented key would report on that key rather than on
+   * whether the method exists at all.
+   */
+  mostRecentSessionKey(): string | undefined {
+    const row = this.db
+      .prepare("SELECT session_key FROM sessions ORDER BY last_activity_at DESC, session_key ASC LIMIT 1")
+      .get() as Record<string, unknown> | undefined;
+    return row === undefined ? undefined : String(row.session_key);
+  }
+
+  /**
    * Keyset-paginated session list.
    *
    * Fetches one row beyond the limit to decide whether a next page exists,
@@ -1357,7 +1371,7 @@ export class CollectorRepository {
         },
         cost: {
           coverage: usageCoverage,
-          source: "snapshots" as const,
+          source: { "24h": "snapshots" as const, "7d": "snapshots" as const },
           windows: costWindows.get(id) ?? { "24h": emptyUsageTotals(), "7d": emptyUsageTotals() },
         },
       };
@@ -1537,25 +1551,46 @@ export class CollectorRepository {
    * here rather than by the database.
    */
   pruneSessions(cutoff: number): number {
-    const doomed = (
-      this.db
-        .prepare("SELECT session_key FROM sessions WHERE archived = 1 AND last_activity_at < ?")
-        .all(cutoff) as Array<Record<string, unknown>>
-    ).map((row) => String(row.session_key));
-    if (doomed.length === 0) return 0;
-
-    this.transcripts.dropSessions(doomed);
-    const result = this.db
-      .prepare("DELETE FROM sessions WHERE archived = 1 AND last_activity_at < ?")
-      .run(cutoff);
-    this.db
-      .prepare(`
-        UPDATE activities SET session_ref = NULL
-        WHERE session_ref IS NOT NULL
-          AND session_ref NOT IN (SELECT session_key FROM sessions)
-      `)
-      .run();
-    return Number(result.changes);
+    // Three deletes that only make sense together. Run separately, a crash
+    // between them left the database in a state no code accounts for: a session
+    // whose transcript is gone but which still lists as archived and searchable,
+    // or Activity rows pointing at a session key that no longer exists.
+    let removed = 0;
+    let messages = 0;
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      // Chosen under the write lock, so the keys whose messages are dropped are
+      // the same rows the delete below removes. Read beforehand, another writer
+      // could archive a session in between: the predicate would then take a row
+      // whose transcript was never in the list, leaving text behind with no
+      // session to reach it by.
+      const doomed = (
+        this.db
+          .prepare("SELECT session_key FROM sessions WHERE archived = 1 AND last_activity_at < ?")
+          .all(cutoff) as Array<Record<string, unknown>>
+      ).map((row) => String(row.session_key));
+      if (doomed.length > 0) {
+        messages = this.transcripts.dropSessionsInTransaction(doomed);
+        removed = Number(
+          this.db.prepare("DELETE FROM sessions WHERE archived = 1 AND last_activity_at < ?").run(cutoff).changes,
+        );
+        this.db
+          .prepare(`
+            UPDATE activities SET session_ref = NULL
+            WHERE session_ref IS NOT NULL
+              AND session_ref NOT IN (SELECT session_key FROM sessions)
+          `)
+          .run();
+      }
+      this.db.exec("COMMIT");
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
+    // Index maintenance, deliberately outside the transaction that had to be
+    // atomic: merging FTS tombstones is what makes the freed pages measurable.
+    if (messages > 0) this.transcripts.compactIndex();
+    return removed;
   }
 
   private listSettledInRange(rangeStart: number, rangeEnd: number): StoredActivity[] {

@@ -19,8 +19,6 @@ export const ACTIVE_WINDOW_MS = 15 * 60_000;
 export const ROUND_REQUEST_BUDGET = 20;
 export const BACKFILL_SESSION_BUDGET = 5;
 export const HISTORY_PAGE_LIMIT = 200;
-/** dbstat walks every page, so the authoritative measure is taken sparingly. */
-export const USAGE_MEASURE_MS = 5 * 60_000;
 
 export type HistoryRequest = (method: string, params: unknown) => Promise<unknown>;
 
@@ -44,8 +42,13 @@ export type TranscriptSyncOutcome = {
   requests: number;
   inserted: number;
   sessions: number;
-  /** `paused` means capacity stopped backfill; active increments continue. */
-  capacity: "ok" | "paused";
+  /**
+   * `paused` means capacity gave up backfill while active increments continue.
+   * `full` means the ceiling is reached and everything still held is too recent
+   * to evict, so this round archived nothing at all — stated rather than worked
+   * around, because the alternative is tearing up the conversation being read.
+   */
+  capacity: "ok" | "paused" | "full";
   evictedSessions: number;
   skipped?: "disabled" | "unavailable" | "primary_sync_failed" | "not_connected";
   errorCode?: string;
@@ -80,7 +83,17 @@ export function classifyHistoryFailure(error: unknown): string {
 
 export class TranscriptSynchronizer {
   private storedBytes = 0;
-  private measuredAt = 0;
+  /**
+   * Page bytes per content byte, as last measured.
+   *
+   * The budget is in page bytes, which is what the archive actually occupies once
+   * its indexes and FTS shadow tables are counted. A round only knows the UTF-8
+   * length of what it wrote, and adding that to a page-byte total compares two
+   * different quantities: the estimate then climbed at roughly a third of the real
+   * rate, and the ceiling was crossed well before anything noticed.
+   */
+  private overhead = 1;
+  private measured = false;
 
   constructor(private readonly deps: TranscriptSyncDeps) {}
 
@@ -98,11 +111,28 @@ export class TranscriptSynchronizer {
     if (!options.available) return { ...idle, skipped: "unavailable" };
     if (!options.primaryHealthy) return { ...idle, skipped: "primary_sync_failed" };
 
-    const capacity = this.capacityState(options.now);
+    let capacity: TranscriptSyncOutcome["capacity"] = this.capacityState(options.now);
     let evictedSessions = 0;
     if (capacity === "paused") {
-      evictedSessions = this.deps.archive.evictOldestSessions(this.deps.maxBytes).sessions;
-      if (evictedSessions > 0) this.measure(options.now);
+      // Sessions still producing messages are off limits. Evicting one only sends
+      // the next round to fetch it again, so the archive would spend every round
+      // deleting and refetching the transcript most likely to be on screen.
+      const eviction = this.deps.archive.evictOldestSessions(this.deps.maxBytes, {
+        protectSince: options.now - ACTIVE_WINDOW_MS,
+      });
+      evictedSessions = eviction.sessions;
+      // An eviction moves enough data that the page cost is worth asking about
+      // again; estimating across an FTS compaction is guesswork.
+      if (evictedSessions > 0) this.measure();
+      if (!eviction.reachedTarget) capacity = "full";
+    }
+
+    // Nothing is pulled while full: every insert would push the archive further
+    // over a ceiling it cannot come back under, and the only sessions left to
+    // evict are the ones being written to. The round reports it instead, which is
+    // what the disclosure panel shows the operator.
+    if (capacity === "full") {
+      return { requests: 0, inserted: 0, sessions: 0, capacity, evictedSessions };
     }
 
     let requests = 0;
@@ -159,14 +189,40 @@ export class TranscriptSynchronizer {
     return this.storedBytes;
   }
 
+  /**
+   * Tells the next round to measure again instead of trusting its estimate.
+   *
+   * Called by the prune cycle, which deletes rows this class has no other way to
+   * hear about. The estimate only ever grows on its own, so a stale one reads as
+   * over budget and would evict transcripts that retention had already removed.
+   */
+  markUsageStale(): void {
+    this.measured = false;
+  }
+
+  /**
+   * Measured once, then estimated.
+   *
+   * `dbstat` enumerates the database's pages, so asking on a schedule put a walk
+   * of the whole file on the sync path every few minutes for as long as the
+   * collector ran. It is now asked at startup, after an eviction has moved a large
+   * amount of data, and after each prune pass — all of which are either rare or
+   * already doing heavy work. Between them the estimate grows with what each round
+   * wrote, scaled into page bytes.
+   */
   private capacityState(now: number): "ok" | "paused" {
-    if (this.measuredAt === 0 || now - this.measuredAt >= USAGE_MEASURE_MS) this.measure(now);
+    if (!this.measured) this.measure();
     return this.storedBytes >= this.deps.maxBytes ? "paused" : "ok";
   }
 
-  private measure(now: number): void {
-    this.storedBytes = this.deps.archive.usage().storedBytes;
-    this.measuredAt = now;
+  private measure(): void {
+    const usage = this.deps.archive.usage();
+    this.storedBytes = usage.storedBytes;
+    // Below 1 the archive would be claiming to hold text in less space than the
+    // text occupies, which happens on an empty archive and would shrink every
+    // later estimate.
+    this.overhead = usage.contentBytes > 0 ? Math.max(usage.storedBytes / usage.contentBytes, 1) : 1;
+    this.measured = true;
   }
 
   /**
@@ -217,8 +273,13 @@ export class TranscriptSynchronizer {
     });
 
     const writes = this.withoutKnown(candidate.sessionKey, page.writes);
-    const { inserted } = this.deps.archive.append(writes);
-    this.storedBytes += writes.reduce((total, write) => total + Buffer.byteLength(write.content, "utf8"), 0);
+    const { inserted, insertedBytes } = this.deps.archive.append(writes);
+    // Only what the insert actually kept. A tail read re-fetches the newest page
+    // every round, and `withoutKnown` can only filter it when the Gateway gives
+    // messages an id; otherwise the duplicates are dropped by the idempotency key
+    // and the file does not grow, so charging the estimate for them would march it
+    // to the ceiling on a session that had stopped changing.
+    this.storedBytes += Math.round(insertedBytes * this.overhead);
 
     // Backfill pages walk backwards, so their sequence numbers sit below the
     // watermark. Reporting this page's own maximum would move the watermark down,

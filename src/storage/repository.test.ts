@@ -172,6 +172,36 @@ describe("CollectorRepository agents and sessions", () => {
     expect(repo.getSession("old-live")).toBeDefined();
   });
 
+  /**
+   * Retention deletes the transcript, the session row and the Activity references
+   * that point at it. Run as separate statements, a failure between them left a
+   * state no code accounts for — a session whose text is gone but which still
+   * lists as archived, or Activity rows referring to a key that no longer exists.
+   */
+  it("drops a session's transcript, row and references together", () => {
+    const repo = repository();
+    repo.upsertSessions([session({ sessionKey: "old-archived", archived: true, lastActivityAt: 1_000 })]);
+    repo.transcripts.append([
+      {
+        sessionKey: "old-archived",
+        seq: 0,
+        role: "user",
+        content: "text that must not outlive its session",
+        createdAt: 1_000,
+        observedAt: 1_000,
+      },
+    ]);
+    expect(repo.transcripts.search({ text: "must not outlive", sessionKey: "old-archived" }).hits).toHaveLength(1);
+
+    expect(repo.pruneSessions(2_000)).toBe(1);
+
+    expect(repo.getSession("old-archived")).toBeUndefined();
+    expect(repo.transcripts.listMessages("old-archived")).toEqual([]);
+    // Searchable text outliving the record it belongs to is the same leak by
+    // another route.
+    expect(repo.transcripts.search({ text: "must not outlive", from: 0 }).hits).toEqual([]);
+  });
+
   it("excludes archived sessions from the default listing", () => {
     const repo = repository();
     repo.upsertSessions([

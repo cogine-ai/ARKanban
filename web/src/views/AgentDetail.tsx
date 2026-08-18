@@ -1,13 +1,13 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import type { AgentActivityRollup, AgentRollupWindow, UpcomingSchedule } from "../../../src/contracts";
+import type { AgentActivityRollup, AgentOverview, AgentRollupWindow, UpcomingSchedule } from "../../../src/contracts";
 import { collectorApi, type AgentDetail as AgentDetailData } from "../api";
 import { AgentCost, ROLLUP_WINDOWS } from "../components/AgentCost";
 import { GradeChip } from "../components/GradeChip";
 import { useScheduleNow } from "../hooks/use-schedule-now";
 import { AGENT_COLORS } from "../lib/board";
 import {
-  formatDateTime,
   formatDuration,
+  formatExact,
   formatPercent,
   formatRelative,
   formatScheduleRelative,
@@ -25,6 +25,20 @@ import { useCollector } from "../state/collector-context";
  * the card shows a success rate, which cannot distinguish an agent that fails
  * from one that is cancelled, times out, or ends without a verdict at all.
  */
+
+/**
+ * Where each window's amount came from.
+ *
+ * The two windows are priced by separate Gateway calls, so one can be a Gateway
+ * price while the other falls back to stored readings — a single label for the
+ * pair would put the Gateway's name on a figure it never priced.
+ */
+function costSourceLabel(source: AgentOverview["cost"]["source"]): string {
+  const priced = ROLLUP_WINDOWS.filter((window) => source[window] === "gateway");
+  if (priced.length === ROLLUP_WINDOWS.length) return "Priced by the Gateway";
+  if (priced.length === 0) return "Totalled from stored session readings";
+  return `${priced.join(" and ")} priced by the Gateway; the rest totalled from stored session readings`;
+}
 
 /** Outcome buckets in the order they are worth reading, worst last. */
 const OUTCOMES: Array<{ key: keyof AgentActivityRollup; label: string }> = [
@@ -106,7 +120,7 @@ function SchedulePanel({ schedules }: { schedules: UpcomingSchedule[] }) {
           {[...schedules].sort((left, right) => left.nextRunAt - right.nextRunAt).map((schedule) => (
             <li key={schedule.id}>
               <span className="schedule-title">{schedule.title}</span>
-              <span className="muted" title={formatDateTime(schedule.nextRunAt)}>
+              <span className="muted" title={formatExact(schedule.nextRunAt)}>
                 {formatScheduleRelative(schedule.nextRunAt, now)}
               </span>
             </li>
@@ -217,9 +231,7 @@ export function AgentDetailView({ agentId }: { agentId: string }) {
         <div className="detail-panel">
           <h2>Cost</h2>
           <AgentCost cost={agent.cost} />
-          <footer className="detail-foot muted">
-            {agent.cost.source === "gateway" ? "Priced by the Gateway" : "Totalled from stored session readings"}
-          </footer>
+          <footer className="detail-foot muted">{costSourceLabel(agent.cost.source)}</footer>
         </div>
 
         <SchedulePanel schedules={live.schedules} />

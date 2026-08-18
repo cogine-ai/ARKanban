@@ -20,7 +20,13 @@ function repository(): CollectorRepository {
   return result;
 }
 
-function seedSession(repo: CollectorRepository, sessionKey: string, agentId = "builder", lastActivityAt = 5_000): void {
+function seedSession(
+  repo: CollectorRepository,
+  sessionKey: string,
+  agentId = "builder",
+  lastActivityAt = 5_000,
+  hasActiveRun = false,
+): void {
   repo.upsertSessions([
     {
       sessionKey,
@@ -28,7 +34,7 @@ function seedSession(repo: CollectorRepository, sessionKey: string, agentId = "b
       label: `Session ${sessionKey}`,
       kindHint: "main",
       archived: false,
-      hasActiveRun: false,
+      hasActiveRun,
       lineage: {},
       lastActivityAt,
       observedAt: lastActivityAt,
@@ -53,8 +59,10 @@ describe("TranscriptArchive", () => {
     seedSession(repo, "agent:builder:one");
     const batch = [message({ seq: 0, content: "first" }), message({ seq: 1, content: "second" })];
 
-    expect(repo.transcripts.append(batch)).toEqual({ inserted: 2, skipped: 0 });
-    expect(repo.transcripts.append(batch)).toEqual({ inserted: 0, skipped: 2 });
+    expect(repo.transcripts.append(batch)).toEqual({ inserted: 2, insertedBytes: 11, skipped: 0, divergent: 0 });
+    // No bytes on the replay: the second call wrote nothing, so a caller sizing
+    // the archive from this number does not grow it for a page it re-read.
+    expect(repo.transcripts.append(batch)).toEqual({ inserted: 0, insertedBytes: 0, skipped: 2, divergent: 0 });
     expect(repo.transcripts.listMessages("agent:builder:one")).toHaveLength(2);
   });
 
@@ -95,6 +103,36 @@ describe("TranscriptArchive", () => {
     const narrowed = repo.transcripts.search({ text: "登录", agentId: "builder" });
     expect(narrowed.mode).toBe("fallback");
     expect(narrowed.hits).toHaveLength(1);
+  });
+
+  /**
+   * §7.2 of the amendment: where the Gateway has rewritten a range that was
+   * already synced, the local copy keeps what it stored first and marks it. The
+   * flag was declared and never written, so a rewritten turn read as a faithful
+   * copy of something upstream no longer says.
+   */
+  it("keeps the first version and flags it when the same position comes back different", () => {
+    const repo = repository();
+    seedSession(repo, "agent:builder:one");
+    repo.transcripts.append([message({ seq: 0, content: "the original wording" })]);
+
+    const second = repo.transcripts.append([message({ seq: 0, content: "a different wording entirely" })]);
+
+    expect(second).toEqual({ inserted: 0, insertedBytes: 0, skipped: 1, divergent: 1 });
+    const stored = repo.transcripts.listMessages("agent:builder:one");
+    expect(stored).toHaveLength(1);
+    expect(stored[0]).toMatchObject({ content: "the original wording", divergent: true });
+  });
+
+  it("does not flag a re-fetch that brought back the same text", () => {
+    const repo = repository();
+    seedSession(repo, "agent:builder:one");
+    repo.transcripts.append([message({ seq: 0, content: "unchanged" })]);
+
+    const second = repo.transcripts.append([message({ seq: 0, content: "unchanged" })]);
+
+    expect(second).toEqual({ inserted: 0, insertedBytes: 0, skipped: 1, divergent: 0 });
+    expect(repo.transcripts.listMessages("agent:builder:one")[0]).toMatchObject({ divergent: false });
   });
 
   it("refuses an unbounded short query instead of scanning the whole archive", () => {
@@ -142,11 +180,94 @@ describe("TranscriptArchive", () => {
 
     const before = repo.transcripts.usage();
     expect(before.storedBytes).toBeGreaterThan(0);
-    const evicted = repo.transcripts.evictOldestSessions(Math.floor(before.storedBytes * 0.6));
+    const evicted = repo.transcripts.evictOldestSessions(Math.floor(before.storedBytes * 0.8));
 
     expect(evicted.sessions).toBe(1);
+    expect(evicted.reachedTarget).toBe(true);
     expect(repo.transcripts.listMessages("agent:builder:old")).toEqual([]);
     expect(repo.transcripts.listMessages("agent:builder:new")).toHaveLength(40);
+  });
+
+  /**
+   * Half the text does not free half the pages. Indexes and FTS segments are
+   * allocated in whole blocks, and their cost per message rises as the archive
+   * gets smaller — a two-session archive here keeps 68% of its pages after losing
+   * 50% of its text. A content-byte estimate cannot see that, so it reported the
+   * ceiling as met while the file was still over it, and the caller went back to
+   * archiving into an archive with no room. The verdict is measured after the
+   * pages have actually been released.
+   */
+  it("reports the ceiling as missed when freeing the text did not free the pages", () => {
+    const repo = repository();
+    seedSession(repo, "agent:builder:old", "builder", 1_000);
+    seedSession(repo, "agent:builder:new", "builder", 9_000);
+    const bulk = (sessionKey: string) =>
+      Array.from({ length: 40 }, (_unused, index) =>
+        message({ sessionKey, seq: index, content: `padding ${"x".repeat(500)} ${index}` }),
+      );
+    repo.transcripts.append(bulk("agent:builder:old"));
+    repo.transcripts.append(bulk("agent:builder:new"));
+
+    const before = repo.transcripts.usage();
+    // Removing one of two equal sessions clears half the text, which is more than
+    // this target asks for in content terms and still not enough in page terms.
+    const target = Math.floor(before.storedBytes * 0.6);
+    const evicted = repo.transcripts.evictOldestSessions(target);
+
+    expect(evicted.sessions).toBe(1);
+    expect(evicted.reachedTarget).toBe(false);
+    expect(repo.transcripts.usage().storedBytes).toBeGreaterThan(target);
+  });
+
+  /**
+   * Evicting a session that is still producing messages accomplishes nothing: the
+   * next sync round pulls it back, and the round after that evicts it again. The
+   * archive spent its request budget shredding and refetching the one transcript
+   * most likely to be open on screen.
+   */
+  it("refuses to evict a session that is still being written to", () => {
+    const repo = repository();
+    seedSession(repo, "agent:builder:live", "builder", 9_000, true);
+    seedSession(repo, "agent:builder:recent", "builder", 8_000);
+    const bulk = (sessionKey: string) =>
+      Array.from({ length: 40 }, (_unused, index) =>
+        message({ sessionKey, seq: index, content: `padding ${"x".repeat(500)} ${index}` }),
+      );
+    repo.transcripts.append(bulk("agent:builder:live"));
+    repo.transcripts.append(bulk("agent:builder:recent"));
+
+    const before = repo.transcripts.usage();
+    // Both sessions are protected — one by its open run, the other by the window —
+    // so there is no room to make and the caller has to be told so.
+    const evicted = repo.transcripts.evictOldestSessions(Math.floor(before.storedBytes * 0.4), {
+      protectSince: 7_000,
+    });
+
+    expect(evicted).toEqual({ sessions: 0, messages: 0, reachedTarget: false });
+    expect(repo.transcripts.listMessages("agent:builder:live")).toHaveLength(40);
+    expect(repo.transcripts.listMessages("agent:builder:recent")).toHaveLength(40);
+  });
+
+  it("evicts what it may while protecting the live session", () => {
+    const repo = repository();
+    seedSession(repo, "agent:builder:live", "builder", 9_000, true);
+    seedSession(repo, "agent:builder:cold", "builder", 1_000);
+    const bulk = (sessionKey: string) =>
+      Array.from({ length: 40 }, (_unused, index) =>
+        message({ sessionKey, seq: index, content: `padding ${"x".repeat(500)} ${index}` }),
+      );
+    repo.transcripts.append(bulk("agent:builder:live"));
+    repo.transcripts.append(bulk("agent:builder:cold"));
+
+    const before = repo.transcripts.usage();
+    const evicted = repo.transcripts.evictOldestSessions(Math.floor(before.storedBytes * 0.8), {
+      protectSince: 7_000,
+    });
+
+    expect(evicted.sessions).toBe(1);
+    expect(evicted.reachedTarget).toBe(true);
+    expect(repo.transcripts.listMessages("agent:builder:cold")).toEqual([]);
+    expect(repo.transcripts.listMessages("agent:builder:live")).toHaveLength(40);
   });
 
   it("reports sync watermarks so a stale local copy is not shown as live", () => {

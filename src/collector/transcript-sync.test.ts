@@ -6,6 +6,7 @@ import { CollectorRepository } from "../storage/repository.js";
 import {
   BACKFILL_SESSION_BUDGET,
   ROUND_REQUEST_BUDGET,
+  TRANSCRIPT_SYNC_MS,
   TranscriptSynchronizer,
   classifyHistoryFailure,
   type HistoryRequest,
@@ -347,24 +348,144 @@ describe("transcript sync budgets", () => {
   });
 });
 
+/** Fills a session's archive directly, to put the store over a ceiling. */
+function padArchive(repo: CollectorRepository, sessionKey: string, count = 40): void {
+  repo.transcripts.append(
+    Array.from({ length: count }, (_unused, index) => ({
+      sessionKey,
+      seq: index,
+      role: "assistant" as const,
+      content: `padding ${"x".repeat(500)} ${index}`,
+      createdAt: NOW - 100_000 + index,
+      observedAt: NOW - 100_000 + index,
+    })),
+  );
+}
+
 describe("transcript sync capacity", () => {
   it("keeps active increments but stops backfill once the ceiling is reached", async () => {
     const repo = repository();
     seedSession(repo, "agent:builder:live", { lastActivityAt: NOW });
-    seedSession(repo, "agent:builder:old", { active: false, lastActivityAt: NOW - 60 * 60_000 });
+    seedSession(repo, "agent:builder:cold", { active: false, lastActivityAt: NOW - 60 * 60_000 });
+    padArchive(repo, "agent:builder:live");
+    padArchive(repo, "agent:builder:cold");
     const { request, calls } = gateway({
       "agent:builder:live": [turn(0), turn(1), turn(2)],
-      "agent:builder:old": [turn(0), turn(1), turn(2)],
+      "agent:builder:cold": [turn(0), turn(1), turn(2)],
     });
-    // Any stored page exceeds a one-byte ceiling, so the first round already
-    // reports pressure rather than needing a large fixture to build up.
-    const sync = synchronizer(repo, request, { maxBytes: 1 });
+    // Tight enough to be over budget, loose enough that dropping the cold session
+    // gets back under it — measured, not estimated: two equal sessions here keep
+    // 68% of their pages after one of them goes, because index and FTS pages do
+    // not shrink in step with the text they cover.
+    const sync = synchronizer(repo, request, { maxBytes: Math.floor(repo.transcripts.usage().storedBytes * 0.8) });
 
-    await sync.runOnce(healthy);
     const outcome = await sync.runOnce(healthy);
 
     expect(outcome.capacity).toBe("paused");
-    expect(calls.map((call) => call.sessionKey)).not.toContain("agent:builder:old");
+    expect(outcome.evictedSessions).toBe(1);
+    // The live session keeps receiving its tail; only backfill was given up.
+    expect(calls).toEqual([{ sessionKey: "agent:builder:live" }]);
+  });
+
+  /**
+   * The end of a full archive, stated rather than worked around. Every session
+   * left is too recent to evict, so continuing to pull would push further over a
+   * ceiling nothing can bring it back under — and the only way to make room would
+   * be to tear up a conversation still being written to.
+   */
+  it("stops archiving and says so when everything left is too recent to evict", async () => {
+    const repo = repository();
+    seedSession(repo, "agent:builder:live", { lastActivityAt: NOW });
+    padArchive(repo, "agent:builder:live");
+    const { request, calls } = gateway({ "agent:builder:live": [turn(0), turn(1), turn(2)] });
+    const sync = synchronizer(repo, request, { maxBytes: Math.floor(repo.transcripts.usage().storedBytes * 0.5) });
+
+    const outcome = await sync.runOnce(healthy);
+
+    expect(outcome).toMatchObject({ capacity: "full", requests: 0, inserted: 0, evictedSessions: 0 });
+    expect(calls).toEqual([]);
+    expect(repo.transcripts.listMessages("agent:builder:live")).toHaveLength(40);
+  });
+
+  /**
+   * The budget is in page bytes — the space the archive actually occupies once its
+   * indexes and FTS shadow tables are counted. A round only knows the UTF-8 length
+   * of what it wrote, so adding that raw would let the estimate climb at a
+   * fraction of the real rate and sail past the ceiling unnoticed.
+   */
+  it("counts a round's writes at the archive's real cost per byte of text", async () => {
+    const repo = repository();
+    seedSession(repo, "agent:builder:live", { lastActivityAt: NOW });
+    padArchive(repo, "agent:builder:live");
+    const measured = repo.transcripts.usage();
+    const overhead = measured.storedBytes / measured.contentBytes;
+    expect(overhead).toBeGreaterThan(1);
+
+    // Sequence numbers above the padding, which already occupies 0-39: the archive
+    // treats a repeated number in the same session as the same message.
+    const { request } = gateway({ "agent:builder:live": [turn(100), turn(101)] });
+    const sync = synchronizer(repo, request, { maxBytes: 512 * 1024 * 1024 });
+    await sync.runOnce(healthy);
+
+    const written = repo.transcripts.usage().contentBytes - measured.contentBytes;
+    expect(written).toBeGreaterThan(0);
+    expect(sync.archiveBytes).toBe(measured.storedBytes + Math.round(written * overhead));
+  });
+
+  /**
+   * A tail read asks for the newest page every round, so the same messages come
+   * back over and over. `withoutKnown` filters them only when the Gateway gives a
+   * message an id; otherwise the idempotency key drops them at the insert and the
+   * file does not grow. Charging the estimate for those writes anyway made an idle
+   * session climb towards the ceiling on text that was already stored, until the
+   * archive started evicting transcripts to make room for nothing.
+   */
+  it("does not charge the estimate for a page it already had", async () => {
+    const repo = repository();
+    seedSession(repo, "agent:builder:live", { lastActivityAt: NOW });
+    // Numbered but not identified, which is what makes the duplicates reach the
+    // insert instead of being filtered before it.
+    const unidentified = (seq: number) => ({
+      role: "user",
+      content: `message ${seq}`,
+      timestamp: NOW - 1_000 + seq,
+      __openclaw: { seq },
+    });
+    const { request } = gateway({ "agent:builder:live": [unidentified(0), unidentified(1)] });
+    const sync = synchronizer(repo, request);
+
+    const first = await sync.runOnce(healthy);
+    const afterFirst = sync.archiveBytes;
+    const second = await sync.runOnce({ ...healthy, now: NOW + TRANSCRIPT_SYNC_MS });
+
+    expect(first.inserted).toBe(2);
+    expect(afterFirst).toBeGreaterThan(0);
+    expect(second.inserted).toBe(0);
+    expect(sync.archiveBytes).toBe(afterFirst);
+  });
+
+  /**
+   * Retention deletes rows the synchronizer never hears about, and its estimate
+   * only ever grows. Left uncorrected it reads as over budget and starts evicting
+   * transcripts that are no longer there.
+   */
+  it("re-measures after a prune instead of trusting a stale estimate", async () => {
+    const repo = repository();
+    seedSession(repo, "agent:builder:live", { lastActivityAt: NOW });
+    padArchive(repo, "agent:builder:live");
+    // An empty history, so the rounds below only move the estimate by measuring.
+    const { request } = gateway({});
+    const sync = synchronizer(repo, request, { maxBytes: 512 * 1024 * 1024 });
+    await sync.runOnce(healthy);
+    const beforePrune = sync.archiveBytes;
+    expect(beforePrune).toBeGreaterThan(0);
+
+    repo.transcripts.pruneOlderThan(NOW);
+    sync.markUsageStale();
+    await sync.runOnce(healthy);
+
+    expect(sync.archiveBytes).toBeLessThan(beforePrune);
+    expect(sync.archiveBytes).toBe(repo.transcripts.usage().storedBytes);
   });
 });
 

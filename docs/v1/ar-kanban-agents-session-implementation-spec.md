@@ -230,7 +230,7 @@ sessions.list 分页
 
 ### 3.4 能力探测
 
-`sessions.usage`、`sessions.usage.timeseries`、`usage.cost` 不在 hello 的发现列表中，按 v1.1 修订 §4.3 处理：
+`sessions.usage`、`sessions.usage.timeseries`、`usage.cost`、`chat.history` 都按 v1.1 修订 §4.3 处理——前三个不在 hello 的发现列表中，`chat.history` 在本机 2026.7.1-2 上会 advertise，但**不能因此只信发现列表**：§4.3 的要点是「未 advertise 不等于不可用」，而正文同步原先正是按字面反过来用的，遇到不列出 `chat.history` 的构建就每轮判 `unavailable`、一条正文都不归档，且没有任何探测或重试能走出来。现在探测结果（任一确定verdict）优先于发现列表，只有还没探测出结果时才回落到发现列表。
 
 ```text
 连接就绪后 → 对每个不可发现方法执行一次最小参数探测
@@ -241,6 +241,10 @@ sessions.list 分页
 ```
 
 探测结果绑定在 connection generation 上；重连必须重新探测。
+
+探测本身必须是 Gateway 会接受的调用：`chat.history` 报告的是某个会话，拿一个编造的 key 去问，答案说的是那个 key 而不是这个方法存不存在。因此它用采集器已经见过的最近一个会话键（`repository.mostRecentSessionKey()`）；还没有任何会话时该项探测跳过、verdict 保持 `unknown`。
+
+「下一轮再来」必须真有下一轮。连接时只探测一次意味着：Gateway 当时空跑（没有任何会话可供组装调用），verdict 就在这条连接的余生里停在 `unknown`——不 advertise 该方法的构建于是一条正文都不归档，无论期间起了多少会话；一次瞬时失败同理，`error` 不等于 `live`，连接建立那一刻的抖动足以让正文同步歇到下次重连。因此在**会话同步之后**重试探测：那正是缺失的前提（一个真实会话键）到位的时刻。`probeAll` 会跳过已定论的方法，所以这只在答案确实未知时每轮多一次请求，定论之后归零；`transcriptSync` 关闭时完全不发。调用点放在会话同步的 try 边界之外，既不拖慢快照，也不会被误记成一次会话同步失败——代价是它得自己扛住关停：`stop()` 不等在飞的那一轮就关掉数据库，而各轮由定时器以 `void` 发起、没有任何调用方接得住它的拒绝，于是关停时序稍一交错，一次没人在等的探测就足以用「database is not open」结束进程。因此这里与用量轮一样先看 `stopped`、再把仓储读取与探测整体包住；用量轮的注释解释的是同一件事。
 
 ### 3.5 失败隔离
 
@@ -267,11 +271,16 @@ migrations[]         —— 有序数组，每项 { version, up(db) }
 
 ```text
 读取 schema_version
+→ 若高于目标版本：拒绝启动并说明降级不受支持（否则等于让当前代码跑在它没见过的 schema 上）
 → 若低于目标版本：复制数据库文件到 <path>.pre-v<N>.bak（0600）
-→ 在单个事务内顺序执行待应用的 migration
-→ 写入新的 schema_version
+→ 在单个事务内：再读一次 schema_version（写锁下的权威值）→ 顺序执行待应用的 migration → 写入新的 schema_version
 → 失败则整体回滚并 fail closed，不带着半迁移的库启动
+→ 成功后删除其余 <path>.pre-v*.bak，只留本次这一份
 ```
+
+事务内重读版本号是为并发启动准备的：两个进程几乎同时读到旧版本，后到的那个原先会去建已经存在的表，然后在一个其实完全迁移好的库上假失败。备份只留一代，是因为备份是含全部正文的完整库副本：永久保留会让它活过 `transcriptRetentionDays` 承诺删掉的那段正文——文本就躺在数据库旁边的文件里可读可搜，此前只有 `purge-transcripts` 会删它。
+
+备份**不能覆盖同名的既有备份**。复制这一步只能在写锁之外做——把 WAL 合回主文件不允许在事务里执行——所以两个同时启动的进程都会走到这里，后到的那个可能是在前者迁移完成之后才复制：覆盖等于把「迁移前的副本」换成迁移后的副本，而文件名仍在承诺前者，这是这个文件唯一职责上的唯一一种失效方式。既然文件名已经断言了它是哪个目标版本之前的副本，同名文件存在时就保留它（上一次半途死掉的升级留下的同样是迁移前副本，正是想要的那份）。
 
 v1 基线库视为 version 1；本次交付 version 2。
 
@@ -361,15 +370,11 @@ CREATE TABLE session_signals (
   FOREIGN KEY (session_key) REFERENCES sessions(session_key) ON DELETE CASCADE
 );
 
-CREATE TABLE session_message_stats (
-  session_key TEXT NOT NULL,
-  direction TEXT NOT NULL,
-  channel TEXT NOT NULL,
-  outcome TEXT NOT NULL,
-  count INTEGER NOT NULL,
-  last_event_at INTEGER NOT NULL,
-  PRIMARY KEY (session_key, direction, channel, outcome)
-);
+-- 已随迁移 v4 删除：这张表在 v2 建了，但没有任何写入路径，也没有任何读取方。
+-- 空表不是中性的——它读起来像「这套按渠道的消息分解存在，只是暂时没数据」，
+-- 与「从未采集」是两个不同的断言，正是本项目在别处一律拒绝的那种塌缩。
+-- 等真正实现填充它的采集路径时再连表一起加回来。
+-- CREATE TABLE session_message_stats (...);
 
 -- 会话正文归档（local_archive）
 CREATE TABLE session_messages (
@@ -450,7 +455,9 @@ CREATE INDEX idx_activities_session_ref ON activities(session_ref);
   3. 删除 archived 且 last_activity_at 超过 sessionRetentionDays 的 sessions
   4. 删除 created_at 超过 transcriptRetentionDays 的 session_messages
   5. 若正文体量仍超过 transcriptMaxBytes，按会话最后活动时间从最旧一端继续驱逐
+     （豁免 15 分钟内有活动或仍有 open run 的会话）
   6. 保持现有的 terminal_history prune 不变
+  7. 让同步器的容量估算失效，下一轮重新做权威测量
 ```
 
 新增配置项：
@@ -477,6 +484,8 @@ CREATE INDEX idx_activities_session_ref ON activities(session_ref);
 - `usage_daily_rollup` 没有 `has_cost` 列，所以「这一桶从未定价」只能用 `cost_micro_usd IS NULL` 表达。日内部分定价的细节会在跨过折叠地平线后丢失，总额退化为下界。
 
 正文按时间与容量双闸门裁剪。容量驱逐以整个会话为单位而不是单条消息，避免留下一半的对话——半截 transcript 在回顾场景里几乎没有价值，还会让搜索结果产生误导。
+
+删会话是三条只有一起做才成立的删除（正文、会话行、指向它的 Activity 引用），因此在同一个 `BEGIN IMMEDIATE` 事务内完成：分开执行时中途崩溃会留下没有代码能解释的状态——正文没了却仍以「已归档、可搜索」示人，或者 Activity 指向一个不存在的会话键。**待删集合也要在写锁之内挑**：先在锁外查出 key 列表、再在锁内按同一条件删会话，两者可能不是同一批——若期间别的写者归档了某个会话，锁内的条件会把它选中删掉，而它的正文从来不在那份列表里，于是文本留了下来，却没有任何会话能把它读出来。
 
 ## 5. HTTP API
 
@@ -518,12 +527,14 @@ recent: Record<"24h" | "7d", {
 ```ts
 cost: {
   coverage: SessionUsageCoverage;
-  source: "gateway" | "snapshots";
+  source: Record<"24h" | "7d", "gateway" | "snapshots">;
   windows: Record<"24h" | "7d", UsageTotals>;
 }
 ```
 
 `source` 必须暴露，因为同一笔花费有两个来源：`usage.cost` 按区间一次定价，`sessions.usage` 按会话逐个定价。卡片优先用前者（一次定价整个区间，比把不同时刻的读数相加更准），`/api/v1/usage/summary` 只报后者。两者不一致时，`source` 是唯一能解释差异的线索。
+
+`source` 与成本 coverage 都**按窗口**记录，因为 24h 与 7d 是两次独立的 `usage.cost` 请求、会各自失败。整卡一个标签的写法有两处失真：一是任一窗口成功就把「由 Gateway 定价」盖在另一个它根本没答的窗口上；二是原实现把两个窗口的结果先攒成一份再整体替换，于是失败的那个窗口以**空 map** 落地——已知价格被静默清空——同时凭另一个窗口的成功把 coverage 报成 `live`，正是这条成本链路本身要防的「没人定价却显示成已定价」。现在每个窗口只被自己那次成功的应答替换，失败的窗口保留上次已知价格并单独降级为 `error`。
 
 但覆盖只替换金额，不替换 `hasCost`。区间定价不可能定出 `sessions.usage` 自己都报为未定价的模型，把 `hasCost` 一并设成 true 会让一个下界读起来像完整值——这正是 §2.3 禁止的那种塌缩。
 
@@ -630,6 +641,18 @@ web/src/state/use-paged-query.ts      （新增，供会话列表使用）
 
 会话列表在用户滚动时不得因为 SSE 自动重排。参照 AgentsView 的做法：显示一个刷新提示，由用户决定何时拉取。
 
+**事件流断开要说清是哪一种断开。** Gateway 连不上是采集端的事，由 `status.syncState` 表达；事件流断开是「这个页面已经不再听到任何变化」，页面上的每个数字都停在断线那一刻。两者过去都塌缩成一个静态的 offline。`EventSource` 自己会重试并自己决定间隔，因此 UI 能诚实报出的是重试次数与断线时刻，而不是一个本代码并未设定的倒计时；只有 `readyState === CLOSED`（浏览器彻底放弃，例如响应不被当作事件流）才是终局，此时给出手动重连。重连成功后按 `ALL_TOPICS` 重拉一次——断线期间发生的变化没有人通报过。
+
+手动重连要当场变成一次新的重连周期：状态回到 `connecting`（横幅与那条已被取代的错误行一并消失），重试计数归零。否则新连接还在建立，页面却仍写着「已停止、点这里重连」，那一次点击看上去什么也没做。`lostAt` 刻意保留——屏幕上的数据仍是那一刻的旧数据，重新打时间戳会在重连再次失败时低报页面有多陈旧。
+
+**检索结果不能停留在上一次查询上。** 每次新请求开始时清掉已有结果与该请求自己的错误：留着它们等于把上一个词的命中数与片段摆在新词旁边，而片段的截取窗口是按当前输入框里的词算的。会话详情页的 `error` 例外：那条状态同时承载「正文没读出来」的失败，清掉它会把空面板唯一的解释一并抹掉。
+
+`abort()` 只否决还在飞的请求，已经拿到答复（或错误）的那个仍会执行它的回调，因此写入面板之前要先问一句自己是否还是当前那次检索——`controller.signal.aborted` 就是这个答案，无需另设一个代次计数。少了这一句，被取代的请求会在清空之后把上一个词的结果重新填回去，或者为一个已经不在输入框里的词报错。
+
+**时间必须能被定位。** 列表与正文行用紧凑格式（不带时区，否则每行都在重复同一个事实），精确时刻带完整日期与时区放在 `title`，并以 `<time dateTime>` 承载机器可读的瞬间；正文面板另外一次性声明「Times shown in <zone>」。跨时区读同一份归档时，「11:54」本身不说明是谁的 11:54。
+
+**虚拟滚动的视口高度由 CSS 决定，再被量测回来。** 写死的常量在小窗口上高于可视区（要靠外层滚动条才能读到列表末尾），在大屏上又只占一小块。高度归 CSS（`.session-list[data-virtualized="true"]` 按窗口收敛），窗口化的计算读 `ResizeObserver` 量到的实际高度，避免两处各存一份高度而漂移。
+
 ### 6.4 第一批交付：Agents 总览
 
 每个 Agent 一张卡，四段信息：
@@ -677,7 +700,7 @@ Agent 详情页（`/agents/:agentId`）在卡片之上多出的那一层是**结
 
 1. 每轮总请求数不超过 20，避免正文同步挤占 Task/Session 主同步的 Gateway 配额。
 2. 主同步失败时正文同步整轮跳过。正文是次要目标，不得拖累 Live Flow。
-3. 达到 `transcriptMaxBytes` 时停止空闲回填，仅保留活跃会话增量，并按会话最后活动时间从最旧一端驱逐。
+3. 达到 `transcriptMaxBytes` 时停止空闲回填，仅保留活跃会话增量，并按会话最后活动时间从最旧一端驱逐。驱逐**豁免**近 15 分钟内有活动或仍有 open run 的会话；若豁免后仍到不了目标，本轮进入 `capacity: "full"`：**完全停止归档并在 UI 明示**，而不是撕碎正在被写入（也最可能正被阅读）的那条会话——撕碎的结果是下一轮把它重新拉回来、再下一轮再驱逐，请求预算全花在同一条正文的删与拉上。
 
 实现补充（`src/collector/transcript-sync.ts`）：
 
@@ -689,7 +712,10 @@ Agent 详情页（`/agents/:agentId`）在卡片之上多出的那一层是**结
   - 该构建**完全不返回分页字段**。`chat.history` 的响应只有 `{ sessionKey, sessionId, messages, defaults, sessionInfo, thinkingLevel }`，无论历史多长都没有 `hasMore`、`nextOffset`、`totalMessages`。因此 `projectHistoryPage` 不能只信响应：满页（`messages.length >= limit`）即视为还有更旧的，下一个 offset 由 `offset + 本页条数` 自行推算；短页即历史到底。别名保留，会答的构建仍然优先采信。
   - 若按字面只信响应，后果是每个会话在一次 tail 读后就被判 `complete`：超过一页（200 条）的会话只存下最新一页，却对外声明「已完整归档」，同时回填拿不到 offset，永远重读同一页。这条已修，回归测试见 `message-projector.test.ts`「keeps walking a full page the Gateway said nothing about」。
 - 消息字段同批核对：真机的频道字段是 `sourceChannel`（不是 `channel`），`sessionId` 只在**页面顶层**、消息行内没有——后者改为从页面读取，因为它正是判断 transcript 是否换代的依据，比会话表里存的那个更新。实测两个真实会话 6/6、2/2 全部成功投影，无丢弃，角色 / messageId / 时间戳全部命中。仍未被任何别名认领的键：`api`、`idempotencyKey`、`isError`、`model`、`provider`、`stopReason`、`toolCallId`、`usage`、`sender*`——前者多为逐条用量与工具错误标记（可作为后续信号来源），`sender*` 是刻意不入库的身份信息。
-- 容量判定不在写路径上做。`usage()` 依赖 `dbstat`，会遍历全部页，因此权威测量最多每 5 分钟一次，其间用本轮写入字节数递增估算；越线时立即重新测量再驱逐。
+- 容量判定不在写路径上做。`usage()` 依赖 `dbstat`，会遍历全部页——按定时器去问，等于只要 collector 在跑就每隔几分钟在同步路径上走一遍整个库。改为：启动时测一次，驱逐搬动了大量数据后测一次，每轮 prune 之后（由 `markUsageStale()` 通知）测一次；三者都是罕见或本来就在做重活的时机。其间用本轮写入量递增估算。
+- 估算必须换算到页字节口径。预算比的是 `dbstat` 的页字节（含索引与 FTS 影子表），而一轮只知道自己写了多少 UTF-8 内容字节，两者相加是把两种量当同一种：估算实际以真实增速的约三分之一爬升，越线时早已超出。因此按上次测量得到的 `storedBytes / contentBytes` 比率放大后再累加（下限 1，空库不会算出「文本比自身还小」）。
+- 只累加**真正落库**的字节。`append()` 因此回报 `insertedBytes`。tail 读每轮都重取最新一页，而 `withoutKnown` 只在 Gateway 给了 messageId 时才滤得掉；否则重复行由幂等键在插入处丢弃、库根本没长，把这些写入也记进估算，等于让一个早已不再变化的会话稳步爬向上限，最后为了腾出根本不需要的空间去驱逐别人的正文。
+- 「是否回到预算内」由驱逐并压缩之后的实测值判定，不用删除前的内容字节估算。删掉一半正文不等于释放一半页：索引与 FTS 段按整块分配，且每条消息的固定开销随归档变小而占比上升——两个等量会话的归档删掉其中一个后仍占原先 68% 的页。而 `full` 是在对操作者宣称「新消息没有被存下来」，这句话不能建立在估算上，所以宁可在这条本就在成片删数据的路径上多走一次 `dbstat`。无可驱逐对象时（全被保护）仍只能用估算作答，因为没有发生删除可供测量。
 - `chat.history` 的字段名与 `sessions.list` 一样来自协议文档而非实测，经 `MESSAGE_FIELD_ALIASES` 声明式读取，未命中项由 `/api/v1/diagnostics/field-coverage` 的 `chat.history` 报告列出。
 - 幂等键要求 Gateway 给出消息序号。若未给出，序号由本地水位续编，此时改以 `messageId` 去重——否则重复拉取同一页会拿到一批新序号，绕过唯一约束。
 
@@ -699,7 +725,7 @@ Agent 详情页（`/agents/:agentId`）在卡片之上多出的那一层是**结
 
 `sessionId` 变化意味着同一 `sessionKey` 下 transcript 换代（compaction 或重建）。此时不覆盖旧消息，而是给旧消息打上 `superseded_by_session_id`，新代际从 `seq = 0` 重新开始。理由是压缩前的原始对话往往正是回顾时想看的内容，直接覆盖等于让归档失去意义。
 
-Gateway 侧若重写了已同步区间的内容，本地保留先到的版本并记 `divergent` 标记，不做自动覆盖。
+Gateway 侧若重写了已同步区间的内容，本地保留先到的版本并记 `divergent` 标记，不做自动覆盖。实现落在 `append()`：插入冲突后再判一次正文是否真的不同，不同才置 `divergent = 1`（相同则连写都不发生）。这个标记必须在阅读器里露出来（消息头的 `rewritten upstream`），否则等于没标——页面会读起来像某个上游早已改口的回合的忠实副本。
 
 ### 7.3 读取与搜索
 
@@ -764,6 +790,7 @@ openclaw-collector purge-transcripts --config <path>
 - `agents.list` 缺失时，Agent 名册由观测反推并标 `origin: "observed"`，Live Flow 不受影响。
 - `sessions.usage` 的三种失败分别产生 `unavailable`、`unauthorized`、`error`，且都不改变 `CollectorSyncState`。
 - `METHOD_NOT_FOUND` 后在同一 connection generation 内不再重试；重连后重新探测。
+- 连接时无会话可探时 `chat.history` 保持 `unknown`，首个会话出现后同一条连接内完成探测，无需等到重连。
 - 用量候选集上限生效，超限部分 coverage 标 `snapshot`。
 - `sessions.list` 的隐私参数未被修改。
 
@@ -785,7 +812,7 @@ openclaw-collector purge-transcripts --config <path>
 - `sessionId` 换代后旧消息保留并标 `superseded_by_session_id`，新代际从 `seq = 0` 独立计数。
 - Gateway 断线时正文与搜索照常工作，且界面显示同步水位而非「实时」。
 - 主同步失败的那一轮，正文同步整轮跳过。
-- 达到 `transcriptMaxBytes` 后停止历史回填、活跃增量不中断、按会话整体驱逐，无消息被静默丢弃。
+- 达到 `transcriptMaxBytes` 后停止历史回填、活跃增量不中断、按会话整体驱逐，无消息被静默丢弃。驱逐不会命中近 15 分钟内有活动或仍有 open run 的会话；若只剩这类会话仍超限，则停止归档并在 Connections 面板明示「Full — new messages not stored」，同样不静默。
 - 中文检索：`登录接口` 能命中含该词的消息；`登录` 走 `LIKE` 回退并标 `mode: "fallback"`；无候选集收窄的短查询被拒绝而不是全库扫描。
 - 自动化审计通过：正文不进日志、不进 SSE、不进 diagnostic bundle，写入路径只有一个集中模块。审计在数据库确实含正文时运行。
 - `purge-transcripts` 后正文不可从数据库空闲页与 `*.bak` 备份中恢复。
@@ -798,6 +825,11 @@ openclaw-collector purge-transcripts --config <path>
 - 会话列表在用户滚动期间不因 SSE 自动重排。
 - `kind: "system"` 的 Agent 默认折叠。
 - 用量不可用时显示 coverage 状态，而不是显示 0。
+- 检索输入连打不产生每键一次请求：防抖后只发一次，被取代的在途请求被 abort，且取消不显示为错误。
+- 换一个查询词后，上一个词的命中行与命中数不再出现在结果块里。
+- 事件流被阻断时页面顶部明示状态：仍在重试报出第几次，浏览器放弃则报「已停止」并给手动重连；点击重连立即撤下横幅与错误行，成功则数据刷新，仍失败则重新报出「已停止」且断线时刻不被重打。
+- 时间：紧凑显示不含时区，`title` 与 `dateTime` 给出带时区的精确时刻，正文面板声明一次所用时区。
+- 窗口化列表的视口高度随窗口收敛（900×600 与超高窗口下均无需外层滚动即可读到列表末尾），滚动到底不出现空白段。
 
 ## 10. 分片顺序
 

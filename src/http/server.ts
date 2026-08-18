@@ -170,14 +170,18 @@ function parseSeq(raw: string | undefined): number | undefined | null {
  */
 function withGatewayCost(runtime: CollectorRuntime, agent: AgentOverview): AgentOverview {
   const windows = { ...agent.cost.windows };
+  const source = { ...agent.cost.source };
   let overlaid = false;
   for (const window of ["24h", "7d"] as const) {
     const priced = runtime.getAgentCost(window, agent.id);
     if (priced === undefined) continue;
     windows[window] = { ...windows[window], costMicroUsd: priced };
+    // Recorded per window: the windows are separate requests, and one of them
+    // failing must not let the other's label speak for it.
+    source[window] = "gateway";
     overlaid = true;
   }
-  return overlaid ? { ...agent, cost: { ...agent.cost, source: "gateway", windows } } : agent;
+  return overlaid ? { ...agent, cost: { ...agent.cost, source, windows } } : agent;
 }
 
 function settledRange(value: string | undefined): SettledRange | undefined {

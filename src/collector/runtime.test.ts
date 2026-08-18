@@ -361,6 +361,80 @@ describe("CollectorRuntime", () => {
   });
 
   /**
+   * `stop()` closes the database without waiting for a pass already in flight, and
+   * the timers call those passes with `void` — nothing is holding the promise, so a
+   * throw after the close becomes an unhandled rejection and takes the process down
+   * on the way out. Anything the session pass does after its own try boundary has
+   * to survive the database going away underneath it.
+   */
+  it("shuts down cleanly while a session pass is still in flight", async () => {
+    const server = new WebSocketServer({ host: "127.0.0.1", port: 0 });
+    await once(server, "listening");
+    const address = server.address();
+    if (!address || typeof address === "string") throw new Error("mock gateway did not bind TCP");
+    let sessionsListed = 0;
+    server.on("connection", (socket) => {
+      socket.send(JSON.stringify({ type: "event", event: "connect.challenge", payload: { nonce: "shutdown", ts: Date.now() } }));
+      socket.on("message", (raw) => {
+        const request = JSON.parse(raw.toString()) as { id: string; method: string; params?: Record<string, unknown> };
+        const respond = (payload: unknown) => socket.send(JSON.stringify({ type: "res", id: request.id, ok: true, payload }));
+        if (request.method === "connect") respond({ type: "hello-ok", protocol: 4, server: { version: "runtime-test", connId: "shutdown" }, features: { methods: ["tasks.list", "sessions.list", "sessions.subscribe"], events: ["task", "agent", "sessions.changed", "session.tool"] }, snapshot: {}, auth: { role: "operator", scopes: ["operator.read"] }, policy: { maxPayload: 1_000_000, maxBufferedBytes: 1_000_000, tickIntervalMs: 30_000 } });
+        else if (request.method === "sessions.subscribe") respond({ subscribed: true });
+        else if (request.method === "tasks.list") respond({ tasks: [] });
+        else if (request.method === "sessions.list") {
+          sessionsListed += 1;
+          // The first page lands so the archive holds a session — the state in
+          // which the probe below has something to ask about. The second is held
+          // open, which is what puts a pass in flight when the stop arrives.
+          if (sessionsListed === 1) {
+            respond({ sessions: [{ key: "agent:builder:one", agentId: "builder", label: "Session", status: "running", hasActiveRun: true, startedAt: 1_000 }], hasMore: false, nextOffset: 1 });
+          }
+        }
+      });
+    });
+
+    const rejections: unknown[] = [];
+    const onRejection = (reason: unknown) => rejections.push(reason);
+    process.on("unhandledRejection", onRejection);
+
+    const directory = mkdtempSync(path.join(tmpdir(), "collector-runtime-shutdown-"));
+    const config: ResolvedCollectorConfig = {
+      gateway: { name: "test", url: `ws://127.0.0.1:${address.port}`, tokenEnv: "TEST_GATEWAY_TOKEN", token: "test-token" },
+      server: { host: "127.0.0.1", port: 47_128 },
+      storage: {
+        path: path.join(directory, "collector.sqlite"),
+        terminalRetentionDays: 1,
+        usageRetentionDays: 14,
+        sessionRetentionDays: 90,
+        transcriptRetentionDays: 180,
+        transcriptMaxBytes: 64 * 1024 * 1024,
+        transcriptSync: "enabled",
+      },
+      reconcile: { tasksMs: 60_000, sessionsMs: 120 },
+      ui: { recentLimit: 200 },
+      configPath: path.join(directory, "config.json"),
+    };
+    const runtime = new CollectorRuntime(config);
+    // The stop is part of the test, so the cleanup must not repeat it: `stop()`
+    // closes the database handle and closing it twice throws.
+    cleanups.push(async () => {
+      process.off("unhandledRejection", onRejection);
+      for (const socket of server.clients) socket.terminate();
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+      rmSync(directory, { recursive: true, force: true });
+    });
+    runtime.start();
+
+    await vi.waitFor(() => expect(sessionsListed).toBeGreaterThan(1), { timeout: 5_000 });
+    await runtime.stop();
+    // Long enough for the held request to be rejected by the stop and for whatever
+    // the pass does afterwards to run against the closed database.
+    await new Promise<void>((resolve) => setTimeout(resolve, 200));
+
+    expect(rejections).toEqual([]);
+  });
+
+  /**
    * A deletion is the one change a client cannot infer. Retention runs on its own
    * six-hour timer, and on an idle collector nothing else emits a frame — so rows
    * this pass removed stayed on an open page, listed and linkable and gone, until

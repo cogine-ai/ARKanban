@@ -667,13 +667,24 @@ export class CollectorRuntime {
    * Called from the session pass because that is where the missing precondition
    * arrives. `probeAll` skips methods already settled, so this costs one request
    * per pass only while the answer is genuinely unknown, and nothing afterwards.
+   *
+   * Gated on `stopped` and wrapped, for the same reason the usage round is:
+   * `stop()` closes the database without waiting for a pass already in flight, so
+   * a shutdown landing mid-request leaves this reading a closed handle. The timer
+   * calls the pass with `void` and has no caller to see the rejection, which is
+   * enough to take the process down over a probe nobody was waiting for.
    */
   private async settleHistoryProbe(): Promise<void> {
-    if (this.config.storage.transcriptSync !== "enabled") return;
+    if (this.stopped || this.config.storage.transcriptSync !== "enabled") return;
     const state = this.capabilities.stateOf("chat.history");
     if (state !== "unknown" && state !== "error") return;
-    if (this.repository.mostRecentSessionKey() === undefined) return;
-    await this.probeCapabilities();
+    try {
+      if (this.repository.mostRecentSessionKey() === undefined) return;
+      await this.probeCapabilities();
+    } catch {
+      // The verdict stays unknown and the next pass tries again, which is what
+      // this method is for.
+    }
   }
 
   /** Counts and watermarks only; never message text. */

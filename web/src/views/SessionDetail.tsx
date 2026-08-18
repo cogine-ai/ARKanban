@@ -227,11 +227,15 @@ function TranscriptPanel({ sessionKey, revision }: { sessionKey: string; revisio
             { q: needle, sessionKey },
             { limit: TRANSCRIPT_PAGE_SIZE, signal: controller.signal },
           );
+          // An abort only rejects a request still in flight. One that had already
+          // answered runs its continuation regardless, so the request has to say
+          // whether it is still the one being asked before it writes to the panel.
+          if (controller.signal.aborted) return;
           setHits(result.hits.map((hit) => hit.message));
         } catch (cause) {
           // A cancelled search is not a failure to report; the next keystroke's
           // search is already on its way.
-          if (isAbortError(cause)) return;
+          if (isAbortError(cause) || controller.signal.aborted) return;
           setError(cause instanceof Error ? cause.message : String(cause));
         } finally {
           if (!controller.signal.aborted) setSearching(false);

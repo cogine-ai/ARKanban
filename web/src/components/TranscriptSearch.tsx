@@ -55,10 +55,15 @@ export function TranscriptSearch({ query, agentId }: { query: string; agentId?: 
           { q: query, ...(agentId ? { agentId } : {}) },
           { signal: controller.signal },
         );
+        // An abort only rejects a request still in flight. One that had already
+        // answered — with a reply or an error — still runs its continuation, and
+        // committing it here would put the previous query's hits under the term now
+        // in the box. The signal says which request this is.
+        if (controller.signal.aborted) return;
         setResult(found);
         setError(undefined);
       } catch (cause) {
-        if (isAbortError(cause)) return;
+        if (isAbortError(cause) || controller.signal.aborted) return;
         setResult(undefined);
         setError(cause instanceof Error ? cause.message : String(cause));
       } finally {

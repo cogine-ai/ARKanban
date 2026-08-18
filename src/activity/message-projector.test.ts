@@ -8,7 +8,14 @@ import { flattenContent, messageRole, projectHistoryPage } from "./message-proje
  * read as milliseconds, and transcript retention deletes on age.
  */
 const OBSERVED_AT = Date.UTC(2026, 7, 1, 12, 0, 0);
-const base = { sessionKey: "agent:builder:demo", observedAt: OBSERVED_AT, seqBase: -1 };
+const base = {
+  sessionKey: "agent:builder:demo",
+  observedAt: OBSERVED_AT,
+  seqBase: -1,
+  // Large enough that these small fixtures never look like a full page, so cases
+  // about the reported fields are not answered by the derived fallback.
+  request: { limit: 100, offset: 0 },
+};
 
 describe("content flattening", () => {
   it("joins the text of structured content blocks", () => {
@@ -162,9 +169,38 @@ describe("history page projection", () => {
     expect(page.hasMore).toBe(true);
   });
 
-  it("stops when neither a flag nor an offset is returned", () => {
+  it("stops when neither a flag nor an offset is returned and the page is short", () => {
     const page = projectHistoryPage({ messages: [{ role: "user", content: "a" }] }, base);
     expect(page.hasMore).toBe(false);
+  });
+
+  /**
+   * The shape a real Gateway returns. 2026.7.1-2 reports no paging whatsoever —
+   * verified against a live 18789: a response carries `sessionKey`, `sessionId`,
+   * `messages`, `defaults`, `sessionInfo` and `thinkingLevel`, and nothing else,
+   * however much history the session holds. Believing that absence meant every
+   * conversation looked like one complete page: a long one was truncated to its
+   * newest page on disk and reported as fully archived, and backfill had no offset
+   * to advance to, so it re-read that same page every round forever.
+   *
+   * `offset` is honoured by that build even though it is never reported, and a
+   * request past the end comes back empty — so a full page is the signal to keep
+   * walking, and a short one is the end.
+   */
+  it("keeps walking a full page the Gateway said nothing about", () => {
+    const rows = Array.from({ length: 4 }, (_, index) => ({ role: "user", content: `turn ${index}` }));
+    const request = { limit: 4, offset: 8 };
+
+    const full = projectHistoryPage({ sessionKey: "s", sessionId: "gen", messages: rows }, { ...base, request });
+    expect(full.hasMore).toBe(true);
+    expect(full.nextOffset).toBe(12);
+
+    const short = projectHistoryPage(
+      { sessionKey: "s", sessionId: "gen", messages: rows.slice(0, 3) },
+      { ...base, request },
+    );
+    expect(short.hasMore).toBe(false);
+    expect(short.nextOffset).toBeUndefined();
   });
 
   it("prefers the row's own generation over the session's", () => {
@@ -174,6 +210,21 @@ describe("history page projection", () => {
     );
 
     expect(page.writes[0]!.sessionId).toBe("gen-2");
+  });
+
+  /**
+   * Rows carry no generation of their own on a real Gateway — it sits on the page.
+   * Reading it there beats the id stored with the session, which is what says a
+   * transcript has been rebuilt since, and so which messages are superseded.
+   */
+  it("takes the generation from the page when the rows do not carry one", () => {
+    const page = projectHistoryPage(
+      { sessionKey: "s", sessionId: "gen-live", messages: [{ role: "user", content: "a", sourceChannel: "telegram" }] },
+      { ...base, sessionId: "gen-stored" },
+    );
+
+    expect(page.writes[0]!.sessionId).toBe("gen-live");
+    expect(page.writes[0]!.channel).toBe("telegram");
   });
 
   /**

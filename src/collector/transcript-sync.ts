@@ -186,13 +186,14 @@ export class TranscriptSynchronizer {
     now: number,
     mode: "tail" | "backfill",
   ): Promise<{ requests: number; inserted: number; errorCode?: string }> {
+    const offset = mode === "backfill" ? (continuationParams(candidate.cursor).offset ?? 0) : 0;
     let payload: Record<string, unknown>;
     try {
       payload = record(
         await this.deps.request("chat.history", {
           sessionKey: candidate.sessionKey,
           limit: HISTORY_PAGE_LIMIT,
-          ...(mode === "backfill" ? continuationParams(candidate.cursor) : {}),
+          ...(offset > 0 ? { offset } : {}),
         }),
       );
     } catch (error) {
@@ -211,6 +212,7 @@ export class TranscriptSynchronizer {
       ...(candidate.sessionId ? { sessionId: candidate.sessionId } : {}),
       observedAt: now,
       seqBase: candidate.lastSeq ?? -1,
+      request: { limit: HISTORY_PAGE_LIMIT, offset },
       ...(this.deps.inventory ? { inventory: this.deps.inventory } : {}),
     });
 

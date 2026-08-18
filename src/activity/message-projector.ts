@@ -25,23 +25,28 @@ export const MESSAGE_FIELD_ALIASES = {
   messageId: ["id", "messageId", "uuid"],
   seq: ["seq", "index", "ordinal", "position"],
   role: ["role", "author", "sender"],
-  channel: ["channel", "source"],
+  // 2026.7.1-2 names it `sourceChannel`; it is how a transcript shows that a turn
+  // arrived over Telegram rather than the terminal.
+  channel: ["sourceChannel", "channel", "source"],
   toolName: ["toolName", "tool_name", "tool", "functionName"],
   content: ["content", "text", "body", "message", "parts"],
   createdAt: ["timestamp", "recordTimestampMs", "createdAt", "ts", "time"],
   sessionId: ["sessionId", "conversationId"],
 } as const satisfies Record<string, readonly string[]>;
 
+/**
+ * Paging is by offset counted back from the newest message, and 2026.7.1-2
+ * reports none of it: a response is `{ sessionKey, sessionId, messages, defaults,
+ * sessionInfo, thinkingLevel }` whatever the offset. The aliases stay because a
+ * build that does answer should be believed; `projectHistoryPage` derives the
+ * same two facts from the request when they are missing.
+ */
 export const HISTORY_PAGE_ALIASES = {
   messages: ["messages", "items", "history", "entries"],
-  /**
-   * Paging is by offset from the tail, not by cursor. The response carries
-   * `nextOffset` (a number) and only when the request asked for an offset at
-   * all; an unpaged call returns the newest page with no paging fields.
-   */
   nextOffset: ["nextOffset"],
   hasMore: ["hasMore", "more"],
   totalMessages: ["totalMessages"],
+  sessionId: ["sessionId", "conversationId"],
 } as const satisfies Record<string, readonly string[]>;
 
 type MessageField = keyof typeof MESSAGE_FIELD_ALIASES;
@@ -149,6 +154,8 @@ export type ProjectMessagesOptions = {
   observedAt: number;
   /** First synthesised sequence number, used only for rows the Gateway did not number. */
   seqBase: number;
+  /** What the request asked for, so paging can be derived when the response omits it. */
+  request: { limit: number; offset: number };
   inventory?: FieldInventory;
 };
 
@@ -168,6 +175,15 @@ export type ProjectedPage = {
 export function projectHistoryPage(payload: Record<string, unknown>, options: ProjectMessagesOptions): ProjectedPage {
   const rawMessages = pick(payload, "messages", HISTORY_PAGE_ALIASES.messages, options.inventory);
   const rows = Array.isArray(rawMessages) ? rawMessages : [];
+  /**
+   * The generation these rows belong to, as the Gateway sees it now.
+   *
+   * Rows carry no `sessionId` of their own — 2026.7.1-2 puts it on the page — and
+   * this is a better answer than the one stored with the session: a transcript
+   * that has been compacted or rebuilt gets a new id, and that is precisely what
+   * marks the older messages superseded rather than interleaving two generations.
+   */
+  const pageSessionId = asString(pick(payload, "sessionId", HISTORY_PAGE_ALIASES.sessionId, options.inventory));
   const writes: MessageWrite[] = [];
   let dropped = 0;
   let synthesised = options.seqBase;
@@ -199,7 +215,7 @@ export function projectHistoryPage(payload: Record<string, unknown>, options: Pr
 
     const seq = asInteger(read("seq"));
     if (seq === undefined) synthesised += 1;
-    const sessionId = asString(read("sessionId")) ?? options.sessionId;
+    const sessionId = asString(read("sessionId")) ?? pageSessionId ?? options.sessionId;
 
     writes.push({
       sessionKey: options.sessionKey,
@@ -215,14 +231,34 @@ export function projectHistoryPage(payload: Record<string, unknown>, options: Pr
     });
   }
 
-  const nextOffset = asInteger(pick(payload, "nextOffset", HISTORY_PAGE_ALIASES.nextOffset, options.inventory));
-  const hasMore = pick(payload, "hasMore", HISTORY_PAGE_ALIASES.hasMore, options.inventory);
+  const reportedOffset = asInteger(pick(payload, "nextOffset", HISTORY_PAGE_ALIASES.nextOffset, options.inventory));
+  const reportedMore = pick(payload, "hasMore", HISTORY_PAGE_ALIASES.hasMore, options.inventory);
+
+  /**
+   * Derived from the request when the response says nothing about paging.
+   *
+   * 2026.7.1-2 returns neither field: a `chat.history` payload is
+   * `{ sessionKey, sessionId, messages, defaults, sessionInfo, thinkingLevel }`
+   * and nothing else, however much history the session has. Trusting the absence
+   * meant every session looked like one complete page — the newest one — so a long
+   * conversation was truncated on disk and reported as fully archived, and backfill
+   * had no offset to advance to and re-read the same page forever.
+   *
+   * A short page is the end of the history: the Gateway returned everything it had
+   * left. A full page means there is probably more, and asking once more for an
+   * offset past the end simply comes back empty, which costs one request and is
+   * the only way to be sure on a build that will not say.
+   */
+  const full = rows.length >= options.request.limit;
+  const nextOffset = reportedOffset ?? (full ? options.request.offset + rows.length : undefined);
+  // An explicit flag wins. Failing that, a reported offset is itself the claim
+  // that more exists, and a full page is the only remaining evidence.
+  const hasMore = typeof reportedMore === "boolean" ? reportedMore : reportedOffset !== undefined || full;
 
   return {
     writes,
-    ...(nextOffset !== undefined ? { nextOffset } : {}),
-    // An explicit flag wins; otherwise an offset is itself the signal there is more.
-    hasMore: typeof hasMore === "boolean" ? hasMore : nextOffset !== undefined,
+    ...(hasMore && nextOffset !== undefined ? { nextOffset } : {}),
+    hasMore,
     dropped,
   };
 }

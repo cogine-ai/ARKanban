@@ -684,7 +684,11 @@ Agent 详情页（`/agents/:agentId`）在卡片之上多出的那一层是**结
 - 每个会话每轮只拉一页。长回填跨轮推进，而不是一次占满请求预算。
 - 活跃增量与回填是两种读，不共用游标。上面伪码写的「活跃会话按 `cursor` 增量拉」按字面实现是错的：`cursor` 由回填写入，指向更旧的一页，活跃会话于是把每轮唯一的那次请求花在早已读过的页上，尾部要等整条历史走完才出现——50 页历史的会话，正文 25 分钟才更新一次。因此活跃读固定取最新一页（不带 `offset`），回填读跟随 `cursor`；活跃读不回写 `cursor`（否则回填进度被重置回第二页），只在该会话还没有任何游标时顺手播种一个，让回填从尾部下面一页开始而不是重读刚取的那页。
 - 活跃读拿到「没有更旧的一页」时可以直接判定 `complete`：它从最新一条开始读，Gateway 又说后面没有了，那就是整条历史。绝大多数会话一页装得下，这条省掉它们各自一次多余的回填请求。
-- 上述方向依赖一个假设：`chat.history` 的 `offset` 从最新一条往回数（协议文档如此，未在真机逐页核对）。若真机相反，表现是活跃会话只反复读到最旧一页、尾部永不更新；改 `syncSession` 的 `tail` 分支即可，其余逻辑不受影响。`transcript-sync.test.ts` 里的假 Gateway 已按该假设实现倒序翻页。
+- 翻页方向与分页字段已在真机（openclaw 2026.7.1-2，protocol 4）核对：
+  - `offset` **从最新一条往回数**，且**确实生效**（同一会话 `{limit:1}` 与 `{limit:1,offset:1}` 返回不同页）；越界 offset 返回空数组。上面的 tail / backfill 分工成立。
+  - 该构建**完全不返回分页字段**。`chat.history` 的响应只有 `{ sessionKey, sessionId, messages, defaults, sessionInfo, thinkingLevel }`，无论历史多长都没有 `hasMore`、`nextOffset`、`totalMessages`。因此 `projectHistoryPage` 不能只信响应：满页（`messages.length >= limit`）即视为还有更旧的，下一个 offset 由 `offset + 本页条数` 自行推算；短页即历史到底。别名保留，会答的构建仍然优先采信。
+  - 若按字面只信响应，后果是每个会话在一次 tail 读后就被判 `complete`：超过一页（200 条）的会话只存下最新一页，却对外声明「已完整归档」，同时回填拿不到 offset，永远重读同一页。这条已修，回归测试见 `message-projector.test.ts`「keeps walking a full page the Gateway said nothing about」。
+- 消息字段同批核对：真机的频道字段是 `sourceChannel`（不是 `channel`），`sessionId` 只在**页面顶层**、消息行内没有——后者改为从页面读取，因为它正是判断 transcript 是否换代的依据，比会话表里存的那个更新。实测两个真实会话 6/6、2/2 全部成功投影，无丢弃，角色 / messageId / 时间戳全部命中。仍未被任何别名认领的键：`api`、`idempotencyKey`、`isError`、`model`、`provider`、`stopReason`、`toolCallId`、`usage`、`sender*`——前者多为逐条用量与工具错误标记（可作为后续信号来源），`sender*` 是刻意不入库的身份信息。
 - 容量判定不在写路径上做。`usage()` 依赖 `dbstat`，会遍历全部页，因此权威测量最多每 5 分钟一次，其间用本轮写入字节数递增估算；越线时立即重新测量再驱逐。
 - `chat.history` 的字段名与 `sessions.list` 一样来自协议文档而非实测，经 `MESSAGE_FIELD_ALIASES` 声明式读取，未命中项由 `/api/v1/diagnostics/field-coverage` 的 `chat.history` 报告列出。
 - 幂等键要求 Gateway 给出消息序号。若未给出，序号由本地水位续编，此时改以 `messageId` 去重——否则重复拉取同一页会拿到一批新序号，绕过唯一约束。

@@ -229,6 +229,7 @@ export class CollectorRuntime {
       maxBytes: config.storage.transcriptMaxBytes,
       enabled: config.storage.transcriptSync === "enabled",
       inventory: this.messageFields,
+      onArchived: (sessionKeys) => this.rescoreArchived(sessionKeys),
     });
     this.usage = new UsageSynchronizer({
       store: this.repository.usage,
@@ -633,6 +634,38 @@ export class CollectorRuntime {
       };
     } finally {
       this.transcriptSyncing = false;
+    }
+  }
+
+  /**
+   * Rescores the sessions a transcript round added messages to.
+   *
+   * Done here rather than left to the periodic pass because a backfill page is
+   * evidence arriving for a session that has not moved: the staleness check reads
+   * `last_activity_at`, so a page of last week's tool failures would sit in the
+   * archive unscored until something else happened in that session. The set is
+   * bounded by the round's request budget, and scoring one session is a couple of
+   * indexed reads.
+   */
+  private rescoreArchived(sessionKeys: readonly string[]): void {
+    if (this.stopped) return;
+    const now = Date.now();
+    let rescored = 0;
+    for (const sessionKey of sessionKeys) {
+      // A key can be archived before its session row exists, in which case there
+      // is nothing to score against yet and the periodic pass picks it up later.
+      if (this.repository.signals.recompute(sessionKey, now)) rescored += 1;
+    }
+    // Same frame the periodic pass emits: a grade changed, and the list is sorted
+    // and filtered by it.
+    if (rescored > 0) {
+      this.emitChange({
+        epoch: this.repository.epoch,
+        revision: this.repository.revision,
+        topics: ["sessions"],
+        ids: [],
+        reasons: ["signals_recomputed"],
+      });
     }
   }
 

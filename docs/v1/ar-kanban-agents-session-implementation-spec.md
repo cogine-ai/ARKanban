@@ -165,7 +165,9 @@ export type SessionSignals = {
 
 实现补充（S7）：
 
-- 评分只读本机已存的 `activities` 与 `observations`，不回查 Gateway，因此离线可算、可重算。权重表见 `SIGNAL_PENALTIES`，每一类都带上限，避免单个病态会话把分数拉到任意负值——那会让 F 这个桶失去意义。
+- 评分只读本机已存的 `activities`、`observations` 与归档消息，不回查 Gateway，因此离线可算、可重算。权重表见 `SIGNAL_PENALTIES`，每一类都带上限，避免单个病态会话把分数拉到任意负值——那会让 F 这个桶失去意义。
+- 工具结论有两个来源，二选一而非相加。归档里的 `toolResult` 消息带 Gateway 直接给的 `is_error`；observation 只有生命周期阶段，其失败词表还是我们从文档里猜的。两者描述的是同一批调用，相加等于同一次失败罚两次分，所以**有归档就只用归档**（它同时是权威的和有序的），没有才退回 observations。已被换代标记的那一代不计：压缩会把存活下来的轮次以新 `sessionId` 重发一遍，两代都算的话，跨过一次压缩的会话每条失败都会翻倍。
+- 回填页会带来「会话本身没动，证据却到了」的情况：陈旧判定看的是 `last_activity_at`，而上周历史的一页不会碰它。因此 transcript 同步每轮回报本轮真正新增了消息的会话，运行时就地重算这几个会话，不等定时批次。
 - 给分门槛：必须存在**已分类的终态结论**或**至少一次已结算的工具调用**，否则返回 `unscored`。「有东西结束了」不是结论：会话级终态事件经常不带任何 outcome，把它当成功会仅凭「运行停了」就发出干净的分数。
 - 判定用哪一行终态时，**最新的已分类结论优先于更新的未分类行**。`unknown` 不携带信息，而它经常就是最新的一行：运行结束后才到的事件会开出一个新的 attempt，下一轮快照发现 Gateway 不再广告它，就把它关成 `unknown`。直接取最新行会让这类记账盖掉 Gateway 真正给过的结论。
 - 与之配套，`sessions.changed` 的终态 `status` 现在按别名表映射成 outcome，其中包含 `succeeded`（`done` / `completed` / `finished` …）。此前只分类失败、其余一律 `unknown`，结果是所有健康会话都拿不到结论，读起来与「无从判断的会话」完全一样。
@@ -388,6 +390,8 @@ CREATE TABLE session_messages (
   role TEXT NOT NULL,
   channel TEXT,
   tool_name TEXT,
+  -- Gateway 对这次工具调用的结论。NULL 表示这条不是工具结果，与 0（调用成功）不同。
+  is_error INTEGER,
   content TEXT NOT NULL,
   content_bytes INTEGER NOT NULL,
   superseded_by_session_id TEXT,
@@ -717,7 +721,8 @@ Agent 详情页（`/agents/:agentId`）在卡片之上多出的那一层是**结
   - `offset` **从最新一条往回数**，且**确实生效**（同一会话 `{limit:1}` 与 `{limit:1,offset:1}` 返回不同页）；越界 offset 返回空数组。上面的 tail / backfill 分工成立。
   - 该构建**完全不返回分页字段**。`chat.history` 的响应只有 `{ sessionKey, sessionId, messages, defaults, sessionInfo, thinkingLevel }`，无论历史多长都没有 `hasMore`、`nextOffset`、`totalMessages`。因此 `projectHistoryPage` 不能只信响应：满页（`messages.length >= limit`）即视为还有更旧的，下一个 offset 由 `offset + 本页条数` 自行推算；短页即历史到底。别名保留，会答的构建仍然优先采信。
   - 若按字面只信响应，后果是每个会话在一次 tail 读后就被判 `complete`：超过一页（200 条）的会话只存下最新一页，却对外声明「已完整归档」，同时回填拿不到 offset，永远重读同一页。这条已修，回归测试见 `message-projector.test.ts`「keeps walking a full page the Gateway said nothing about」。
-- 消息字段同批核对：真机的频道字段是 `sourceChannel`（不是 `channel`），`sessionId` 只在**页面顶层**、消息行内没有——后者改为从页面读取，因为它正是判断 transcript 是否换代的依据，比会话表里存的那个更新。实测两个真实会话 6/6、2/2 全部成功投影，无丢弃，角色 / messageId / 时间戳全部命中。仍未被任何别名认领的键：`api`、`idempotencyKey`、`isError`、`model`、`provider`、`stopReason`、`toolCallId`、`usage`、`sender*`——前者多为逐条用量与工具错误标记（可作为后续信号来源），`sender*` 是刻意不入库的身份信息。
+- 消息字段同批核对：真机的频道字段是 `sourceChannel`（不是 `channel`），`sessionId` 只在**页面顶层**、消息行内没有——后者改为从页面读取，因为它正是判断 transcript 是否换代的依据，比会话表里存的那个更新。实测两个真实会话 6/6、2/2 全部成功投影，无丢弃，角色 / messageId / 时间戳全部命中。`isError` 随后已接入（见下条）。仍未被任何别名认领的键：`api`、`idempotencyKey`、`model`、`provider`、`stopReason`、`toolCallId`、`usage`、`sender*`——前几项多为逐条用量与调用元数据，`sender*` 是刻意不入库的身份信息。
+- 工具结果的 `isError` 入库为 `session_messages.is_error`（schema v5），只接受布尔值：`NULL` 表示这条不是工具结果，与「调用成功」是两件事，混同会让每条普通消息都变成一次成功的工具调用，把没用过工具的会话也评成高置信度。真机 30 条里 13 条带这个字段，其中 3 条为 true。
 - 容量判定不在写路径上做。`usage()` 依赖 `dbstat`，会遍历全部页——按定时器去问，等于只要 collector 在跑就每隔几分钟在同步路径上走一遍整个库。改为：启动时测一次，驱逐搬动了大量数据后测一次，每轮 prune 之后（由 `markUsageStale()` 通知）测一次；三者都是罕见或本来就在做重活的时机。其间用本轮写入量递增估算。
 - 估算必须换算到页字节口径。预算比的是 `dbstat` 的页字节（含索引与 FTS 影子表），而一轮只知道自己写了多少 UTF-8 内容字节，两者相加是把两种量当同一种：估算实际以真实增速的约三分之一爬升，越线时早已超出。因此按上次测量得到的 `storedBytes / contentBytes` 比率放大后再累加（下限 1，空库不会算出「文本比自身还小」）。
 - 只累加**真正落库**的字节。`append()` 因此回报 `insertedBytes`。tail 读每轮都重取最新一页，而 `withoutKnown` 只在 Gateway 给了 messageId 时才滤得掉；否则重复行由幂等键在插入处丢弃、库根本没长，把这些写入也记进估算，等于让一个早已不再变化的会话稳步爬向上限，最后为了腾出根本不需要的空间去驱逐别人的正文。

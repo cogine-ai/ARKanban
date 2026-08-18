@@ -113,8 +113,11 @@ function sessionWireRow(session: (typeof sessions)[number]): Record<string, unkn
 const transcriptTurns = [
   { role: "user", content: "登录接口最近的失败率有点高，帮我看一下是不是超时导致的。" },
   { role: "assistant", content: "我先拉取最近 24 小时的 登录接口 调用日志，再按错误码分组。" },
-  { role: "tool", toolName: "query_logs", content: '{"window":"24h","group_by":"error_code","rows":1842}' },
+  // `isError` is spelled the way 2026.7.1-2 spells it, and appears both ways: a
+  // tool result that worked says so, which is what tells a grade the call settled.
+  { role: "toolResult", toolName: "query_logs", isError: false, content: '{"window":"24h","group_by":"error_code","rows":1842}' },
   { role: "assistant", content: "超时占 63%，其余是凭证错误。建议把上游超时从 2s 调到 5s。" },
+  { role: "toolResult", toolName: "deploy_canary", isError: true, content: "Error: upstream refused the canary weight change (429)" },
   { role: "user", content: "Can you also check whether the retry budget is being exhausted?" },
   { role: "assistant", content: "Retry budget peaks at 78% during the 09:00 burst; it is not exhausted." },
   { role: "user", content: "<script>alert('xss')</script> **bold** [link](javascript:void 0)" },
@@ -278,6 +281,7 @@ function mockMessage(sessionKey: string, sessionId: string | undefined, index: n
   return {
     role: turn.role,
     ...(turn.toolName ? { toolName: turn.toolName } : {}),
+    ...("isError" in turn ? { isError: turn.isError } : {}),
     ...(sessionId ? { sessionId } : {}),
     content: asBlocks ? [{ type: "text", text: turn.content }] : turn.content,
     timestamp: now - (200 - index) * 30_000,

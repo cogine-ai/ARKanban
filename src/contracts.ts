@@ -415,6 +415,12 @@ export type ArchivedMessage = {
   role: MessageRole;
   channel?: string;
   toolName?: string;
+  /**
+   * The Gateway's own verdict on a tool call, absent unless the turn is a tool
+   * result. Absent and `false` are different facts: one is not a tool result at
+   * all, the other is a call that worked.
+   */
+  isError?: boolean;
   content: string;
   /** Set when a later transcript generation replaced this message's lineage. */
   supersededBySessionId?: string;

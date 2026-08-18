@@ -27,6 +27,8 @@ export type MessageWrite = {
   role: MessageRole;
   channel?: string;
   toolName?: string;
+  /** The Gateway's verdict on a tool call; absent when the turn is not one. */
+  isError?: boolean;
   content: string;
   createdAt: number;
   observedAt: number;
@@ -90,6 +92,9 @@ function rowToMessage(row: Row): ArchivedMessage {
     role: row.role as MessageRole,
     ...(asString(row.channel) ? { channel: asString(row.channel) } : {}),
     ...(asString(row.tool_name) ? { toolName: asString(row.tool_name) } : {}),
+    // A stored NULL means "not a tool result" and stays absent, so nothing
+    // downstream can read it as a call that went fine.
+    ...(asNumber(row.is_error) !== undefined ? { isError: Number(row.is_error) === 1 } : {}),
     content: String(row.content),
     ...(asString(row.superseded_by_session_id)
       ? { supersededBySessionId: asString(row.superseded_by_session_id) }
@@ -139,8 +144,8 @@ export class TranscriptArchive {
     const statement = this.db.prepare(`
       INSERT INTO session_messages (
         session_key, session_id, message_id, seq, role, channel, tool_name,
-        content, content_bytes, created_at, observed_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        is_error, content, content_bytes, created_at, observed_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT (session_key, seq, session_id) DO NOTHING
     `);
     // Only reached when the insert conflicted, and a no-op unless the text
@@ -164,6 +169,7 @@ export class TranscriptArchive {
           write.role,
           write.channel ?? null,
           write.toolName ?? null,
+          write.isError === undefined ? null : write.isError ? 1 : 0,
           write.content,
           contentBytes,
           write.createdAt,

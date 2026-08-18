@@ -22,7 +22,7 @@ import type {
  * per §2.4 of the spec.
  */
 
-export const SIGNAL_ALGORITHM_VERSION = 2;
+export const SIGNAL_ALGORITHM_VERSION = 3;
 
 /**
  * Points deducted from 100. Each entry is capped so one pathological session
@@ -77,6 +77,15 @@ export type ToolEventEvidence = {
   status?: string;
   /** Full event kind, e.g. `session.tool:tool:error`, used when status is absent. */
   kind?: string;
+  /**
+   * A stated outcome, from a source that gives one outright.
+   *
+   * An archived `toolResult` message carries the Gateway's own `isError`, so
+   * there is nothing to infer from a phase vocabulary that was guessed from
+   * documentation. When this is set it decides the event, and the event counts as
+   * settled whichever way it reads.
+   */
+  failed?: boolean;
   occurredAt: number;
 };
 
@@ -104,10 +113,12 @@ function matches(haystack: string | undefined, needles: readonly string[]): bool
 }
 
 export function isToolFailure(event: ToolEventEvidence): boolean {
+  if (event.failed !== undefined) return event.failed;
   return matches(event.status, TOOL_FAILURE_STATUSES) || matches(event.kind, TOOL_FAILURE_STATUSES);
 }
 
 function isToolSettled(event: ToolEventEvidence): boolean {
+  if (event.failed !== undefined) return true;
   return isToolFailure(event) || matches(event.status, TOOL_SUCCESS_STATUSES) || matches(event.kind, TOOL_SUCCESS_STATUSES);
 }
 

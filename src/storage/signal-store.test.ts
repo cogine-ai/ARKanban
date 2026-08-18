@@ -75,6 +75,32 @@ function toolEvent(
   );
 }
 
+/** An archived tool result, which states its outcome rather than implying it. */
+function toolResult(
+  repo: CollectorRepository,
+  sessionKey: string,
+  seq: number,
+  toolName: string,
+  isError: boolean,
+  at: number,
+  sessionId = "gen-1",
+): void {
+  repo.transcripts.append([
+    {
+      sessionKey,
+      sessionId,
+      messageId: `${sessionKey}:${sessionId}:${seq}`,
+      seq,
+      role: "tool",
+      toolName,
+      isError,
+      content: isError ? "command failed" : "command output",
+      createdAt: at,
+      observedAt: at,
+    },
+  ]);
+}
+
 function terminalRun(
   repo: CollectorRepository,
   sessionKey: string,
@@ -135,6 +161,62 @@ describe("SignalStore evidence", () => {
     const signals = repo.signals.recompute("agent:builder:late", NOW);
 
     expect(signals?.toolFailures).toBe(1);
+  });
+
+  it("scores an archived tool result the Gateway called an error", () => {
+    const repo = repository();
+    session(repo, "agent:builder:archived");
+    toolResult(repo, "agent:builder:archived", 1, "exec", true, NOW - 3_000);
+    toolResult(repo, "agent:builder:archived", 2, "exec", false, NOW - 2_000);
+
+    const signals = repo.signals.recompute("agent:builder:archived", NOW);
+
+    expect(signals).toMatchObject({ toolFailures: 1, toolRetries: 1, confidence: "medium" });
+    expect(signals?.penalties.map((penalty) => penalty.code)).toEqual(["tool_failure"]);
+  });
+
+  it("charges one failed call once when both the archive and the events hold it", () => {
+    const repo = repository();
+    session(repo, "agent:builder:both");
+    toolEvent(repo, "agent:builder:both", "t1", "error", "exec", NOW - 3_000);
+    toolResult(repo, "agent:builder:both", 1, "exec", true, NOW - 3_000);
+
+    const signals = repo.signals.recompute("agent:builder:both", NOW);
+
+    expect(signals?.toolFailures).toBe(1);
+  });
+
+  it("leaves a compacted generation out rather than counting its results twice", () => {
+    const repo = repository();
+    session(repo, "agent:builder:compacted");
+    toolResult(repo, "agent:builder:compacted", 1, "exec", true, NOW - 5_000, "gen-1");
+    repo.transcripts.supersede("agent:builder:compacted", "gen-2");
+    toolResult(repo, "agent:builder:compacted", 1, "exec", true, NOW - 4_000, "gen-2");
+
+    const signals = repo.signals.recompute("agent:builder:compacted", NOW);
+
+    expect(signals?.toolFailures).toBe(1);
+  });
+
+  it("ignores messages that are not tool results at all", () => {
+    const repo = repository();
+    session(repo, "agent:builder:chat");
+    repo.transcripts.append([
+      {
+        sessionKey: "agent:builder:chat",
+        sessionId: "gen-1",
+        messageId: "m1",
+        seq: 1,
+        role: "user",
+        content: "hello",
+        createdAt: NOW - 1_000,
+        observedAt: NOW - 1_000,
+      },
+    ]);
+
+    const signals = repo.signals.recompute("agent:builder:chat", NOW);
+
+    expect(signals).toMatchObject({ toolFailures: 0, grade: "unscored", confidence: "low" });
   });
 
   it("returns nothing for a session that was never observed", () => {

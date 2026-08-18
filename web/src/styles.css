@@ -399,6 +399,7 @@ button { color: inherit; }
 .transcript-tool { padding: 1px 5px; border-radius: 5px; background: rgba(118,118,128,.14); color: var(--secondary); font-weight: 640; }
 .transcript-superseded { padding: 1px 5px; border-radius: 5px; background: rgba(191,116,20,.12); color: #8a520a; font-weight: 640; }
 .transcript-divergent { padding: 1px 5px; border-radius: 5px; background: rgba(191,50,50,.1); color: #9a2b2b; font-weight: 640; }
+.transcript-failed { padding: 1px 5px; border-radius: 5px; background: rgba(215,38,61,.14); color: #a51226; font-weight: 700; text-transform: uppercase; letter-spacing: .05em; }
 /* Message text is untrusted input: pre-wrap preserves its shape without letting
    it become markup. */
 .transcript-body { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; font-size: 10px; line-height: 1.5; }

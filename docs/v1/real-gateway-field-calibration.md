@@ -211,6 +211,12 @@ sessions.usage 参数（additionalProperties: false）
 
 **但成本仍然没有**：`totalCost: 0` 配 `missingCostEntries: 1`（provider 是 `codex`，没有价目表）。这个组合很危险——它不是「几乎免费」，而是「一分钱都没定出价」。投影器因此多一条规则：**成本为 0 且有未定价条目时不算金额**，该窗口宁可报没有价格，也不显示 `$0.00+`——把下界标记挂在一个什么都没量到的数字上，比空着更糟。零成本只在没有任何未定价条目时才当作事实保留（例如今天确实还没干活）。
 
+### `isError` 的真机投影复核（同日）
+
+把真机一页历史喂给投影器（`openclaw gateway call chat.history --params '{"sessionKey":"…","limit":30}' | awk 'NR>1' | npx tsx scripts/inspect-gateway-payload.ts history 30`）：6 条消息全部投影、无丢弃，工具结论 `failed=1 ok=1 absent=4`，`isError` 从 `unknown` 键列表里消失。
+
+顺手修了这个脚本：`projectHistoryPage` 早先加了必填的 `request`（分页要靠它反推），脚本没跟上，任何 `history` 模式的调用都会先崩在 `request.limit` 上。现在把调用时用的 `limit` 作为第二个参数传进去——传错的话打印出来的分页结论说的是另一次请求。
+
 ---
 
 ## 3. 版本差异：audit
@@ -226,7 +232,7 @@ sessions.usage 参数（additionalProperties: false）
 ## 4. 还没做的事
 
 1. ~~**`usage.cost` 的成本覆盖层**要改成读 `sessions.usage` 的 `aggregates.byAgent`~~ 已改，见 §2.4 末尾的形状与参数。注意 §2.6 仍然成立：真机上 `aggregates.byAgent` 的 token 与成本也是零，所以这条修完在这台机器上不一定有数——它修掉的是「每轮调用直接失败」，以及在会记账的 harness 上本来就该出现的那份分解。
-2. **消息级 `isError` 没被读**。`chat.history` 的工具结果带 `isError`——真机那 30 条里有 13 条带这个字段、其中 3 条为 true。派生信号现在从 activities/observations 推工具失败，而这里有 Gateway 直接给的结论。（同一批消息的 `usage` 全是零，见 §2.6，别指望它。）
+2. ~~**消息级 `isError` 没被读**~~ 已接：`session_messages` 加了 `is_error`（schema v5），投影器只认布尔值——`NULL` 表示「这条不是工具结果」，和「调用成功」是两件事，混同会把每条普通消息都算成一次成功的工具调用。派生信号优先用归档里的工具结果，没有归档才退回 observations：两边描述的是同一批调用，相加等于同一次失败罚两次分。已换代（`superseded_by_session_id`）的那一代不计，否则跨过一次压缩的会话每条失败都会翻倍。算法版本 2 → 3，存量行自动重算。（同一批消息的 `usage` 全是零，见 §2.6，别指望它。）
 3. **`peakContextTokens` 没有数据源**，而 `sessions.list` 的 `totalTokens` 就是上下文占用量（§2.7）。要接的话得单独走一条不进成本聚合的写入路径——直接写进用量快照会让零 token 的会话进入成本视图。
 4. **audit 采集**完全没实现（§3）。
 5. ~~**Agents 页的「系统 agent 折叠」没有数据来源**~~ 已按后者处理：分组与 SYSTEM 徽号都已删除，规格第 7 节与 §9.6 同步修订。换别的信号（例如只由 cron 触发的 agent）是采集器自己编的区分，不做。`kind` 仍留在契约里，别的 Gateway 版本发这个字段时它就是诚实数据。

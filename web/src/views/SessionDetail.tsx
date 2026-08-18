@@ -302,6 +302,15 @@ function TranscriptPanel({ sessionKey, revision }: { sessionKey: string; revisio
             <header>
               <span className="transcript-role">{message.role}</span>
               {message.toolName ? <span className="transcript-tool">{message.toolName}</span> : null}
+              {/* The Gateway's own verdict on the call, and the one thing a reader
+                  scanning a long transcript for what went wrong is looking for.
+                  Only a stated failure is marked: a tool result that worked reads
+                  as an ordinary turn. */}
+              {message.isError ? (
+                <span className="transcript-failed" title="The Gateway reported this tool call as failed">
+                  failed
+                </span>
+              ) : null}
               <Timestamp className="muted" value={message.createdAt} />
               {message.supersededBySessionId ? (
                 <span className="transcript-superseded" title={`Replaced by generation ${message.supersededBySessionId}`}>

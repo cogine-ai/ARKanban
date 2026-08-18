@@ -29,6 +29,12 @@ export const MESSAGE_FIELD_ALIASES = {
   // arrived over Telegram rather than the terminal.
   channel: ["sourceChannel", "channel", "source"],
   toolName: ["toolName", "tool_name", "tool", "functionName"],
+  // The Gateway's own verdict on a tool call, on the message rather than in the
+  // block: a `role: "toolResult"` turn carries `isError` next to `toolCallId` and
+  // `toolName`, and reports `false` as readily as `true`. The alias list stays
+  // narrow on purpose — a key merely named `error` is as likely to hold a message
+  // or an object, and reading that as a boolean would invent a failed call.
+  isError: ["isError", "is_error"],
   content: ["content", "text", "body", "message", "parts"],
   createdAt: ["timestamp", "recordTimestampMs", "createdAt", "ts", "time"],
   sessionId: ["sessionId", "conversationId"],
@@ -225,6 +231,10 @@ export function projectHistoryPage(payload: Record<string, unknown>, options: Pr
       role: messageRole(read("role")),
       ...(asString(read("channel")) ? { channel: asString(read("channel"))! } : {}),
       ...(asString(read("toolName")) ? { toolName: asString(read("toolName"))! } : {}),
+      // Only a boolean counts. Absent means the turn is not a tool result at all,
+      // which is a third state: storing it as `false` would turn every ordinary
+      // message into evidence of a tool call that succeeded.
+      ...(typeof read("isError") === "boolean" ? { isError: read("isError") as boolean } : {}),
       content,
       createdAt: boundedTimestamp(read("createdAt"), options.observedAt) ?? options.observedAt,
       observedAt: options.observedAt,

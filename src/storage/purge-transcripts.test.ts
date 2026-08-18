@@ -1,9 +1,9 @@
 import { copyFileSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { CollectorRepository } from "./repository.js";
-import { findMigrationBackups, purgeTranscripts } from "./purge-transcripts.js";
+import { ArchiveBusyError, findMigrationBackups, purgeTranscripts } from "./purge-transcripts.js";
 
 const cleanups: Array<() => void> = [];
 afterEach(() => {
@@ -103,6 +103,55 @@ describe("purge-transcripts", () => {
     const repository = new CollectorRepository(databasePath);
     cleanups.push(() => repository.close());
     expect(repository.transcripts.syncState("agent:builder:1")).toMatchObject({ syncedCount: 0, complete: false });
+  });
+
+  /**
+   * The vacuum is the last step and the one most likely to fail — a busy database
+   * or a full disk. It used to take the backup deletion down with it, leaving whole
+   * pre-upgrade copies of the archive on disk while the command reported success.
+   */
+  it("deletes the backups even when the free pages cannot be rewritten", () => {
+    const directory = workspace();
+    const databasePath = path.join(directory, "collector.sqlite");
+    seed(databasePath);
+    const backup = `${databasePath}.pre-v2.bak`;
+    copyFileSync(databasePath, backup);
+    const vacuum = vi
+      .spyOn(CollectorRepository.prototype, "vacuum")
+      .mockImplementation(() => {
+        throw new Error("database or disk is full");
+      });
+    cleanups.push(() => vacuum.mockRestore());
+
+    const result = purgeTranscripts(databasePath);
+
+    expect(result.messagesRemoved).toBe(200);
+    expect(result.backupsRemoved).toEqual([backup]);
+    expect(existsSync(backup)).toBe(false);
+    // And it says so, rather than reporting an erasure it did not complete.
+    expect(result).toMatchObject({ vacuumed: false, vacuumError: "database or disk is full" });
+  });
+
+  /**
+   * Purging clears the sync watermarks, so a collector still running would treat
+   * every session as uncollected and pull the whole archive back from the Gateway
+   * within a round.
+   */
+  it("refuses to start while another process holds the database", () => {
+    const directory = workspace();
+    const databasePath = path.join(directory, "collector.sqlite");
+    seed(databasePath);
+    const probe = vi.spyOn(CollectorRepository.prototype, "probeExclusive").mockImplementation(() => {
+      throw new Error("SQLITE_BUSY: database is locked");
+    });
+    cleanups.push(() => probe.mockRestore());
+
+    expect(() => purgeTranscripts(databasePath)).toThrow(ArchiveBusyError);
+
+    // Nothing was deleted, so the operator can stop the collector and retry.
+    const repository = new CollectorRepository(databasePath);
+    cleanups.push(() => repository.close());
+    expect(repository.transcripts.listMessages("agent:builder:1")).toHaveLength(200);
   });
 
   it("only claims the backups that belong to this database", () => {

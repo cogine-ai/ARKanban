@@ -681,6 +681,16 @@ export class CollectorRepository {
     this.db.exec("VACUUM");
   }
 
+  /**
+   * Throws unless this connection can take the database exclusively, which is as
+   * close as SQLite gets to asking "is anyone else here?". Acquired and released
+   * immediately: the answer is what the caller wants, not the lock.
+   */
+  probeExclusive(): void {
+    this.db.exec("BEGIN EXCLUSIVE");
+    this.db.exec("ROLLBACK");
+  }
+
   subscribe(listener: (change: RepositoryChange) => void): () => void {
     this.listeners.add(listener);
     return () => this.listeners.delete(listener);

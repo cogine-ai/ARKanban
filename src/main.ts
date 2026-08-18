@@ -47,6 +47,16 @@ async function run(): Promise<void> {
     }
     const result = purgeTranscripts(config.storage.path);
     process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
+    if (!result.vacuumed) {
+      // The rows and the backups are gone, but the pages that held them were not
+      // rewritten. Reporting this as success would leave the operator believing
+      // in an erasure that is still incomplete.
+      process.stderr.write(
+        "warning: freed pages were not rewritten, so deleted text may remain recoverable in the database file. " +
+          "Stop the collector and re-run to finish.\n",
+      );
+      process.exitCode = 3;
+    }
     return;
   }
 

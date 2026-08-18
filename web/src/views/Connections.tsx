@@ -8,9 +8,15 @@ import { useTranscriptStatus } from "../state/use-transcript-status";
  * conversations must be stated plainly and continuously, not buried in a
  * settings page the operator has to go looking for.
  */
+const CAPACITY_LABEL = {
+  ok: "Within limit",
+  paused: "Evicting oldest",
+  full: "Full — new messages not stored",
+} as const;
+
 function ArchivePanel({ status }: { status?: TranscriptArchiveStatus }) {
   if (!status) return null;
-  const capacityPaused = status.sync?.capacity === "paused";
+  const capacity = status.sync?.capacity ?? "ok";
 
   return (
     <div className="archive-panel" data-enabled={status.enabled}>
@@ -36,7 +42,7 @@ function ArchivePanel({ status }: { status?: TranscriptArchiveStatus }) {
         </div>
         <div>
           <dt>Capacity</dt>
-          <dd>{capacityPaused ? "Evicting oldest" : "Within limit"}</dd>
+          <dd>{CAPACITY_LABEL[capacity]}</dd>
         </div>
         <div>
           <dt>State</dt>
@@ -47,6 +53,16 @@ function ArchivePanel({ status }: { status?: TranscriptArchiveStatus }) {
           <dd>{status.filePermissionsEnforced ? "This user only" : "Readable by other users"}</dd>
         </div>
       </dl>
+      {capacity === "full" ? (
+        // A full archive stops storing rather than evicting a conversation that is
+        // still being written to, so what is missing has to be said out loud: the
+        // panel would otherwise keep reporting a healthy round while the newest
+        // messages went unarchived.
+        <p className="archive-warning">
+          The archive has reached {formatBytes(status.maxBytes)} and everything it holds is too recent to evict, so new
+          messages are not being stored. Raise the size limit or run the erase command below.
+        </p>
+      ) : null}
       {status.filePermissionsEnforced ? null : (
         // The panel's whole claim is that the text stays on this machine, which
         // says nothing about who else on it can read the file. Where the mode

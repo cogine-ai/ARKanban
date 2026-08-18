@@ -20,7 +20,13 @@ function repository(): CollectorRepository {
   return result;
 }
 
-function seedSession(repo: CollectorRepository, sessionKey: string, agentId = "builder", lastActivityAt = 5_000): void {
+function seedSession(
+  repo: CollectorRepository,
+  sessionKey: string,
+  agentId = "builder",
+  lastActivityAt = 5_000,
+  hasActiveRun = false,
+): void {
   repo.upsertSessions([
     {
       sessionKey,
@@ -28,7 +34,7 @@ function seedSession(repo: CollectorRepository, sessionKey: string, agentId = "b
       label: `Session ${sessionKey}`,
       kindHint: "main",
       archived: false,
-      hasActiveRun: false,
+      hasActiveRun,
       lineage: {},
       lastActivityAt,
       observedAt: lastActivityAt,
@@ -145,8 +151,60 @@ describe("TranscriptArchive", () => {
     const evicted = repo.transcripts.evictOldestSessions(Math.floor(before.storedBytes * 0.6));
 
     expect(evicted.sessions).toBe(1);
+    expect(evicted.reachedTarget).toBe(true);
     expect(repo.transcripts.listMessages("agent:builder:old")).toEqual([]);
     expect(repo.transcripts.listMessages("agent:builder:new")).toHaveLength(40);
+  });
+
+  /**
+   * Evicting a session that is still producing messages accomplishes nothing: the
+   * next sync round pulls it back, and the round after that evicts it again. The
+   * archive spent its request budget shredding and refetching the one transcript
+   * most likely to be open on screen.
+   */
+  it("refuses to evict a session that is still being written to", () => {
+    const repo = repository();
+    seedSession(repo, "agent:builder:live", "builder", 9_000, true);
+    seedSession(repo, "agent:builder:recent", "builder", 8_000);
+    const bulk = (sessionKey: string) =>
+      Array.from({ length: 40 }, (_unused, index) =>
+        message({ sessionKey, seq: index, content: `padding ${"x".repeat(500)} ${index}` }),
+      );
+    repo.transcripts.append(bulk("agent:builder:live"));
+    repo.transcripts.append(bulk("agent:builder:recent"));
+
+    const before = repo.transcripts.usage();
+    // Both sessions are protected — one by its open run, the other by the window —
+    // so there is no room to make and the caller has to be told so.
+    const evicted = repo.transcripts.evictOldestSessions(Math.floor(before.storedBytes * 0.4), {
+      protectSince: 7_000,
+    });
+
+    expect(evicted).toEqual({ sessions: 0, messages: 0, reachedTarget: false });
+    expect(repo.transcripts.listMessages("agent:builder:live")).toHaveLength(40);
+    expect(repo.transcripts.listMessages("agent:builder:recent")).toHaveLength(40);
+  });
+
+  it("evicts what it may while protecting the live session", () => {
+    const repo = repository();
+    seedSession(repo, "agent:builder:live", "builder", 9_000, true);
+    seedSession(repo, "agent:builder:cold", "builder", 1_000);
+    const bulk = (sessionKey: string) =>
+      Array.from({ length: 40 }, (_unused, index) =>
+        message({ sessionKey, seq: index, content: `padding ${"x".repeat(500)} ${index}` }),
+      );
+    repo.transcripts.append(bulk("agent:builder:live"));
+    repo.transcripts.append(bulk("agent:builder:cold"));
+
+    const before = repo.transcripts.usage();
+    const evicted = repo.transcripts.evictOldestSessions(Math.floor(before.storedBytes * 0.6), {
+      protectSince: 7_000,
+    });
+
+    expect(evicted.sessions).toBe(1);
+    expect(evicted.reachedTarget).toBe(true);
+    expect(repo.transcripts.listMessages("agent:builder:cold")).toEqual([]);
+    expect(repo.transcripts.listMessages("agent:builder:live")).toHaveLength(40);
   });
 
   it("reports sync watermarks so a stale local copy is not shown as live", () => {

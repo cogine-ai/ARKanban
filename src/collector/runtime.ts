@@ -59,6 +59,7 @@ import {
   type UsageSyncOutcome,
 } from "./usage-sync.js";
 import {
+  ACTIVE_WINDOW_MS,
   classifyHistoryFailure,
   TRANSCRIPT_SYNC_MS,
   TranscriptSynchronizer,
@@ -1072,7 +1073,13 @@ export class CollectorRuntime {
       // Transcripts have two gates: age here, and the size ceiling the sync loop
       // enforces. Age runs first so eviction only ever has to handle real growth.
       this.repository.transcripts.pruneOlderThan(now - this.config.storage.transcriptRetentionDays * day);
-      this.repository.transcripts.evictOldestSessions(this.config.storage.transcriptMaxBytes);
+      this.repository.transcripts.evictOldestSessions(this.config.storage.transcriptMaxBytes, {
+        protectSince: now - ACTIVE_WINDOW_MS,
+      });
+      // This pass is where the archive's real page cost gets re-measured: it has
+      // just deleted rows the sync loop cannot see, and its own estimate would
+      // still be counting them.
+      this.transcripts.markUsageStale();
       this.pruneError = undefined;
     } catch (error) {
       this.pruneError = storageErrorCode(error);

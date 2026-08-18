@@ -57,6 +57,19 @@ export type ArchiveUsage = {
   storedBytes: number;
 };
 
+export type EvictionOutcome = {
+  sessions: number;
+  messages: number;
+  /**
+   * False when the protected sessions alone still exceed the ceiling.
+   *
+   * The caller needs this to tell "made room" apart from "there is no more room
+   * to make", because the two call for opposite behaviour: carry on archiving, or
+   * stop and say so.
+   */
+  reachedTarget: boolean;
+};
+
 type Row = Record<string, unknown>;
 
 function asString(value: unknown): string | undefined {
@@ -422,23 +435,35 @@ export class TranscriptArchive {
    * Capacity eviction drops whole sessions, oldest first. Trimming individual
    * messages would leave half-conversations behind, which are close to worthless
    * for review and actively misleading in search results.
+   *
+   * `protectSince` shields sessions that are still producing messages, and with
+   * them the conversation someone is most likely reading right now. Without it an
+   * over-budget archive tore up the newest session, the next sync round pulled it
+   * straight back, and the round after that evicted it again — the archive spent
+   * its whole request budget shredding and refetching the same transcript. When
+   * the protected sessions alone exceed the ceiling, `reachedTarget` is false and
+   * nothing further is deleted: the caller is expected to stop archiving and say
+   * so, which is the honest end of a full disk.
    */
-  evictOldestSessions(targetStoredBytes: number): { sessions: number; messages: number } {
+  evictOldestSessions(targetStoredBytes: number, options: { protectSince?: number } = {}): EvictionOutcome {
     const usage = this.usage();
     if (usage.storedBytes <= targetStoredBytes || usage.contentBytes === 0) {
-      return { sessions: 0, messages: 0 };
+      return { sessions: 0, messages: 0, reachedTarget: true };
     }
+    const protectSince = options.protectSince ?? Number.POSITIVE_INFINITY;
     const candidates = this.db
       .prepare(`
         SELECT m.session_key AS session_key,
                SUM(m.content_bytes) AS bytes,
-               COALESCE(s.last_activity_at, MIN(m.created_at)) AS activity
+               COALESCE(s.last_activity_at, MIN(m.created_at)) AS activity,
+               COALESCE(s.has_active_run, 0) AS active_run
         FROM session_messages m
         LEFT JOIN sessions s ON s.session_key = m.session_key
         GROUP BY m.session_key
+        HAVING active_run = 0 AND activity < ?
         ORDER BY activity ASC
       `)
-      .all() as Row[];
+      .all(protectSince === Number.POSITIVE_INFINITY ? Number.MAX_SAFE_INTEGER : protectSince) as Row[];
 
     // storedBytes includes index overhead, so scale the content-byte budget by the
     // observed ratio instead of comparing the two directly.
@@ -450,7 +475,10 @@ export class TranscriptArchive {
       doomed.push(String(candidate.session_key));
       contentBudget -= Number(candidate.bytes);
     }
-    if (doomed.length === 0) return { sessions: 0, messages: 0 };
+    // Whatever is left owing after every unprotected session has been taken is
+    // held by sessions this pass refuses to touch.
+    const reachedTarget = contentBudget <= 0;
+    if (doomed.length === 0) return { sessions: 0, messages: 0, reachedTarget };
 
     const statement = this.db.prepare("DELETE FROM session_messages WHERE session_key = ?");
     // The watermark has to come back with the text. Left alone it would keep
@@ -475,7 +503,7 @@ export class TranscriptArchive {
       throw error;
     }
     this.compactIndex();
-    return { sessions: doomed.length, messages };
+    return { sessions: doomed.length, messages, reachedTarget };
   }
 
   /**

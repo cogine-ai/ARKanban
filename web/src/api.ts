@@ -26,7 +26,13 @@ export type TranscriptArchiveStatus = {
   filePermissionsEnforced: boolean;
   messageCount: number;
   contentBytes: number;
-  sync: { sessions: number; inserted: number; capacity: "ok" | "paused"; errorCode?: string; skipped?: string } | null;
+  sync: {
+    sessions: number;
+    inserted: number;
+    capacity: "ok" | "paused" | "full";
+    errorCode?: string;
+    skipped?: string;
+  } | null;
 };
 
 export type SessionListFilters = {

@@ -11,11 +11,18 @@
 
 export type CapabilityState = "unknown" | "live" | "unavailable" | "unauthorized" | "error";
 
-/** Methods that must be probed because discovery will never mention them. */
+/**
+ * Methods that must be probed because discovery will never mention them.
+ *
+ * `usage.cost` was here and is not called any more: it takes an agent scope but
+ * merges every agent into one total, so the per-agent split the cost view needs
+ * exists only in `sessions.usage`'s aggregates. Probing a method nothing reads
+ * would publish a capability on the Connections page that explains nothing about
+ * what the UI can show.
+ */
 export const NON_DISCOVERABLE_METHODS = [
   "sessions.usage",
   "sessions.usage.timeseries",
-  "usage.cost",
   "chat.history",
 ] as const;
 
@@ -69,7 +76,6 @@ const PROBE_PARAMS: Record<
 > = {
   "sessions.usage": () => ({ limit: 1 }),
   "sessions.usage.timeseries": () => ({ limit: 1 }),
-  "usage.cost": () => ({ limit: 1 }),
   "chat.history": (context) =>
     context.sessionKey === undefined ? undefined : { sessionKey: context.sessionKey, limit: 1 },
 };

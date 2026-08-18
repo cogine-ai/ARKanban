@@ -181,7 +181,7 @@ export type SessionSignals = {
 | `sessions.list` | 8s（复用现有） | 现有 reconcile 循环 | limit 500 |
 | `sessions.describe` | 按需 | 打开 Session 详情、或该会话首次转 terminal | 单条 |
 | `sessions.usage` | 60s | 只覆盖候选集，见 3.3 | 见 3.3 |
-| `usage.cost` | 300s | Agents 总览的成本卡 | 按范围 |
+| `sessions.usage`（`agentScope: "all"`） | 300s | Agents 总览的成本卡 | 一次一个日历跨度 |
 | `audit.activity.list`（`kind: "message"`） | 300s，后台 | 增量游标 | limit 500 |
 | `chat.history` | 30s（活跃会话增量）+ 空闲期回填 | 见第 7 节 | 游标 |
 
@@ -226,11 +226,13 @@ sessions.list 分页
 - coverage 由本轮结果决定：全部请求失败才是 `error`，只要有一个成功就按 `demand > limit ? "snapshot" : "live"` 取值。单个会话抖动不应该把整张成本卡涂成故障。
 - §2.2 的 `SessionCoverage.usage` 联合类型原本没有 `snapshot`，与本节要求矛盾，已按本节补齐。
 - 快照是**累计读数**而非增量，因此任何聚合都取每个会话的最新一行，绝不对多行求和。
-- `usage.cost` 按 300s 独立节奏刷新，结果只驻内存：它是对某个区间的交叉校验，落库会造出第二份可能与快照冲突的成本口径。重连即失效。
+- 按 agent 的成本按 300s 独立节奏刷新，结果只驻内存：它是对某个区间的交叉校验，落库会造出第二份可能与快照冲突的成本口径。重连即失效。
+- 它走的是**同一个方法的另一种问法**：`sessions.usage` 加 `agentScope: "all"`，读 `aggregates.byAgent`。原设计用 `usage.cost`，真机校准（见校准记录 §2.4）证明那个方法给不出按 agent 的分解——它接受 agent 作用域，但只把所有 agent 合并进 `totals`。`limit` 只截断回包里的 `sessions` 数组、不影响聚合，所以这次调用发 `limit: 1`：拿到分解，不搬回一堆用不上的行。
+- `usage.cost` 因此不再被调用，也从能力探测清单里移除：探一个没人读的方法，只会在 Connections 面板上多挂一个解释不了任何界面内容的能力。
 
 ### 3.4 能力探测
 
-`sessions.usage`、`sessions.usage.timeseries`、`usage.cost`、`chat.history` 都按 v1.1 修订 §4.3 处理——前三个不在 hello 的发现列表中，`chat.history` 在本机 2026.7.1-2 上会 advertise，但**不能因此只信发现列表**：§4.3 的要点是「未 advertise 不等于不可用」，而正文同步原先正是按字面反过来用的，遇到不列出 `chat.history` 的构建就每轮判 `unavailable`、一条正文都不归档，且没有任何探测或重试能走出来。现在探测结果（任一确定verdict）优先于发现列表，只有还没探测出结果时才回落到发现列表。
+`sessions.usage`、`sessions.usage.timeseries`、`chat.history` 都按 v1.1 修订 §4.3 处理——前三个不在 hello 的发现列表中，`chat.history` 在本机 2026.7.1-2 上会 advertise，但**不能因此只信发现列表**：§4.3 的要点是「未 advertise 不等于不可用」，而正文同步原先正是按字面反过来用的，遇到不列出 `chat.history` 的构建就每轮判 `unavailable`、一条正文都不归档，且没有任何探测或重试能走出来。现在探测结果（任一确定verdict）优先于发现列表，只有还没探测出结果时才回落到发现列表。
 
 ```text
 连接就绪后 → 对每个不可发现方法执行一次最小参数探测
@@ -529,14 +531,18 @@ cost: {
   coverage: SessionUsageCoverage;
   source: Record<"24h" | "7d", "gateway" | "snapshots">;
   windows: Record<"24h" | "7d", UsageTotals>;
+  /** 只出现在由 Gateway 定价的窗口上：它实际覆盖的日历跨度。 */
+  priced?: Partial<Record<"24h" | "7d", { from: string; to: string }>>;
 }
 ```
 
-`source` 必须暴露，因为同一笔花费有两个来源：`usage.cost` 按区间一次定价，`sessions.usage` 按会话逐个定价。卡片优先用前者（一次定价整个区间，比把不同时刻的读数相加更准），`/api/v1/usage/summary` 只报后者。两者不一致时，`source` 是唯一能解释差异的线索。
+`source` 必须暴露，因为同一笔花费有两个来源：一次区间定价（`sessions.usage` 的 `aggregates.byAgent`），与按会话逐个定价的快照。卡片优先用前者（一次定价整个区间，比把不同时刻的读数相加更准；在自己不记账的 harness 上它还是唯一有数的那个），`/api/v1/usage/summary` 只报后者。两者不一致时，`source` 是唯一能解释差异的线索。
 
-`source` 与成本 coverage 都**按窗口**记录，因为 24h 与 7d 是两次独立的 `usage.cost` 请求、会各自失败。整卡一个标签的写法有两处失真：一是任一窗口成功就把「由 Gateway 定价」盖在另一个它根本没答的窗口上；二是原实现把两个窗口的结果先攒成一份再整体替换，于是失败的那个窗口以**空 map** 落地——已知价格被静默清空——同时凭另一个窗口的成功把 coverage 报成 `live`，正是这条成本链路本身要防的「没人定价却显示成已定价」。现在每个窗口只被自己那次成功的应答替换，失败的窗口保留上次已知价格并单独降级为 `error`。
+`source` 与成本 coverage 都**按窗口**记录，因为 24h 与 7d 是两次独立请求、会各自失败。整卡一个标签的写法有两处失真：一是任一窗口成功就把「由 Gateway 定价」盖在另一个它根本没答的窗口上；二是原实现把两个窗口的结果先攒成一份再整体替换，于是失败的那个窗口以**空 map** 落地——已知价格被静默清空——同时凭另一个窗口的成功把 coverage 报成 `live`，正是这条成本链路本身要防的「没人定价却显示成已定价」。现在每个窗口只被自己那次成功的应答替换，失败的窗口保留上次已知价格并单独降级为 `error`。
 
-但覆盖只替换金额，不替换 `hasCost`。区间定价不可能定出 `sessions.usage` 自己都报为未定价的模型，把 `hasCost` 一并设成 true 会让一个下界读起来像完整值——这正是 §2.3 禁止的那种塌缩。
+覆盖同时替换金额与 `hasCost`，因为两者来自同一次应答：聚合自己带着 `missingCostEntries`，那是唯一能判断屏幕上这个金额完整与否的东西。原来的写法保留按会话读数的 `hasCost`，于是一个区间明明全部定价、却因为某个会话的快照曾是下界而被标成下界。未定价的**模型名**仍只能来自按会话读数——区间应答只报数量、不报是谁——所以名字留着，完整性由区间说。
+
+金额覆盖的窗口还要带上**实际定价的日历跨度**（`cost.priced`）。Gateway 只按日历天定价：`range` 最小是 `7d`，单日必须用 `startDate`/`endDate` 点名，不存在「最近 24 小时」这种问法。因此 24h 那一列在被 Gateway 定价时展示的是**某一天**的花费，卡片就按应答回来的跨度改标签（今天即 `today`），详情页页脚把两个跨度写全。把一天的金额挂在写着 24h 的标签下，正是这条链路要防的那种「标签与含义不符」。发请求时带 `mode: "specific"` 与本机 UTC 偏移，这样「哪一天的午夜」由我们钉死，不取决于 Gateway 宿主机的时区。
 
 ### 5.2 会话列表分页
 

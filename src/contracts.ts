@@ -234,19 +234,28 @@ export type AgentOverview = AgentSummary & {
    * Carries its own coverage so the card can say "not collected" instead of
    * rendering a confident zero for an agent whose usage was never observed.
    *
-   * `source` names where the amount came from, because a card priced by
-   * `usage.cost` can legitimately differ from `/usage/summary`, which only ever
+   * `source` names where the amount came from, because a card priced by a ranged
+   * Gateway read can legitimately differ from `/usage/summary`, which only ever
    * reports stored per-session readings.
    */
   cost: {
     coverage: SessionUsageCoverage;
     /**
-     * Named per window, because the two windows are separate `usage.cost`
-     * requests that fail separately. One label for the pair claimed both were
-     * priced by the Gateway whenever either was.
+     * Named per window, because the two windows are separate requests that fail
+     * separately. One label for the pair claimed both were priced by the Gateway
+     * whenever either was.
      */
     source: Record<AgentRollupWindow, "gateway" | "snapshots">;
     windows: Record<AgentRollupWindow, UsageTotals>;
+    /**
+     * The calendar span a Gateway-priced window actually covers, `YYYY-MM-DD`.
+     *
+     * The Gateway prices by calendar day and has no rolling-window form, so the
+     * amount under `24h` is one day's spend and the amount under `7d` covers
+     * seven calendar days. Present only for windows whose `source` is `gateway`,
+     * and the card labels those windows from this rather than from the key.
+     */
+    priced?: Partial<Record<AgentRollupWindow, { from: string; to: string }>>;
   };
 };
 

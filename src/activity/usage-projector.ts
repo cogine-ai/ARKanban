@@ -3,7 +3,7 @@ import type { UsageWrite } from "../storage/usage-store.js";
 import { boundedTimestamp } from "./timestamps.js";
 
 /**
- * Projects `sessions.usage` and `usage.cost` replies into usage writes.
+ * Projects `sessions.usage` replies into usage writes and per-agent cost.
  *
  * Every field goes through an alias list, so correcting one is a single-line
  * edit — move the real key to the front. The lists have been checked against
@@ -197,31 +197,69 @@ export function projectUsageRow(raw: unknown, options: ProjectUsageOptions): Usa
 export const COST_FIELD_ALIASES = {
   agentId: ["agentId", "agent", "id", "key", "name"],
   costMicroUsd: ["costMicroUsd", "costMicros", "cost_micro_usd"],
-  costUsd: ["costUsd", "cost", "amountUsd", "total"],
+  costUsd: ["totalCost", "costUsd", "cost", "amountUsd", "total"],
+  missingCostEntries: ["missingCostEntries"],
 } as const satisfies Record<string, readonly string[]>;
 
 export const COST_PAGE_ALIASES = {
-  entries: ["agents", "byAgent", "breakdown", "items", "entries", "results", "costs"],
+  entries: ["byAgent", "agents", "breakdown", "items", "entries", "results", "costs"],
   totalMicroUsd: ["totalMicroUsd", "totalCostMicroUsd"],
-  totalUsd: ["totalUsd", "totalCost", "total", "cost"],
+  totalUsd: ["totalCost", "totalUsd", "total", "cost"],
+  pricedFrom: ["startDate", "from", "rangeStart"],
+  pricedTo: ["endDate", "to", "rangeEnd"],
 } as const satisfies Record<string, readonly string[]>;
 
-export type CostReport = { byAgent: Map<string, number>; totalMicroUsd?: number };
+/**
+ * The per-agent breakdown and the per-agent amount each sit one level down.
+ *
+ * A reply is `{ updatedAt, startDate, endDate, sessions, totals, aggregates:
+ * { byAgent: [{ agentId, totals: { totalCost, missingCostEntries, ... } }], ... },
+ * cacheStatus }`. Both levels are read, so a Gateway that puts the breakdown or
+ * the amount on the row still lands.
+ */
+const COST_AGGREGATE_KEY = "aggregates";
+const COST_TOTALS_KEY = "totals";
 
 /**
- * Reads a ranged `usage.cost` reply into per-agent micro-USD.
+ * One agent's spend over the requested span.
+ *
+ * `hasCost` carries the same meaning as it does on a stored reading: false says
+ * the amount is a floor, because the Gateway counted entries it could not price.
+ * Without it a ranged total would be presented as complete on the strength of
+ * having arrived.
+ */
+export type AgentCostEntry = { costMicroUsd: number; hasCost: boolean };
+
+export type CostReport = {
+  byAgent: Map<string, AgentCostEntry>;
+  totalMicroUsd?: number;
+  /** The calendar span the Gateway actually priced, as it reported it. */
+  pricedFrom?: string;
+  pricedTo?: string;
+};
+
+/**
+ * Reads the per-agent breakdown of a ranged `sessions.usage` reply.
  *
  * The Gateway prices work it knows about, which is why its figure takes
  * precedence over one derived from token counts: local pricing would have to
  * guess at rates that change without notice.
+ *
+ * `usage.cost` used to be the source and cannot be: it takes an agent scope but
+ * merges every agent into one total, so the per-agent split exists only here.
+ * See docs/v1/real-gateway-field-calibration.md §2.4.
  */
 export function projectCostReport(payload: unknown, inventory?: FieldInventory): CostReport {
-  const byAgent = new Map<string, number>();
+  const byAgent = new Map<string, AgentCostEntry>();
   const envelope = record(payload);
   if (!envelope) return { byAgent };
   inventory?.observeRow(envelope);
+  const aggregates = record(envelope[COST_AGGREGATE_KEY]);
+  if (aggregates) inventory?.observeRow(aggregates);
 
-  const listed = pick(envelope, "entries", COST_PAGE_ALIASES.entries, inventory);
+  const listed =
+    (aggregates ? pick(aggregates, "entries", COST_PAGE_ALIASES.entries, inventory) : undefined) ??
+    pick(envelope, "entries", COST_PAGE_ALIASES.entries, inventory);
   const rows = Array.isArray(listed)
     ? listed
     : record(listed)
@@ -234,25 +272,61 @@ export function projectCostReport(payload: unknown, inventory?: FieldInventory):
     inventory?.observeRow(row);
     const agentId = pick(row, "agentId", COST_FIELD_ALIASES.agentId, inventory);
     if (typeof agentId !== "string" || !agentId.trim()) continue;
-    const micros = asNumber(pick(row, "costMicroUsd", COST_FIELD_ALIASES.costMicroUsd, inventory));
-    const dollars = asNumber(pick(row, "costUsd", COST_FIELD_ALIASES.costUsd, inventory));
+    const totals = record(row[COST_TOTALS_KEY]);
+    if (totals) inventory?.observeRow(totals);
+    const read = (field: keyof typeof COST_FIELD_ALIASES): unknown => {
+      const direct = pick(row, field, COST_FIELD_ALIASES[field], inventory);
+      if (direct !== undefined) return direct;
+      return totals ? pick(totals, field, COST_FIELD_ALIASES[field], inventory) : undefined;
+    };
+    const micros = asNumber(read("costMicroUsd"));
+    const dollars = asNumber(read("costUsd"));
     const cost = micros !== undefined ? Math.round(micros) : dollars !== undefined ? toMicroUsd(dollars) : undefined;
     if (cost === undefined) continue;
-    byAgent.set(agentId.trim(), (byAgent.get(agentId.trim()) ?? 0) + cost);
+    const unpriced = asNumber(read("missingCostEntries")) ?? 0;
+    const id = agentId.trim();
+    const previous = byAgent.get(id);
+    // Zero priced against entries it could not price is not an amount. The
+    // calibration machine answers exactly this for a week holding 27,844 tokens:
+    // `totalCost: 0` with `missingCostEntries: 1`, because the codex harness has
+    // no price table. Carried through, the card would read "$0.00+" over a week of
+    // real work — the floor marker attached to a figure that measures nothing. The
+    // window is left to say it has no price instead.
+    if (cost === 0 && unpriced > 0) {
+      if (previous) byAgent.set(id, { ...previous, hasCost: false });
+      continue;
+    }
+    byAgent.set(id, {
+      costMicroUsd: (previous?.costMicroUsd ?? 0) + cost,
+      // One unpriced entry anywhere in the span makes the whole amount a floor.
+      hasCost: (previous?.hasCost ?? true) && unpriced === 0,
+    });
   }
 
   const totalMicros = asNumber(pick(envelope, "totalMicroUsd", COST_PAGE_ALIASES.totalMicroUsd, inventory));
-  const totalDollars = asNumber(pick(envelope, "totalUsd", COST_PAGE_ALIASES.totalUsd, inventory));
+  const totalsEnvelope = record(envelope[COST_TOTALS_KEY]);
+  const totalDollars = asNumber(
+    pick(envelope, "totalUsd", COST_PAGE_ALIASES.totalUsd, inventory) ??
+      (totalsEnvelope ? pick(totalsEnvelope, "totalUsd", COST_PAGE_ALIASES.totalUsd, inventory) : undefined),
+  );
   const totalMicroUsd =
     totalMicros !== undefined
       ? Math.round(totalMicros)
       : totalDollars !== undefined
         ? toMicroUsd(totalDollars)
         : byAgent.size > 0
-          ? [...byAgent.values()].reduce((sum, value) => sum + value, 0)
+          ? [...byAgent.values()].reduce((sum, entry) => sum + entry.costMicroUsd, 0)
           : undefined;
 
-  return { byAgent, ...(totalMicroUsd !== undefined ? { totalMicroUsd } : {}) };
+  const pricedFrom = pick(envelope, "pricedFrom", COST_PAGE_ALIASES.pricedFrom, inventory);
+  const pricedTo = pick(envelope, "pricedTo", COST_PAGE_ALIASES.pricedTo, inventory);
+
+  return {
+    byAgent,
+    ...(totalMicroUsd !== undefined ? { totalMicroUsd } : {}),
+    ...(typeof pricedFrom === "string" && pricedFrom ? { pricedFrom } : {}),
+    ...(typeof pricedTo === "string" && pricedTo ? { pricedTo } : {}),
+  };
 }
 
 /** Reads a batched `sessions.usage` reply, tolerating both list and map shapes. */

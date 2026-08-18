@@ -27,17 +27,29 @@ import { useCollector } from "../state/collector-context";
  */
 
 /**
- * Where each window's amount came from.
+ * Where each window's amount came from, and what span it covers.
  *
  * The two windows are priced by separate Gateway calls, so one can be a Gateway
  * price while the other falls back to stored readings — a single label for the
- * pair would put the Gateway's name on a figure it never priced.
+ * pair would put the Gateway's name on a figure it never priced. The spans are
+ * spelled out because the Gateway prices calendar days: the detail page is where
+ * a reader goes to find out exactly what a number on the card meant.
  */
-function costSourceLabel(source: AgentOverview["cost"]["source"]): string {
-  const priced = ROLLUP_WINDOWS.filter((window) => source[window] === "gateway");
-  if (priced.length === ROLLUP_WINDOWS.length) return "Priced by the Gateway";
+function costSourceLabel(cost: AgentOverview["cost"]): string {
+  const priced = ROLLUP_WINDOWS.filter((window) => cost.source[window] === "gateway");
   if (priced.length === 0) return "Totalled from stored session readings";
-  return `${priced.join(" and ")} priced by the Gateway; the rest totalled from stored session readings`;
+  const lead =
+    priced.length === ROLLUP_WINDOWS.length
+      ? "Priced by the Gateway"
+      : `${priced.join(" and ")} priced by the Gateway; the rest totalled from stored session readings`;
+  const spans = priced
+    .map((window) => {
+      const span = cost.priced?.[window];
+      if (!span) return undefined;
+      return span.from === span.to ? `${window}: ${span.from}` : `${window}: ${span.from} → ${span.to}`;
+    })
+    .filter((entry): entry is string => entry !== undefined);
+  return spans.length === 0 ? lead : `${lead} · calendar days · ${spans.join(" · ")}`;
 }
 
 /** Outcome buckets in the order they are worth reading, worst last. */
@@ -230,7 +242,7 @@ export function AgentDetailView({ agentId }: { agentId: string }) {
         <div className="detail-panel">
           <h2>Cost</h2>
           <AgentCost cost={agent.cost} />
-          <footer className="detail-foot muted">{costSourceLabel(agent.cost.source)}</footer>
+          <footer className="detail-foot muted">{costSourceLabel(agent.cost)}</footer>
         </div>
 
         <SchedulePanel schedules={live.schedules} />

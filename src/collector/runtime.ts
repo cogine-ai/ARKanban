@@ -55,10 +55,12 @@ import { inferAgents, projectAgent, projectSession } from "../activity/session-p
 import { CapabilityRegistry, type CapabilityState } from "./capability-probe.js";
 import {
   classifyUsageFailure,
+  type CostSpan,
   USAGE_SYNC_MS,
   UsageSynchronizer,
   type UsageSyncOutcome,
 } from "./usage-sync.js";
+import type { AgentCostEntry } from "../activity/usage-projector.js";
 import {
   ACTIVE_WINDOW_MS,
   classifyHistoryFailure,
@@ -184,7 +186,6 @@ export class CollectorRuntime {
   private readonly agentFields = new FieldInventory("agents.list");
   private readonly messageFields = new FieldInventory("chat.history");
   private readonly usageFields = new FieldInventory("sessions.usage");
-  private readonly costFields = new FieldInventory("usage.cost");
   private readonly transcripts: TranscriptSynchronizer;
   private readonly usage: UsageSynchronizer;
   private transcriptStatus: TranscriptSyncOutcome | undefined;
@@ -233,7 +234,6 @@ export class CollectorRuntime {
       store: this.repository.usage,
       request: async (method, params) => this.gateway.request(method, params),
       inventory: this.usageFields,
-      costInventory: this.costFields,
     });
   }
 
@@ -362,7 +362,6 @@ export class CollectorRuntime {
       this.sessionFields.reset();
       this.agentFields.reset();
       this.usageFields.reset();
-      this.costFields.reset();
       // Prices are held in memory against a specific Gateway's pricing table,
       // so they do not survive a reconnect either.
       this.usage.resetCost();
@@ -707,7 +706,6 @@ export class CollectorRuntime {
         now: Date.now(),
         connected: this.gateway.isConnected,
         usageState: this.capabilities.stateOf("sessions.usage"),
-        costState: this.capabilities.stateOf("usage.cost"),
       });
     } catch (error) {
       this.usageStatus = {
@@ -794,9 +792,14 @@ export class CollectorRuntime {
     return this.signalStatus;
   }
 
-  /** Gateway-priced cost per agent, absent when `usage.cost` never answered. */
-  getAgentCost(window: AgentRollupWindow, agentId: string): number | undefined {
+  /** Gateway-priced cost per agent, absent when the ranged read never answered. */
+  getAgentCost(window: AgentRollupWindow, agentId: string): AgentCostEntry | undefined {
     return this.usage.costFor(window, agentId);
+  }
+
+  /** The calendar span the Gateway priced a window over, as it reported it. */
+  getAgentCostSpan(window: AgentRollupWindow): CostSpan | undefined {
+    return this.usage.costSpan(window);
   }
 
   /**
@@ -823,7 +826,6 @@ export class CollectorRuntime {
       this.agentFields.report(),
       this.messageFields.report(),
       this.usageFields.report(),
-      this.costFields.report(),
     ];
   }
 

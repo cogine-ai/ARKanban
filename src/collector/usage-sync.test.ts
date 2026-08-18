@@ -3,7 +3,13 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { CollectorRepository } from "../storage/repository.js";
-import { COST_SYNC_MS, UsageSynchronizer, type UsageRequest } from "./usage-sync.js";
+import {
+  COST_SYNC_MS,
+  localDateLabel,
+  localUtcOffset,
+  UsageSynchronizer,
+  type UsageRequest,
+} from "./usage-sync.js";
 
 const cleanups: Array<() => void> = [];
 afterEach(() => {
@@ -51,24 +57,51 @@ function synchronizer(
   return new UsageSynchronizer({ store: repo.usage, request });
 }
 
+/**
+ * The reply 2026.7.1-2 gives an agent-scoped range.
+ *
+ * The per-agent amount lives in `aggregates.byAgent[].totals`, in dollars, next
+ * to the count of entries the Gateway could not price — and the span it resolved
+ * comes back with it.
+ */
+function rangedCostReply(params: Record<string, unknown>): Record<string, unknown> {
+  const day = typeof params.startDate === "string" ? params.startDate : undefined;
+  return {
+    updatedAt: NOW,
+    startDate: day ?? "2026-08-12",
+    endDate: day ?? "2026-08-18",
+    sessions: [],
+    totals: { totalCost: day ? 0.007 : 0.03, missingCostEntries: 0 },
+    aggregates: {
+      byAgent: [{ agentId: "builder", totals: { totalCost: day ? 0.007 : 0.03, totalTokens: 400, missingCostEntries: 0 } }],
+    },
+    cacheStatus: { status: "fresh", cachedFiles: 1, pendingFiles: 0, staleFiles: 0 },
+  };
+}
+
 /** A Gateway that answers usage reads and records what was asked. */
 function recordingGateway(overrides: { usage?: UsageRequest; cost?: UsageRequest } = {}): {
   request: UsageRequest;
   calls: Array<{ method: string; params: Record<string, unknown> }>;
+  costCalls: () => Array<{ method: string; params: Record<string, unknown> }>;
 } {
   const calls: Array<{ method: string; params: Record<string, unknown> }> = [];
+  const isCostRead = (method: string, params: Record<string, unknown>): boolean =>
+    method === "sessions.usage" && params.agentScope === "all";
   const request: UsageRequest = async (method, params) => {
     calls.push({ method, params });
-    if (method === "usage.cost") {
-      return overrides.cost ? overrides.cost(method, params) : { agents: [{ agentId: "builder", costMicroUsd: 7_000 }] };
+    // Cost and tokens are the same method asked two ways: a range across every
+    // agent, or one session by key.
+    if (isCostRead(method, params)) {
+      return overrides.cost ? overrides.cost(method, params) : rangedCostReply(params);
     }
     if (overrides.usage) return overrides.usage(method, params);
     return { inputTokens: 100, outputTokens: 20, costUsd: 0.001, models: ["sonnet"] };
   };
-  return { request, calls };
+  return { request, calls, costCalls: () => calls.filter((call) => isCostRead(call.method, call.params)) };
 }
 
-const LIVE = { connected: true, usageState: "live" as const, costState: "live" as const };
+const LIVE = { connected: true, usageState: "live" as const };
 
 describe("UsageSynchronizer gating", () => {
   it("does nothing while the Gateway is disconnected", async () => {
@@ -228,10 +261,58 @@ describe("UsageSynchronizer cost", () => {
     const outcome = await sync.runOnce({ ...LIVE, now: NOW });
 
     expect(outcome.costRefreshed).toBe(true);
-    expect(gateway.calls.filter((call) => call.method === "usage.cost")).toHaveLength(2);
-    expect(sync.costFor("24h", "builder")).toBe(7_000);
+    expect(gateway.costCalls()).toHaveLength(2);
+    expect(sync.costFor("24h", "builder")).toEqual({ costMicroUsd: 7_000, hasCost: true });
+    expect(sync.costFor("7d", "builder")).toEqual({ costMicroUsd: 30_000, hasCost: true });
     expect(sync.getCostCoverage("24h")).toBe("live");
     expect(sync.getCostCoverage("7d")).toBe("live");
+  });
+
+  /**
+   * The Gateway prices calendar days. `range` has no value below `7d`, so the
+   * short window has to name a single date, and the offset has to be sent with it
+   * — left out, the schema buckets by UTC midnight and the figure under "today"
+   * would be someone else's day.
+   */
+  it("asks for a named day and a preset week, not a rolling window", async () => {
+    const repo = repository();
+    seed(repo, 1);
+    const gateway = recordingGateway();
+    const sync = synchronizer(repo, gateway.request);
+    await sync.runOnce({ ...LIVE, now: NOW });
+
+    const [short, week] = gateway.costCalls().map((call) => call.params);
+    expect(short).toMatchObject({
+      agentScope: "all",
+      groupBy: "family",
+      limit: 1,
+      mode: "specific",
+      utcOffset: localUtcOffset(NOW),
+      startDate: localDateLabel(NOW),
+      endDate: localDateLabel(NOW),
+    });
+    expect(short).not.toHaveProperty("range");
+    expect(week).toMatchObject({ agentScope: "all", range: "7d", limit: 1 });
+    expect(week).not.toHaveProperty("startDate");
+    // The span comes from the reply, not from what was asked: it is what the card
+    // labels the window with.
+    expect(sync.costSpan("24h")).toEqual({ from: localDateLabel(NOW), to: localDateLabel(NOW) });
+    expect(sync.costSpan("7d")).toEqual({ from: "2026-08-12", to: "2026-08-18" });
+  });
+
+  /** One entry the Gateway could not price makes the whole range a floor. */
+  it("reports a range with unpriced entries as a floor", async () => {
+    const repo = repository();
+    seed(repo, 1);
+    const gateway = recordingGateway({
+      cost: async () => ({
+        aggregates: { byAgent: [{ agentId: "builder", totals: { totalCost: 0.5, missingCostEntries: 2 } }] },
+      }),
+    });
+    const sync = synchronizer(repo, gateway.request);
+    await sync.runOnce({ ...LIVE, now: NOW });
+
+    expect(sync.costFor("24h", "builder")).toEqual({ costMicroUsd: 500_000, hasCost: false });
   });
 
   it("re-prices on its own slower cadence, not every usage round", async () => {
@@ -242,23 +323,28 @@ describe("UsageSynchronizer cost", () => {
 
     await sync.runOnce({ ...LIVE, now: NOW });
     await sync.runOnce({ ...LIVE, now: NOW + 60_000 });
-    expect(gateway.calls.filter((call) => call.method === "usage.cost")).toHaveLength(2);
+    expect(gateway.costCalls()).toHaveLength(2);
 
     await sync.runOnce({ ...LIVE, now: NOW + COST_SYNC_MS });
-    expect(gateway.calls.filter((call) => call.method === "usage.cost")).toHaveLength(4);
+    expect(gateway.costCalls()).toHaveLength(4);
   });
 
-  it("keeps collecting tokens when pricing is unavailable", async () => {
+  /**
+   * Cost now rides on the method the token reads use, so a Gateway that does not
+   * have it has no pricing either — and the cost view has to say that rather than
+   * go on reporting "not collected yet" about an answer that is never coming.
+   */
+  it("reports pricing as unavailable when the method itself is", async () => {
     const repo = repository();
     seed(repo, 2);
     const gateway = recordingGateway();
     const sync = synchronizer(repo, gateway.request);
-    const outcome = await sync.runOnce({ ...LIVE, now: NOW, costState: "unavailable" });
+    const outcome = await sync.runOnce({ ...LIVE, now: NOW, usageState: "unavailable" });
 
-    expect(outcome).toMatchObject({ recorded: 2, coverage: "live", costRefreshed: false });
+    expect(outcome).toMatchObject({ coverage: "unavailable", costRefreshed: false });
     expect(sync.getCostCoverage("24h")).toBe("unavailable");
     expect(sync.getCostCoverage("7d")).toBe("unavailable");
-    expect(gateway.calls.some((call) => call.method === "usage.cost")).toBe(false);
+    expect(gateway.calls).toEqual([]);
   });
 
   it("keeps the previous price rather than blanking it when a refresh fails", async () => {
@@ -266,19 +352,22 @@ describe("UsageSynchronizer cost", () => {
     seed(repo, 1);
     let failing = false;
     const gateway = recordingGateway({
-      cost: async () => {
+      cost: async (_method, params) => {
         if (failing) throw new Error("boom");
-        return { agents: [{ agentId: "builder", costMicroUsd: 7_000 }] };
+        return rangedCostReply(params);
       },
     });
     const sync = synchronizer(repo, gateway.request);
     await sync.runOnce({ ...LIVE, now: NOW });
 
     failing = true;
-    await sync.runOnce({ ...LIVE, now: NOW + COST_SYNC_MS });
+    const outcome = await sync.runOnce({ ...LIVE, now: NOW + COST_SYNC_MS });
 
-    expect(sync.costFor("24h", "builder")).toBe(7_000);
+    expect(sync.costFor("24h", "builder")).toEqual({ costMicroUsd: 7_000, hasCost: true });
     expect(sync.getCostCoverage("24h")).toBe("error");
+    // Pricing sits in a try boundary of its own: the tokens for this round were
+    // still read and stored.
+    expect(outcome).toMatchObject({ recorded: 1, coverage: "live" });
   });
 
   /**
@@ -291,28 +380,27 @@ describe("UsageSynchronizer cost", () => {
   it("degrades only the window whose request failed", async () => {
     const repo = repository();
     seed(repo, 1);
-    let failWindow: number | undefined;
+    let failShortWindow = false;
     const gateway = recordingGateway({
       cost: async (_method, params) => {
-        // The 24h call asks for the shorter range, which is how the two are told
-        // apart without depending on call order.
-        const span = Number(params.to) - Number(params.from);
-        if (failWindow !== undefined && span === failWindow) throw new Error("boom");
-        return { agents: [{ agentId: "builder", costMicroUsd: span === 24 * 60 * 60_000 ? 7_000 : 30_000 }] };
+        // The short window names a day; the week asks for a preset range. That is
+        // how the two are told apart without depending on call order.
+        if (failShortWindow && params.startDate !== undefined) throw new Error("boom");
+        return rangedCostReply(params);
       },
     });
     const sync = synchronizer(repo, gateway.request);
     await sync.runOnce({ ...LIVE, now: NOW });
-    expect(sync.costFor("7d", "builder")).toBe(30_000);
+    expect(sync.costFor("7d", "builder")).toEqual({ costMicroUsd: 30_000, hasCost: true });
 
-    failWindow = 24 * 60 * 60_000;
+    failShortWindow = true;
     await sync.runOnce({ ...LIVE, now: NOW + COST_SYNC_MS });
 
     expect(sync.getCostCoverage("24h")).toBe("error");
     expect(sync.getCostCoverage("7d")).toBe("live");
     // The window that failed keeps the price it last knew rather than blanking it.
-    expect(sync.costFor("24h", "builder")).toBe(7_000);
-    expect(sync.costFor("7d", "builder")).toBe(30_000);
+    expect(sync.costFor("24h", "builder")).toEqual({ costMicroUsd: 7_000, hasCost: true });
+    expect(sync.costFor("7d", "builder")).toEqual({ costMicroUsd: 30_000, hasCost: true });
   });
 
   it("forgets prices when the connection generation changes", async () => {

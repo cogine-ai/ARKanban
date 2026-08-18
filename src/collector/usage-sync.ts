@@ -1,8 +1,8 @@
-import { projectCostReport, projectUsagePage } from "../activity/usage-projector.js";
+import { projectCostReport, type AgentCostEntry, projectUsagePage } from "../activity/usage-projector.js";
 import type { AgentRollupWindow, SessionUsageCoverage } from "../contracts.js";
 import type { FieldInventory } from "./field-inventory.js";
 import type { CapabilityState } from "./capability-probe.js";
-import { USAGE_ROLLUP_WINDOW_MS, type UsageStore, type UsageWrite } from "../storage/usage-store.js";
+import { type UsageStore, type UsageWrite } from "../storage/usage-store.js";
 
 /**
  * Token and cost collection.
@@ -40,7 +40,6 @@ export type UsageSyncDeps = {
   store: UsageStore;
   request: UsageRequest;
   inventory?: FieldInventory;
-  costInventory?: FieldInventory;
 };
 
 /**
@@ -78,10 +77,61 @@ function cacheCatchingUp(payload: unknown): boolean {
 }
 
 /** Per-agent cost for one window, as priced by the Gateway. */
-export type CostWindows = Record<AgentRollupWindow, Map<string, number>>;
+export type CostWindows = Record<AgentRollupWindow, Map<string, AgentCostEntry>>;
 
 function emptyCostWindows(): CostWindows {
   return { "24h": new Map(), "7d": new Map() };
+}
+
+/** The calendar span a window was priced over, as the Gateway reported it. */
+export type CostSpan = { from: string; to: string };
+
+/**
+ * The Gateway prices calendar days, not rolling windows.
+ *
+ * `range` accepts only `7d`/`30d`/`90d`/`1y`/`all`, and a single day has to be
+ * asked for as an explicit `startDate`/`endDate` pair — there is no way to ask
+ * for "the last 24 hours". `mode: "specific"` with our own offset pins whose
+ * midnight is meant, so the answer does not depend on the Gateway host's zone,
+ * and the reply echoes the span it used. The card labels the short window from
+ * that echo rather than calling a calendar day 24h.
+ */
+function costRequest(window: AgentRollupWindow, now: number): Record<string, unknown> {
+  const common = {
+    agentScope: "all",
+    groupBy: "family",
+    // Only the `sessions` array is truncated by this; the aggregates are summed
+    // over every session in range. One row is the smallest reply that still
+    // carries the breakdown this call is made for.
+    limit: 1,
+    mode: "specific",
+    utcOffset: localUtcOffset(now),
+  };
+  if (window === "7d") return { ...common, range: "7d" };
+  const today = localDateLabel(now);
+  return { ...common, startDate: today, endDate: today };
+}
+
+/** `UTC+8`, `UTC-4`, `UTC+5:30` — the only offset form the schema accepts. */
+export function localUtcOffset(now: number): string {
+  // `getTimezoneOffset` counts minutes to add to local time to reach UTC, so the
+  // sign is the reverse of how the offset is written.
+  const minutes = -new Date(now).getTimezoneOffset();
+  const sign = minutes < 0 ? "-" : "+";
+  const absolute = Math.abs(minutes);
+  const hours = Math.floor(absolute / 60);
+  const rest = absolute % 60;
+  return `UTC${sign}${hours}${rest === 0 ? "" : `:${String(rest).padStart(2, "0")}`}`;
+}
+
+/** The local calendar date, in the `YYYY-MM-DD` form the schema requires. */
+export function localDateLabel(now: number): string {
+  const date = new Date(now);
+  return [
+    date.getFullYear(),
+    String(date.getMonth() + 1).padStart(2, "0"),
+    String(date.getDate()).padStart(2, "0"),
+  ].join("-");
 }
 
 function costCoverageByWindow(state: SessionUsageCoverage): Record<AgentRollupWindow, SessionUsageCoverage> {
@@ -99,6 +149,7 @@ export class UsageSynchronizer {
    * when nothing priced it.
    */
   private costCoverage = costCoverageByWindow("not_observed");
+  private costSpans: Partial<Record<AgentRollupWindow, CostSpan>> = {};
   private lastCostAt = 0;
   private readonly unreported = new Set<string>();
 
@@ -118,14 +169,19 @@ export class UsageSynchronizer {
   }
 
   /**
-   * Gateway-priced cost per agent, when `usage.cost` answered.
+   * Gateway-priced cost per agent, when the ranged read answered.
    *
    * Held in memory rather than stored: it is a five-minute cross-check of a
    * range, so persisting it would create a second, staler cost of record that
    * could disagree with the snapshots after a restart.
    */
-  costFor(window: AgentRollupWindow, agentId: string): number | undefined {
+  costFor(window: AgentRollupWindow, agentId: string): AgentCostEntry | undefined {
     return this.costWindows[window].get(agentId);
+  }
+
+  /** The span the Gateway priced this window over, absent until it answered. */
+  costSpan(window: AgentRollupWindow): CostSpan | undefined {
+    return this.costSpans[window];
   }
 
   getCostCoverage(window: AgentRollupWindow): SessionUsageCoverage {
@@ -140,6 +196,7 @@ export class UsageSynchronizer {
   resetCost(): void {
     this.costWindows = emptyCostWindows();
     this.costCoverage = costCoverageByWindow("not_observed");
+    this.costSpans = {};
     this.lastCostAt = 0;
   }
 
@@ -147,7 +204,6 @@ export class UsageSynchronizer {
     now: number;
     connected: boolean;
     usageState: CapabilityState;
-    costState: CapabilityState;
   }): Promise<UsageSyncOutcome> {
     const idle: UsageSyncOutcome = {
       requests: 0,
@@ -157,12 +213,17 @@ export class UsageSynchronizer {
       costRefreshed: false,
     };
     if (!options.connected) return { ...idle, skipped: "not_connected" };
+    // Both figures come from the same method now, so a method that cannot be
+    // called blocks both. Left unset, the cost view would go on saying "not
+    // collected yet" about a Gateway that will never answer.
     if (options.usageState === "unavailable") {
       this.coverage = "unavailable";
+      this.costCoverage = costCoverageByWindow("unavailable");
       return { ...idle, coverage: this.coverage, skipped: "unavailable" };
     }
     if (options.usageState === "unauthorized") {
       this.coverage = "unauthorized";
+      this.costCoverage = costCoverageByWindow("unauthorized");
       return { ...idle, coverage: this.coverage, skipped: "unauthorized" };
     }
 
@@ -254,32 +315,29 @@ export class UsageSynchronizer {
   /**
    * Refreshes Gateway-priced cost on its own slower cadence, in a try boundary
    * of its own so a pricing failure cannot stop token collection.
+   *
+   * Same method as the per-session reads, asked a different way: an agent-scoped
+   * range, whose `aggregates.byAgent` is the only per-agent split the Gateway
+   * publishes. The caller has already established the method is usable, which is
+   * why there is no capability gate of its own here.
    */
-  private async refreshCost(options: { now: number; costState: CapabilityState }): Promise<boolean> {
-    if (options.costState === "unavailable") {
-      this.costCoverage = costCoverageByWindow("unavailable");
-      return false;
-    }
-    if (options.costState === "unauthorized") {
-      this.costCoverage = costCoverageByWindow("unauthorized");
-      return false;
-    }
+  private async refreshCost(options: { now: number }): Promise<boolean> {
     if (options.now - this.lastCostAt < COST_SYNC_MS) return false;
     this.lastCostAt = options.now;
 
     let succeeded = 0;
     for (const window of ["24h", "7d"] as const) {
       try {
-        const payload = await this.deps.request("usage.cost", {
-          from: options.now - USAGE_ROLLUP_WINDOW_MS[window],
-          to: options.now,
-          groupBy: "agent",
-        });
+        const payload = await this.deps.request("sessions.usage", costRequest(window, options.now));
+        const report = projectCostReport(payload, this.deps.inventory ?? undefined);
         // Each window is replaced only by its own successful answer. Building a
         // fresh pair and swapping both in meant a failed window arrived as an
         // empty map — every price in it silently gone — on the strength of the
         // other window having answered.
-        this.costWindows[window] = projectCostReport(payload, this.deps.costInventory ?? undefined).byAgent;
+        this.costWindows[window] = report.byAgent;
+        if (report.pricedFrom && report.pricedTo) {
+          this.costSpans[window] = { from: report.pricedFrom, to: report.pricedTo };
+        } else delete this.costSpans[window];
         this.costCoverage[window] = "live";
         succeeded += 1;
       } catch {

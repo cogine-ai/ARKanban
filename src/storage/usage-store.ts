@@ -333,7 +333,10 @@ export class UsageStore {
    * Per-agent totals for the windows the Agents card shows.
    *
    * Reads the newest snapshot per session rather than summing every snapshot,
-   * because snapshots are cumulative.
+   * because snapshots are cumulative — and then subtracts where that session
+   * already stood when the window opened. Without the subtraction a session that
+   * has run for a month and reported yesterday would put its whole lifetime on
+   * the 24h card, which is a spend figure for a period that never happened.
    */
   agentWindows(
     agentIds: string[],
@@ -356,18 +359,45 @@ export class UsageStore {
       `)
       .all() as Row[];
 
+    const folded = this.foldWatermarks();
+    const baselines = new Map<AgentRollupWindow, Map<string, FoldWatermark>>();
+    for (const window of ["24h", "7d"] as const) {
+      baselines.set(window, this.readingsBefore(rangeEnd - USAGE_ROLLUP_WINDOW_MS[window]));
+    }
+
     for (const row of rows) {
       const windows = result.get(String(row.agent_id));
       if (!windows) continue;
       const observedAt = Number(row.observed_at);
+      const sessionKey = String(row.session_key);
       const models = parseModels(row.models_json);
       const priced = Number(row.has_cost) === 1;
       for (const window of ["24h", "7d"] as const) {
         if (observedAt < rangeEnd - USAGE_ROLLUP_WINDOW_MS[window]) continue;
-        accumulate(windows[window], row, priced, priced ? [] : models);
+        // Where the session stood when the window opened: its last reading from
+        // before then, or — once those readings have been folded away and
+        // deleted — the fold watermark that replaced them.
+        const baseline = baselines.get(window)?.get(sessionKey) ?? folded.get(sessionKey);
+        accumulate(windows[window], netOfFold(row, baseline, false), priced, priced ? [] : models);
       }
     }
     return result;
+  }
+
+  /** Each session's newest cumulative reading from strictly before `moment`. */
+  private readingsBefore(moment: number): Map<string, FoldWatermark> {
+    const rows = this.db
+      .prepare(`
+        SELECT session_key, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, cost_micro_usd
+        FROM session_usage_snapshots u
+        WHERE u.observed_at < ?
+          AND u.observed_at = (
+            SELECT MAX(observed_at) FROM session_usage_snapshots x
+            WHERE x.session_key = u.session_key AND x.observed_at < ?
+          )
+      `)
+      .all(moment, moment) as Row[];
+    return new Map(rows.map((row) => [String(row.session_key), readingWatermark(row)]));
   }
 
   /**

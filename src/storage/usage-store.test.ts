@@ -101,6 +101,39 @@ describe("UsageStore", () => {
     expect(windows.get("runner")?.["24h"]).toMatchObject({ hasCost: true, costMicroUsd: 0 });
   });
 
+  /**
+   * The card asks what an agent spent in a window, and a cumulative reading is
+   * not that. A session running for weeks that reported an hour ago used to put
+   * its entire lifetime on the 24h card.
+   */
+  it("charges a window only for what was spent inside it", () => {
+    const repo = repository();
+    session(repo, "agent:builder:1", "builder");
+    repo.usage.record([
+      usage("agent:builder:1", { observedAt: NOW - 5 * DAY_MS, inputTokens: 1_000, costMicroUsd: 10_000 }),
+      usage("agent:builder:1", { observedAt: NOW - 60_000, inputTokens: 1_150, costMicroUsd: 11_500 }),
+    ]);
+
+    const windows = repo.usage.agentWindows(["builder"], NOW);
+    expect(windows.get("builder")?.["24h"]).toMatchObject({ inputTokens: 150, costMicroUsd: 1_500 });
+    expect(windows.get("builder")?.["7d"]).toMatchObject({ inputTokens: 1_150, costMicroUsd: 11_500 });
+  });
+
+  /**
+   * Once the older readings have been folded into daily rows and deleted, the
+   * watermark left behind is the only record of where the session stood.
+   */
+  it("uses the fold watermark as the baseline when the older readings are gone", () => {
+    const repo = repository();
+    session(repo, "agent:builder:1", "builder");
+    repo.usage.record([usage("agent:builder:1", { observedAt: NOW - 9 * DAY_MS, inputTokens: 800, costMicroUsd: 8_000 })]);
+    repo.usage.rollupOlderThan(NOW - 7 * DAY_MS);
+    repo.usage.record([usage("agent:builder:1", { observedAt: NOW - 60_000, inputTokens: 900, costMicroUsd: 9_000 })]);
+
+    const windows = repo.usage.agentWindows(["builder"], NOW);
+    expect(windows.get("builder")?.["24h"]).toMatchObject({ inputTokens: 100, costMicroUsd: 1_000 });
+  });
+
   it("counts a reading toward 7d but not 24h once it ages out", () => {
     const repo = repository();
     session(repo, "agent:builder:1", "builder");

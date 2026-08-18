@@ -290,7 +290,7 @@ export class TranscriptArchive {
    * because a conversation from this morning is likelier to be reviewed than one
    * from last quarter.
    */
-  backfillCandidates(options: { limit: number; exclude?: Set<string> }): TranscriptCandidate[] {
+  backfillCandidates(options: { limit: number }): TranscriptCandidate[] {
     const rows = this.db
       .prepare(`
         SELECT s.session_key, s.session_id, t.cursor, t.last_seq, t.complete
@@ -300,13 +300,8 @@ export class TranscriptArchive {
         ORDER BY s.last_activity_at DESC, s.session_key ASC
         LIMIT ?
       `)
-      // Over-fetch so that excluding sessions already handled this round does not
-      // silently shrink the backfill quota.
-      .all(options.limit + (options.exclude?.size ?? 0)) as Row[];
-    return rows
-      .map(rowToCandidate)
-      .filter((candidate) => !options.exclude?.has(candidate.sessionKey))
-      .slice(0, options.limit);
+      .all(options.limit) as Row[];
+    return rows.map(rowToCandidate);
   }
 
   syncState(sessionKey: string): TranscriptSyncState | undefined {
@@ -350,7 +345,14 @@ export class TranscriptArchive {
           ?, ?, ?
         ON CONFLICT (session_key) DO UPDATE SET
           cursor = CASE WHEN ? = 1 THEN excluded.cursor ELSE session_transcript_sync.cursor END,
-          last_seq = COALESCE(excluded.last_seq, session_transcript_sync.last_seq),
+          -- Monotonic: synthesised sequence numbers are counted from this value,
+          -- so letting an older backfill page lower it would hand already-used
+          -- numbers to new messages, which the unique key then rejects.
+          last_seq = CASE
+            WHEN excluded.last_seq IS NULL THEN session_transcript_sync.last_seq
+            WHEN session_transcript_sync.last_seq IS NULL THEN excluded.last_seq
+            ELSE MAX(session_transcript_sync.last_seq, excluded.last_seq)
+          END,
           last_message_id = COALESCE(excluded.last_message_id, session_transcript_sync.last_message_id),
           synced_count = excluded.synced_count,
           synced_bytes = excluded.synced_bytes,

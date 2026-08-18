@@ -49,24 +49,31 @@ function seedSession(
   ]);
 }
 
-/** Serves a fixed transcript, one page per call, recording every request. */
+const PAGE = 2;
+
+/**
+ * Serves a fixed transcript, one page per call, recording every request.
+ *
+ * Pages the way `chat.history` does: `offset` counts back from the *newest*
+ * message, so no offset returns the tail and each `nextOffset` walks further into
+ * the past. Fixtures are ordered oldest-first, as a transcript reads.
+ */
 function gateway(pages: Record<string, Array<Record<string, unknown>>>): {
   request: HistoryRequest;
-  calls: string[];
+  calls: Array<{ sessionKey: string; offset?: number }>;
 } {
-  const calls: string[] = [];
+  const calls: Array<{ sessionKey: string; offset?: number }> = [];
   const request: HistoryRequest = async (_method, params) => {
-    // Pages by `offset` and answers `nextOffset`, as `chat.history` does. The
-    // real method counts the offset back from the newest message; slicing
-    // forward here keeps the fixtures readable and exercises the same paging
-    // contract, which is what this suite is about.
     const { sessionKey, offset } = params as { sessionKey: string; offset?: number };
-    calls.push(sessionKey);
+    calls.push({ sessionKey, ...(offset === undefined ? {} : { offset }) });
     const messages = pages[sessionKey] ?? [];
-    const from = offset ?? 0;
-    const page = messages.slice(from, from + 2);
-    const next = from + page.length;
-    return { messages: page, hasMore: next < messages.length, ...(next < messages.length ? { nextOffset: next } : {}) };
+    const skipped = offset ?? 0;
+    const end = Math.max(0, messages.length - skipped);
+    const start = Math.max(0, end - PAGE);
+    const page = messages.slice(start, end);
+    const next = skipped + page.length;
+    const hasMore = next < messages.length;
+    return { messages: page, hasMore, ...(hasMore ? { nextOffset: next } : {}) };
   };
   return { request, calls };
 }
@@ -132,20 +139,43 @@ describe("transcript sync gating", () => {
 });
 
 describe("transcript sync progress", () => {
-  it("stores an active session's messages and remembers the cursor", async () => {
+  it("stores an active session's newest page and walks the rest of its history", async () => {
     const repo = repository();
     seedSession(repo, "agent:builder:one");
-    const { request } = gateway({ "agent:builder:one": [turn(0), turn(1), turn(2)] });
+    const { request, calls } = gateway({ "agent:builder:one": [turn(0), turn(1), turn(2)] });
     const sync = synchronizer(repo, request);
 
+    // One round: the tail first, then the page below it. A live conversation gets
+    // its newest messages without waiting for its history to be walked.
     const first = await sync.runOnce(healthy);
-    expect(first.inserted).toBe(2);
-    expect(repo.transcripts.syncState("agent:builder:one")).toMatchObject({ syncedCount: 2, complete: false });
-
-    // The second round resumes from the stored cursor rather than page one.
-    const second = await sync.runOnce(healthy);
-    expect(second.inserted).toBe(1);
+    expect(first.inserted).toBe(3);
+    expect(calls).toEqual([{ sessionKey: "agent:builder:one" }, { sessionKey: "agent:builder:one", offset: 2 }]);
     expect(repo.transcripts.syncState("agent:builder:one")).toMatchObject({ syncedCount: 3, complete: true });
+
+    const second = await sync.runOnce(healthy);
+    expect(second.inserted).toBe(0);
+  });
+
+  /**
+   * The whole point of separating the two reads. While they shared a path, an
+   * active session with a backfill in progress spent its one request per round on
+   * a page it had already read, and the newest messages only arrived once the
+   * entire history had been walked — minutes, for a long conversation.
+   */
+  it("reads the tail of a busy session every round, mid-backfill", async () => {
+    const repo = repository();
+    seedSession(repo, "agent:builder:one");
+    const history = Array.from({ length: 9 }, (_, index) => turn(index));
+    const { request, calls } = gateway({ "agent:builder:one": history });
+    const sync = synchronizer(repo, request);
+
+    await sync.runOnce(healthy);
+    await sync.runOnce(healthy);
+
+    // Every round opens with a tail read, and backfill advances underneath it.
+    expect(calls.filter((call) => call.offset === undefined)).toHaveLength(2);
+    expect(calls.map((call) => call.offset)).toEqual([undefined, 2, undefined, 4]);
+    expect(repo.transcripts.syncState("agent:builder:one")).toMatchObject({ complete: false });
   });
 
   /**
@@ -154,25 +184,70 @@ describe("transcript sync progress", () => {
    * read, and every later round re-requested that offset — so an active
    * conversation's newest messages were never fetched again.
    */
-  it("starts from the newest page again once a session's history runs out", async () => {
+  it("keeps reading the newest page once a session's history runs out", async () => {
     const repo = repository();
     seedSession(repo, "agent:builder:one");
-    const offsets: Array<number | undefined> = [];
-    const request: HistoryRequest = async (_method, params) => {
-      const { offset } = params as { offset?: number };
-      offsets.push(offset);
-      return offset === undefined
-        ? { messages: [turn(0), turn(1)], hasMore: true, nextOffset: 2 }
-        : { messages: [turn(2)], hasMore: false };
-    };
+    const { request, calls } = gateway({ "agent:builder:one": [turn(0), turn(1), turn(2)] });
     const sync = synchronizer(repo, request);
 
-    await sync.runOnce(healthy);
     await sync.runOnce(healthy);
     expect(repo.transcripts.syncState("agent:builder:one")).toMatchObject({ syncedCount: 3, complete: true });
 
     await sync.runOnce(healthy);
-    expect(offsets).toEqual([undefined, 2, undefined]);
+    expect(calls.at(-1)).toEqual({ sessionKey: "agent:builder:one" });
+  });
+
+  /**
+   * `chat.history` counts its offset back from the newest message, so page two
+   * holds *older* turns with lower sequence numbers than page one. The watermark
+   * used to be set from whatever the current page happened to contain, which sent
+   * it backwards as soon as backfill started.
+   */
+  it("does not lower the sequence watermark when backfill reaches an older page", async () => {
+    const repo = repository();
+    seedSession(repo, "agent:builder:one");
+    const request: HistoryRequest = async (_method, params) => {
+      const { offset } = params as { offset?: number };
+      return offset === undefined
+        ? { messages: [turn(300), turn(301)], hasMore: true, nextOffset: 2 }
+        : { messages: [turn(100), turn(101)], hasMore: false };
+    };
+    const sync = synchronizer(repo, request);
+
+    await sync.runOnce(healthy);
+    expect(repo.transcripts.activeCandidates({ now: NOW, withinMs: 60_000, limit: 5 })[0]?.lastSeq).toBe(301);
+
+    await sync.runOnce(healthy);
+    expect(repo.transcripts.activeCandidates({ now: NOW, withinMs: 60_000, limit: 5 })[0]?.lastSeq).toBe(301);
+  });
+
+  /**
+   * What the regression above actually costs. Sequence numbers for rows the
+   * Gateway did not number are counted from the watermark, so a watermark that
+   * has moved back hands out numbers already in the table — and the idempotency
+   * key drops those rows as duplicates of messages they have nothing to do with.
+   */
+  it("keeps an unnumbered message that arrives after a backfill page", async () => {
+    const repo = repository();
+    seedSession(repo, "agent:builder:one");
+    let served = 0;
+    const request: HistoryRequest = async () => {
+      served += 1;
+      // The tail, then the page below it, then a tail read that finds a new turn
+      // the Gateway did not number.
+      if (served === 1) return { messages: [turn(52), turn(53)], hasMore: true, nextOffset: 2 };
+      if (served === 2) return { messages: [turn(50), turn(51)], hasMore: false };
+      return { messages: [{ id: "fresh", role: "user", content: "the newest turn" }], hasMore: false };
+    };
+    const sync = synchronizer(repo, request);
+
+    await sync.runOnce(healthy);
+    const second = await sync.runOnce(healthy);
+
+    expect(second.inserted).toBe(1);
+    expect(repo.transcripts.listMessages("agent:builder:one").map((message) => message.content)).toContain(
+      "the newest turn",
+    );
   });
 
   it("re-pulling an already stored page inserts nothing", async () => {
@@ -254,14 +329,21 @@ describe("transcript sync budgets", () => {
     expect(calls).toHaveLength(BACKFILL_SESSION_BUDGET);
   });
 
-  it("does not spend backfill quota on a session the active pass already pulled", async () => {
+  /**
+   * A session that stays busy is always in the active set, and while that also
+   * excluded it from backfill it could never walk its own history: the older half
+   * of a conversation someone is actively having was unreachable.
+   */
+  it("backfills a session the active pass has already read", async () => {
     const repo = repository();
     seedSession(repo, "agent:builder:one");
-    const { request, calls } = gateway({ "agent:builder:one": [turn(0), turn(1), turn(2)] });
+    const { request, calls } = gateway({
+      "agent:builder:one": Array.from({ length: 5 }, (_, index) => turn(index)),
+    });
 
     await synchronizer(repo, request).runOnce(healthy);
 
-    expect(calls).toEqual(["agent:builder:one"]);
+    expect(calls).toEqual([{ sessionKey: "agent:builder:one" }, { sessionKey: "agent:builder:one", offset: 2 }]);
   });
 });
 
@@ -282,7 +364,7 @@ describe("transcript sync capacity", () => {
     const outcome = await sync.runOnce(healthy);
 
     expect(outcome.capacity).toBe("paused");
-    expect(calls).not.toContain("agent:builder:old");
+    expect(calls.map((call) => call.sessionKey)).not.toContain("agent:builder:old");
   });
 });
 

@@ -117,7 +117,7 @@ export class TranscriptSynchronizer {
     });
     for (const candidate of active) {
       if (requests >= ROUND_REQUEST_BUDGET) break;
-      const result = await this.syncSession(candidate, options.now);
+      const result = await this.syncSession(candidate, options.now, "tail");
       requests += result.requests;
       inserted += result.inserted;
       touched.add(candidate.sessionKey);
@@ -127,11 +127,16 @@ export class TranscriptSynchronizer {
     // Backfill is what capacity pressure gives up: growing the archive backwards
     // is optional, whereas losing the tail of a live conversation is a hole that
     // never gets filled.
+    //
+    // Sessions read above are not excluded. A tail read and a backfill page are
+    // different requests now, and excluding them meant a session that stayed busy
+    // never walked its own history — it was always in the active set, so it was
+    // always skipped here.
     if (capacity === "ok") {
-      const backfill = this.deps.archive.backfillCandidates({ limit: BACKFILL_SESSION_BUDGET, exclude: touched });
+      const backfill = this.deps.archive.backfillCandidates({ limit: BACKFILL_SESSION_BUDGET });
       for (const candidate of backfill) {
         if (requests >= ROUND_REQUEST_BUDGET) break;
-        const result = await this.syncSession(candidate, options.now);
+        const result = await this.syncSession(candidate, options.now, "backfill");
         requests += result.requests;
         inserted += result.inserted;
         touched.add(candidate.sessionKey);
@@ -168,10 +173,18 @@ export class TranscriptSynchronizer {
    * Pulls one page per call rather than draining a session's history in a single
    * round. A long backfill therefore progresses across rounds instead of
    * monopolising the request budget.
+   *
+   * `tail` reads the newest page and `backfill` follows the stored offset
+   * backwards. Keeping them apart is what makes a live conversation's newest
+   * messages arrive on the next round: while the two shared one path, an active
+   * session with a backfill in progress spent its request on a page it had
+   * already read, and the tail only appeared once the whole history had been
+   * walked — a session with fifty pages of history refreshed every 25 minutes.
    */
   private async syncSession(
     candidate: TranscriptCandidate,
     now: number,
+    mode: "tail" | "backfill",
   ): Promise<{ requests: number; inserted: number; errorCode?: string }> {
     let payload: Record<string, unknown>;
     try {
@@ -179,7 +192,7 @@ export class TranscriptSynchronizer {
         await this.deps.request("chat.history", {
           sessionKey: candidate.sessionKey,
           limit: HISTORY_PAGE_LIMIT,
-          ...continuationParams(candidate.cursor),
+          ...(mode === "backfill" ? continuationParams(candidate.cursor) : {}),
         }),
       );
     } catch (error) {
@@ -205,16 +218,37 @@ export class TranscriptSynchronizer {
     const { inserted } = this.deps.archive.append(writes);
     this.storedBytes += writes.reduce((total, write) => total + Buffer.byteLength(write.content, "utf8"), 0);
 
-    const lastSeq = writes.length > 0 ? Math.max(...writes.map((write) => write.seq)) : candidate.lastSeq;
+    // Backfill pages walk backwards, so their sequence numbers sit below the
+    // watermark. Reporting this page's own maximum would move the watermark down,
+    // and the next round would synthesise numbers for unnumbered rows starting
+    // from there — colliding with rows already stored, which the idempotency key
+    // then discards as duplicates. The watermark only rises.
+    const lastSeq = writes.reduce(
+      (highest, write) => (highest === undefined ? write.seq : Math.max(highest, write.seq)),
+      candidate.lastSeq,
+    );
     this.deps.archive.recordSync({
       sessionKey: candidate.sessionKey,
       // A page with no next offset is the end of this session's history, so the
       // token is cleared rather than left pointing at a page already read. Keeping
       // it would send every later round back to that same offset, and the tail a
       // live conversation keeps adding would never be fetched.
-      cursor: page.nextOffset !== undefined ? String(page.nextOffset) : null,
+      //
+      // A tail read has no such offset to report, and "there are older messages"
+      // seen from the newest page is not the claim that backfill is unfinished —
+      // writing either would undo the progress backfill has made. It does seed
+      // the token when nothing has walked this session yet, so backfill starts on
+      // the page below the tail instead of re-reading the one just fetched.
+      ...(mode === "backfill"
+        ? { cursor: page.nextOffset !== undefined ? String(page.nextOffset) : null }
+        : candidate.cursor === undefined && !candidate.complete && page.nextOffset !== undefined
+          ? { cursor: String(page.nextOffset) }
+          : {}),
       ...(lastSeq !== undefined ? { lastSeq } : {}),
-      complete: !page.hasMore,
+      // A tail read that found no older page has, by that fact, seen the whole
+      // history: it started at the newest message and the Gateway reported
+      // nothing beyond it.
+      complete: mode === "backfill" ? !page.hasMore : candidate.complete || !page.hasMore,
       syncedAt: now,
     });
     return { requests: 1, inserted };

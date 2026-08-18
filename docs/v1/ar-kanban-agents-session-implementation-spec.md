@@ -522,12 +522,14 @@ recent: Record<"24h" | "7d", {
 ```ts
 cost: {
   coverage: SessionUsageCoverage;
-  source: "gateway" | "snapshots";
+  source: Record<"24h" | "7d", "gateway" | "snapshots">;
   windows: Record<"24h" | "7d", UsageTotals>;
 }
 ```
 
 `source` 必须暴露，因为同一笔花费有两个来源：`usage.cost` 按区间一次定价，`sessions.usage` 按会话逐个定价。卡片优先用前者（一次定价整个区间，比把不同时刻的读数相加更准），`/api/v1/usage/summary` 只报后者。两者不一致时，`source` 是唯一能解释差异的线索。
+
+`source` 与成本 coverage 都**按窗口**记录，因为 24h 与 7d 是两次独立的 `usage.cost` 请求、会各自失败。整卡一个标签的写法有两处失真：一是任一窗口成功就把「由 Gateway 定价」盖在另一个它根本没答的窗口上；二是原实现把两个窗口的结果先攒成一份再整体替换，于是失败的那个窗口以**空 map** 落地——已知价格被静默清空——同时凭另一个窗口的成功把 coverage 报成 `live`，正是这条成本链路本身要防的「没人定价却显示成已定价」。现在每个窗口只被自己那次成功的应答替换，失败的窗口保留上次已知价格并单独降级为 `error`。
 
 但覆盖只替换金额，不替换 `hasCost`。区间定价不可能定出 `sessions.usage` 自己都报为未定价的模型，把 `hasCost` 一并设成 true 会让一个下界读起来像完整值——这正是 §2.3 禁止的那种塌缩。
 

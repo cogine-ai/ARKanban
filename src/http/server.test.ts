@@ -6,7 +6,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { attemptPatch } from "../activity/projector.js";
 import { SIGNAL_ALGORITHM_VERSION } from "../activity/session-signals.js";
 import { CollectorRuntime } from "../collector/runtime.js";
-import type { AgentOverview } from "../contracts.js";
+import type { AgentOverview, AgentRollupWindow } from "../contracts.js";
 import type { ResolvedCollectorConfig } from "../config.js";
 import type { AgentWrite, SessionWrite } from "../storage/repository.js";
 import { createHttpServer } from "./server.js";
@@ -515,12 +515,30 @@ describe("usage HTTP API", () => {
     const response = await app.inject({ method: "GET", url: "/api/v1/agents" });
     const builder = (response.json().agents as AgentOverview[]).find((agent) => agent.id === "builder");
 
-    expect(builder?.cost.source).toBe("gateway");
+    expect(builder?.cost.source).toEqual({ "24h": "gateway", "7d": "gateway" });
     expect(builder?.cost.windows["24h"]).toMatchObject({
       costMicroUsd: 50_000,
       hasCost: false,
       unpricedModels: ["local-llm"],
     });
+  });
+
+  /**
+   * The two windows are priced by separate `usage.cost` calls. A single label for
+   * the pair put the Gateway's name on a window it never answered for, whenever
+   * the other window did.
+   */
+  it("names the pricing source per window when only one was priced", async () => {
+    const { app, runtime } = await serverWithUsage();
+    Object.defineProperty(runtime, "getAgentCost", {
+      value: (window: AgentRollupWindow) => (window === "7d" ? 50_000 : undefined),
+    });
+
+    const response = await app.inject({ method: "GET", url: "/api/v1/agents" });
+    const builder = (response.json().agents as AgentOverview[]).find((agent) => agent.id === "builder");
+
+    expect(builder?.cost.source).toEqual({ "24h": "snapshots", "7d": "gateway" });
+    expect(builder?.cost.windows["7d"]).toMatchObject({ costMicroUsd: 50_000 });
   });
 
   it("summarises a range by agent and model", async () => {

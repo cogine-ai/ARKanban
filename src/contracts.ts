@@ -240,7 +240,12 @@ export type AgentOverview = AgentSummary & {
    */
   cost: {
     coverage: SessionUsageCoverage;
-    source: "gateway" | "snapshots";
+    /**
+     * Named per window, because the two windows are separate `usage.cost`
+     * requests that fail separately. One label for the pair claimed both were
+     * priced by the Gateway whenever either was.
+     */
+    source: Record<AgentRollupWindow, "gateway" | "snapshots">;
     windows: Record<AgentRollupWindow, UsageTotals>;
   };
 };

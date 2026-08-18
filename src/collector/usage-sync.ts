@@ -84,10 +84,21 @@ function emptyCostWindows(): CostWindows {
   return { "24h": new Map(), "7d": new Map() };
 }
 
+function costCoverageByWindow(state: SessionUsageCoverage): Record<AgentRollupWindow, SessionUsageCoverage> {
+  return { "24h": state, "7d": state };
+}
+
 export class UsageSynchronizer {
   private coverage: SessionUsageCoverage = "not_observed";
   private costWindows = emptyCostWindows();
-  private costCoverage: SessionUsageCoverage = "not_observed";
+  /**
+   * Kept per window because the windows are separate requests that fail
+   * separately. One collector-wide verdict let a failed 24h call be reported as
+   * `live` on the strength of the 7d call that followed it, which is the shape of
+   * mistake this whole cost path exists to avoid: a figure presented as priced
+   * when nothing priced it.
+   */
+  private costCoverage = costCoverageByWindow("not_observed");
   private lastCostAt = 0;
   private readonly unreported = new Set<string>();
 
@@ -117,8 +128,8 @@ export class UsageSynchronizer {
     return this.costWindows[window].get(agentId);
   }
 
-  getCostCoverage(): SessionUsageCoverage {
-    return this.costCoverage;
+  getCostCoverage(window: AgentRollupWindow): SessionUsageCoverage {
+    return this.costCoverage[window];
   }
 
   getCoverage(): SessionUsageCoverage {
@@ -128,7 +139,7 @@ export class UsageSynchronizer {
   /** Forgets Gateway-priced cost; call when the connection generation changes. */
   resetCost(): void {
     this.costWindows = emptyCostWindows();
-    this.costCoverage = "not_observed";
+    this.costCoverage = costCoverageByWindow("not_observed");
     this.lastCostAt = 0;
   }
 
@@ -246,17 +257,16 @@ export class UsageSynchronizer {
    */
   private async refreshCost(options: { now: number; costState: CapabilityState }): Promise<boolean> {
     if (options.costState === "unavailable") {
-      this.costCoverage = "unavailable";
+      this.costCoverage = costCoverageByWindow("unavailable");
       return false;
     }
     if (options.costState === "unauthorized") {
-      this.costCoverage = "unauthorized";
+      this.costCoverage = costCoverageByWindow("unauthorized");
       return false;
     }
     if (options.now - this.lastCostAt < COST_SYNC_MS) return false;
     this.lastCostAt = options.now;
 
-    const next = emptyCostWindows();
     let succeeded = 0;
     for (const window of ["24h", "7d"] as const) {
       try {
@@ -265,19 +275,18 @@ export class UsageSynchronizer {
           to: options.now,
           groupBy: "agent",
         });
-        next[window] = projectCostReport(
-          payload,
-          this.deps.costInventory ?? undefined,
-        ).byAgent;
+        // Each window is replaced only by its own successful answer. Building a
+        // fresh pair and swapping both in meant a failed window arrived as an
+        // empty map — every price in it silently gone — on the strength of the
+        // other window having answered.
+        this.costWindows[window] = projectCostReport(payload, this.deps.costInventory ?? undefined).byAgent;
+        this.costCoverage[window] = "live";
         succeeded += 1;
       } catch {
-        this.costCoverage = "error";
+        this.costCoverage[window] = "error";
       }
     }
 
-    if (succeeded === 0) return false;
-    this.costWindows = next;
-    this.costCoverage = "live";
-    return true;
+    return succeeded > 0;
   }
 }

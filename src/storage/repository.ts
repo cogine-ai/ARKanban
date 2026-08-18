@@ -1371,7 +1371,7 @@ export class CollectorRepository {
         },
         cost: {
           coverage: usageCoverage,
-          source: "snapshots" as const,
+          source: { "24h": "snapshots" as const, "7d": "snapshots" as const },
           windows: costWindows.get(id) ?? { "24h": emptyUsageTotals(), "7d": emptyUsageTotals() },
         },
       };

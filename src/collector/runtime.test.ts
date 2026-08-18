@@ -5,6 +5,7 @@ import path from "node:path";
 import { WebSocketServer, type WebSocket } from "ws";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { ResolvedCollectorConfig } from "../config.js";
+import type { CollectorRepository } from "../storage/repository.js";
 import { CollectorRuntime } from "./runtime.js";
 
 const cleanups: Array<() => Promise<void> | void> = [];
@@ -282,5 +283,108 @@ describe("CollectorRuntime", () => {
     // Probed against a session the collector had actually seen: asking about an
     // invented key would report on that key, not on the method.
     expect(historyAsked[0]).toMatchObject({ sessionKey: "agent:builder:one", limit: 1 });
+  });
+
+  /**
+   * A deletion is the one change a client cannot infer. Retention runs on its own
+   * six-hour timer, and on an idle collector nothing else emits a frame — so rows
+   * this pass removed stayed on an open page, listed and linkable and gone, until
+   * someone reloaded by hand.
+   */
+  it("tells clients to refetch what retention deleted", async () => {
+    const directory = mkdtempSync(path.join(tmpdir(), "collector-runtime-prune-"));
+    const config: ResolvedCollectorConfig = {
+      gateway: { name: "test", url: "ws://127.0.0.1:1", tokenEnv: "TEST_GATEWAY_TOKEN", token: "test-token" },
+      server: { host: "127.0.0.1", port: 47_127 },
+      storage: {
+        path: path.join(directory, "collector.sqlite"),
+        terminalRetentionDays: 1,
+        usageRetentionDays: 14,
+        sessionRetentionDays: 90,
+        transcriptRetentionDays: 180,
+        transcriptMaxBytes: 64 * 1024 * 1024,
+        transcriptSync: "enabled",
+      },
+      reconcile: { tasksMs: 60_000, sessionsMs: 60_000 },
+      ui: { recentLimit: 200 },
+      configPath: path.join(directory, "config.json"),
+    };
+    // Never started: the prune pass is what is under test, and a gateway would
+    // only add frames of its own.
+    const runtime = new CollectorRuntime(config);
+    cleanups.push(async () => {
+      await runtime.stop();
+      rmSync(directory, { recursive: true, force: true });
+    });
+
+    const day = 24 * 60 * 60 * 1_000;
+    const longAgo = Date.now() - 200 * day;
+    const repository = (runtime as unknown as { repository: CollectorRepository }).repository;
+    repository.upsertSessions([
+      {
+        sessionKey: "agent:builder:ancient",
+        agentId: "builder",
+        label: "Ancient session",
+        kindHint: "main",
+        archived: true,
+        hasActiveRun: false,
+        lineage: {},
+        lastActivityAt: longAgo,
+        observedAt: longAgo,
+        coverage: { index: "live", detail: "not_observed", usage: "not_observed", messages: "live" },
+      },
+    ]);
+    repository.transcripts.append([
+      {
+        sessionKey: "agent:builder:ancient",
+        seq: 0,
+        role: "user",
+        content: "long forgotten",
+        createdAt: longAgo,
+        observedAt: longAgo,
+      },
+    ]);
+
+    const frames: Array<{ topics?: string[]; reasons: string[] }> = [];
+    const unsubscribe = runtime.subscribeChanges((change) => frames.push(change));
+    (runtime as unknown as { prune: () => void }).prune();
+    unsubscribe();
+
+    expect(frames).toHaveLength(1);
+    expect(frames[0]?.reasons).toEqual(["retention_prune"]);
+    expect([...(frames[0]?.topics ?? [])].sort()).toEqual(["messages", "sessions"]);
+    expect(repository.transcripts.listMessages("agent:builder:ancient")).toEqual([]);
+  });
+
+  it("stays quiet when a prune pass deleted nothing", async () => {
+    const directory = mkdtempSync(path.join(tmpdir(), "collector-runtime-prune-quiet-"));
+    const config: ResolvedCollectorConfig = {
+      gateway: { name: "test", url: "ws://127.0.0.1:1", tokenEnv: "TEST_GATEWAY_TOKEN", token: "test-token" },
+      server: { host: "127.0.0.1", port: 47_128 },
+      storage: {
+        path: path.join(directory, "collector.sqlite"),
+        terminalRetentionDays: 1,
+        usageRetentionDays: 14,
+        sessionRetentionDays: 90,
+        transcriptRetentionDays: 180,
+        transcriptMaxBytes: 64 * 1024 * 1024,
+        transcriptSync: "enabled",
+      },
+      reconcile: { tasksMs: 60_000, sessionsMs: 60_000 },
+      ui: { recentLimit: 200 },
+      configPath: path.join(directory, "config.json"),
+    };
+    const runtime = new CollectorRuntime(config);
+    cleanups.push(async () => {
+      await runtime.stop();
+      rmSync(directory, { recursive: true, force: true });
+    });
+
+    const frames: unknown[] = [];
+    const unsubscribe = runtime.subscribeChanges((change) => frames.push(change));
+    (runtime as unknown as { prune: () => void }).prune();
+    unsubscribe();
+
+    expect(frames).toEqual([]);
   });
 });

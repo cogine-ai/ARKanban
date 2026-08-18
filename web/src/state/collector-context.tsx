@@ -30,11 +30,32 @@ import { initialSettledRange, RANGE_STORAGE_KEY } from "../lib/settled-range";
  * `range` lives here too — `settled` is fetched per range, so the two cannot be
  * owned separately without the fetch and the selector drifting apart.
  */
+/**
+ * State of the event stream, as opposed to the Gateway's own connection.
+ *
+ * These are different failures with different remedies: the Gateway being
+ * unreachable is reported by the collector, while a broken stream means this page
+ * is no longer hearing about anything. Both used to surface as one static
+ * "offline", which said neither whether anything was still being attempted nor
+ * whether the reader was looking at a frozen page.
+ */
+export type LiveStreamState = {
+  /** `stopped` is the browser having given up; nothing further happens unaided. */
+  state: "connecting" | "open" | "reconnecting" | "stopped";
+  /** Reconnect attempts since the stream was last open. */
+  attempts: number;
+  /** When contact was lost, so the page can say how stale it might be. */
+  lostAt?: number;
+};
+
 export type CollectorContextValue = {
   status?: CollectorStatus;
   snapshot?: ActivitySnapshot;
   settled?: SettledGroupSnapshot;
   error?: string;
+  live: LiveStreamState;
+  /** Rebuilds the event stream, for when the browser has stopped trying. */
+  retryLive: () => void;
   range: SettledRange;
   setRange: (range: SettledRange) => void;
   refresh: () => Promise<void>;
@@ -58,7 +79,11 @@ export function CollectorProvider({ children }: { children: ReactNode }) {
   const [snapshot, setSnapshot] = useState<ActivitySnapshot>();
   const [settled, setSettled] = useState<SettledGroupSnapshot>();
   const [error, setError] = useState<string>();
+  const [live, setLive] = useState<LiveStreamState>({ state: "connecting", attempts: 0 });
+  const [streamGeneration, setStreamGeneration] = useState(0);
   const refreshTimer = useRef<number | undefined>(undefined);
+
+  const retryLive = useCallback(() => setStreamGeneration((generation) => generation + 1), []);
 
   const refresh = useCallback(async () => {
     try {
@@ -120,6 +145,13 @@ export function CollectorProvider({ children }: { children: ReactNode }) {
 
   useEffect(() => {
     const events = new EventSource("/api/v1/events");
+    events.onopen = () => {
+      setLive({ state: "open", attempts: 0 });
+      setError(undefined);
+      // Whatever changed while the stream was down was never announced, so the
+      // page starts again from what the server currently holds.
+      scheduleInvalidation(ALL_TOPICS);
+    };
     events.addEventListener("status", (event) => {
       try {
         setStatus(JSON.parse((event as MessageEvent<string>).data) as CollectorStatus);
@@ -138,12 +170,29 @@ export function CollectorProvider({ children }: { children: ReactNode }) {
         scheduleInvalidation(ALL_TOPICS);
       }
     });
-    events.onerror = () => setError("Live updates disconnected; retrying automatically");
+    // `EventSource` retries on its own and decides its own delay, so the count of
+    // attempts is what can be reported honestly — inventing a countdown would be
+    // stating a schedule this code does not set. `CLOSED` is the one case where
+    // nothing further will happen: the browser stops for good on a response it
+    // will not treat as a stream, and only a new EventSource can recover.
+    events.onerror = () => {
+      const stopped = events.readyState === EventSource.CLOSED;
+      setLive((current) => ({
+        state: stopped ? "stopped" : "reconnecting",
+        attempts: current.state === "open" ? 1 : current.attempts + 1,
+        lostAt: current.lostAt ?? Date.now(),
+      }));
+      setError(
+        stopped
+          ? "Live updates stopped. The page will not update until you retry."
+          : "Live updates disconnected; retrying automatically",
+      );
+    };
     return () => {
       events.close();
       if (refreshTimer.current !== undefined) window.clearTimeout(refreshTimer.current);
     };
-  }, [scheduleInvalidation]);
+  }, [scheduleInvalidation, streamGeneration]);
 
   useEffect(() => {
     try {
@@ -161,12 +210,14 @@ export function CollectorProvider({ children }: { children: ReactNode }) {
       // changes, so it is withheld rather than shown against the new label.
       settled: settled?.range === range ? settled : undefined,
       error,
+      live,
+      retryLive,
       range,
       setRange,
       refresh,
       subscribeTopics,
     }),
-    [status, snapshot, settled, error, range, refresh, subscribeTopics],
+    [status, snapshot, settled, error, live, retryLive, range, refresh, subscribeTopics],
   );
 
   return <CollectorContext.Provider value={value}>{children}</CollectorContext.Provider>;

@@ -1,8 +1,8 @@
 import { useEffect, useState } from "react";
 import type { MessageSearchResult } from "../../../src/contracts";
-import { collectorApi } from "../api";
-import { formatDateTime } from "../lib/format";
+import { collectorApi, isAbortError } from "../api";
 import { Link } from "../router";
+import { Timestamp } from "./Timestamp";
 import { TranscriptText } from "./TranscriptText";
 
 /**
@@ -39,25 +39,27 @@ export function TranscriptSearch({ query, agentId }: { query: string; agentId?: 
       setError(undefined);
       return;
     }
-    let active = true;
+    // Aborted rather than merely ignored: a superseded trigram query is work the
+    // server is doing for an answer nobody will read.
+    const controller = new AbortController();
     setSearching(true);
     void (async () => {
       try {
-        const found = await collectorApi.searchMessages({ q: query, ...(agentId ? { agentId } : {}) });
-        if (!active) return;
+        const found = await collectorApi.searchMessages(
+          { q: query, ...(agentId ? { agentId } : {}) },
+          { signal: controller.signal },
+        );
         setResult(found);
         setError(undefined);
       } catch (cause) {
-        if (!active) return;
+        if (isAbortError(cause)) return;
         setResult(undefined);
         setError(cause instanceof Error ? cause.message : String(cause));
       } finally {
-        if (active) setSearching(false);
+        if (!controller.signal.aborted) setSearching(false);
       }
     })();
-    return () => {
-      active = false;
-    };
+    return () => controller.abort();
   }, [agentId, query]);
 
   if (query.length === 0) return null;
@@ -96,7 +98,7 @@ export function TranscriptSearch({ query, agentId }: { query: string; agentId?: 
                   <b>{hit.sessionLabel}</b>
                   <span className="muted">{hit.agentId}</span>
                   <span className="transcript-role">{hit.message.role}</span>
-                  <span className="muted">{formatDateTime(hit.message.createdAt)}</span>
+                  <Timestamp className="muted" value={hit.message.createdAt} />
                 </span>
                 <span className="transcript-hit-body">
                   <TranscriptText text={body.text} highlight={query} />

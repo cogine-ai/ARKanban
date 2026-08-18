@@ -9,8 +9,10 @@ import type {
   UpcomingSchedule,
 } from "../../../src/contracts";
 import { collectorApi } from "../api";
-import { formatDateTime, formatHourMinute, formatRelative, formatScheduleRelative } from "../lib/format";
+import { formatHourMinute, formatRelative, formatScheduleRelative } from "../lib/format";
+import { useMeasuredHeight } from "../state/use-measured-height";
 import { DialogFrame } from "./DialogFrame";
+import { Timestamp } from "./Timestamp";
 
 export function SeriesRunDialog({
   group,
@@ -45,7 +47,11 @@ export function SeriesRunDialog({
   const filteredRuns = filter === "all" ? runs : runs.filter((run) => run.outcome === filter);
   const outcomes = useMemo(() => ["all", ...new Set(runs.map((run) => run.outcome))] as Array<ActivityOutcome | "all">, [runs]);
   const rowHeight = 48;
-  const viewportHeight = Math.min(360, Math.max(120, filteredRuns.length * rowHeight));
+  // The list asks for exactly the room its rows need; how much of that it may
+  // have on this screen is `.series-run-viewport`'s decision, and the windowing
+  // maths then works from what it actually got.
+  const contentHeight = filteredRuns.length * rowHeight;
+  const viewportHeight = useMeasuredHeight(viewportRef, contentHeight, detail !== undefined);
   const start = Math.max(0, Math.floor(scrollTop / rowHeight) - 4);
   const end = Math.min(filteredRuns.length, Math.ceil((scrollTop + viewportHeight) / rowHeight) + 4);
   const visibleRuns = filteredRuns.slice(start, end);
@@ -90,7 +96,7 @@ export function SeriesRunDialog({
         <div
           ref={viewportRef}
           className="series-run-viewport"
-          style={{ height: viewportHeight }}
+          style={{ height: contentHeight }}
           onScroll={(event) => setScrollTop(event.currentTarget.scrollTop)}
         >
           <div style={{ height: filteredRuns.length * rowHeight, position: "relative" }}>
@@ -103,7 +109,7 @@ export function SeriesRunDialog({
               >
                 <span><i className={`archive-state outcome-${run.outcome}`} />{run.title}</span>
                 <b>{run.outcome.replaceAll("_", " ")}</b>
-                <time>{formatDateTime(run.terminalAt)}</time>
+                <Timestamp value={run.terminalAt} />
               </button>
             ))}
           </div>

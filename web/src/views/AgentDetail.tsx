@@ -6,8 +6,8 @@ import { GradeChip } from "../components/GradeChip";
 import { useScheduleNow } from "../hooks/use-schedule-now";
 import { AGENT_COLORS } from "../lib/board";
 import {
-  formatDateTime,
   formatDuration,
+  formatExact,
   formatPercent,
   formatRelative,
   formatScheduleRelative,
@@ -120,7 +120,7 @@ function SchedulePanel({ schedules }: { schedules: UpcomingSchedule[] }) {
           {[...schedules].sort((left, right) => left.nextRunAt - right.nextRunAt).map((schedule) => (
             <li key={schedule.id}>
               <span className="schedule-title">{schedule.title}</span>
-              <span className="muted" title={formatDateTime(schedule.nextRunAt)}>
+              <span className="muted" title={formatExact(schedule.nextRunAt)}>
                 {formatScheduleRelative(schedule.nextRunAt, now)}
               </span>
             </li>

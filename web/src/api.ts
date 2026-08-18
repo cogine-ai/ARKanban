@@ -82,10 +82,15 @@ async function readError(response: Response): Promise<string> {
   return `${response.status} ${response.statusText}`;
 }
 
-async function getJson<T>(url: string): Promise<T> {
-  const response = await fetch(url, { headers: { Accept: "application/json" } });
+async function getJson<T>(url: string, signal?: AbortSignal): Promise<T> {
+  const response = await fetch(url, { headers: { Accept: "application/json" }, ...(signal ? { signal } : {}) });
   if (!response.ok) throw new Error(await readError(response));
   return (await response.json()) as T;
+}
+
+/** True for the rejection a cancelled request produces, which is not an error to show. */
+export function isAbortError(cause: unknown): boolean {
+  return cause instanceof DOMException && cause.name === "AbortError";
 }
 
 function sessionQuery(filters: SessionListFilters, cursor: string | undefined, limit: number): string {
@@ -98,6 +103,15 @@ function sessionQuery(filters: SessionListFilters, cursor: string | undefined, l
   return params.toString();
 }
 
+/**
+ * How many transcript messages one page request asks for.
+ *
+ * Stated by the caller rather than left to the server's default, because the
+ * "Load N more" button names this number: reading it off an unstated default made
+ * the label a guess that would quietly go wrong if the default ever moved.
+ */
+export const TRANSCRIPT_PAGE_SIZE = 200;
+
 export const collectorApi = {
   status: () => getJson<CollectorStatus>("/api/v1/meta"),
   snapshot: () => getJson<ActivitySnapshot>("/api/v1/snapshot"),
@@ -108,13 +122,18 @@ export const collectorApi = {
   detail: (id: string) => getJson<ActivityDetail>(`/api/v1/activities/${encodeURIComponent(id)}`),
   agents: () => getJson<{ agents: AgentOverview[] }>("/api/v1/agents"),
   agent: (agentId: string) => getJson<AgentDetail>(`/api/v1/agents/${encodeURIComponent(agentId)}`),
-  searchMessages: (filters: MessageSearchFilters, limit = 50) => {
-    const params = new URLSearchParams({ q: filters.q, limit: String(limit) });
+  /**
+   * Takes a signal because a search is the one read a reader outruns: a trigram
+   * query over the archive costs real work, and every keystroke that leaves one
+   * running is work spent on an answer nobody will see.
+   */
+  searchMessages: (filters: MessageSearchFilters, options: { limit?: number; signal?: AbortSignal } = {}) => {
+    const params = new URLSearchParams({ q: filters.q, limit: String(options.limit ?? 50) });
     if (filters.agentId) params.set("agentId", filters.agentId);
     if (filters.sessionKey) params.set("sessionKey", filters.sessionKey);
     if (filters.from !== undefined) params.set("from", String(filters.from));
     if (filters.to !== undefined) params.set("to", String(filters.to));
-    return getJson<MessageSearchResult>(`/api/v1/search/messages?${params.toString()}`);
+    return getJson<MessageSearchResult>(`/api/v1/search/messages?${params.toString()}`, options.signal);
   },
   transcriptStatus: () => getJson<TranscriptArchiveStatus>("/api/v1/transcripts/status"),
   sessions: (filters: SessionListFilters, cursor?: string, limit = 50) =>
@@ -124,8 +143,11 @@ export const collectorApi = {
   session: (sessionKey: string) => getJson<SessionDetail>(`/api/v1/sessions/${encodeURIComponent(sessionKey)}`),
   sessionActivities: (sessionKey: string) =>
     getJson<{ activities: ActivityItem[] }>(`/api/v1/sessions/${encodeURIComponent(sessionKey)}/activities`),
-  sessionMessages: (sessionKey: string, afterSeq?: number) =>
-    getJson<{ messages: ArchivedMessage[]; sync: TranscriptSyncState }>(
-      `/api/v1/sessions/${encodeURIComponent(sessionKey)}/messages${afterSeq === undefined ? "" : `?afterSeq=${afterSeq}`}`,
-    ),
+  sessionMessages: (sessionKey: string, afterSeq?: number) => {
+    const params = new URLSearchParams({ limit: String(TRANSCRIPT_PAGE_SIZE) });
+    if (afterSeq !== undefined) params.set("afterSeq", String(afterSeq));
+    return getJson<{ messages: ArchivedMessage[]; sync: TranscriptSyncState }>(
+      `/api/v1/sessions/${encodeURIComponent(sessionKey)}/messages?${params.toString()}`,
+    );
+  },
 };

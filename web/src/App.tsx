@@ -3,7 +3,7 @@ import type { ActivityItem, SettledGroupSummary, SettledRange, UpcomingSchedule 
 import { IncomingOverflowDialog, OverflowDialog, SeriesRunDialog } from "./components/dialogs";
 import { Inspector } from "./components/Inspector";
 import type { KindFilter } from "./lib/board";
-import { statusLabel } from "./lib/format";
+import { formatRelative, statusLabel } from "./lib/format";
 import { Link, matchPath, useLocation, useNavigate } from "./router";
 import { useCollector } from "./state/collector-context";
 import { AgentDetailView } from "./views/AgentDetail";
@@ -31,6 +31,39 @@ const NAV_ITEMS = [
 function isNavActive(navPath: string, pathname: string): boolean {
   if (matchPath(navPath, pathname)) return true;
   return navPath !== "/" && pathname.startsWith(`${navPath}/`);
+}
+
+/**
+ * The state of this page's own updates, which is not the same fact as whether the
+ * collector can reach its Gateway. A frozen page is worth saying out loud: every
+ * number on it was true when the stream broke and has not been checked since.
+ */
+function LiveStreamNotice() {
+  const { live, retryLive } = useCollector();
+  if (live.state === "open" || live.state === "connecting") return null;
+
+  return (
+    <div className="live-notice" data-state={live.state} role="status">
+      {live.state === "stopped" ? (
+        <>
+          <span>
+            Live updates have stopped{live.lostAt ? ` — last update ${formatRelative(live.lostAt)}` : ""}. Nothing on
+            this page is refreshing.
+          </span>
+          <button type="button" onClick={retryLive}>
+            Reconnect
+          </button>
+        </>
+      ) : (
+        // No countdown: `EventSource` sets its own delay, and naming a time this
+        // code does not control would be inventing a schedule.
+        <span>
+          Reconnecting to live updates (attempt {live.attempts})
+          {live.lostAt ? ` — last update ${formatRelative(live.lostAt)}` : ""}.
+        </span>
+      )}
+    </div>
+  );
 }
 
 export function App() {
@@ -91,6 +124,8 @@ export function App() {
         </nav>
         <button className={`gateway-button ${status?.gateway.connected ? "live" : ""}`} onClick={() => navigateTo("/connections")}><span />{status?.gateway.name ?? "Gateway"}<small>{statusLabel(status)}</small></button>
       </header>
+
+      <LiveStreamNotice />
 
       {isLive ? (
         <LiveFlowView

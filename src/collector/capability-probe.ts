@@ -16,6 +16,7 @@ export const NON_DISCOVERABLE_METHODS = [
   "sessions.usage",
   "sessions.usage.timeseries",
   "usage.cost",
+  "chat.history",
 ] as const;
 
 export type NonDiscoverableMethod = (typeof NON_DISCOVERABLE_METHODS)[number];
@@ -45,11 +46,32 @@ export function classifyProbeFailure(error: unknown): Exclude<CapabilityState, "
   return "error";
 }
 
-/** Minimal read-only arguments; a probe must never have side effects. */
-const PROBE_PARAMS: Record<NonDiscoverableMethod, Record<string, unknown>> = {
-  "sessions.usage": { limit: 1 },
-  "sessions.usage.timeseries": { limit: 1 },
-  "usage.cost": { limit: 1 },
+/**
+ * What a probe may need from the collector to form a valid call.
+ *
+ * `sessionKey` is a real key taken from the session archive. A probe has to be a
+ * call the Gateway would accept: asking `chat.history` about a session that does
+ * not exist tells us about that session, not about the method.
+ */
+export type ProbeContext = {
+  sessionKey?: string;
+};
+
+/**
+ * Minimal read-only arguments; a probe must never have side effects.
+ *
+ * `undefined` means the probe cannot be formed yet and the verdict stays
+ * `unknown`, to be retried on the next pass once the collector knows more.
+ */
+const PROBE_PARAMS: Record<
+  NonDiscoverableMethod,
+  (context: ProbeContext) => Record<string, unknown> | undefined
+> = {
+  "sessions.usage": () => ({ limit: 1 }),
+  "sessions.usage.timeseries": () => ({ limit: 1 }),
+  "usage.cost": () => ({ limit: 1 }),
+  "chat.history": (context) =>
+    context.sessionKey === undefined ? undefined : { sessionKey: context.sessionKey, limit: 1 },
 };
 
 export type ProbeCaller = (method: string, params: Record<string, unknown>) => Promise<unknown>;
@@ -91,11 +113,13 @@ export class CapabilityRegistry {
    * Probes every method whose verdict is not already settled. `error` results are
    * retried on later passes; `unavailable` and `unauthorized` are not.
    */
-  async probeAll(call: ProbeCaller): Promise<Record<string, CapabilityState>> {
+  async probeAll(call: ProbeCaller, context: ProbeContext = {}): Promise<Record<string, CapabilityState>> {
     for (const method of NON_DISCOVERABLE_METHODS) {
       if (this.isSettledUnavailable(method) || this.stateOf(method) === "live") continue;
+      const params = PROBE_PARAMS[method](context);
+      if (params === undefined) continue;
       try {
-        await call(method, PROBE_PARAMS[method]);
+        await call(method, params);
         this.states.set(method, "live");
       } catch (error) {
         this.states.set(method, classifyProbeFailure(error));

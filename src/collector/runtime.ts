@@ -600,7 +600,7 @@ export class CollectorRuntime {
       this.transcriptStatus = await this.transcripts.runOnce({
         now: Date.now(),
         connected: this.gateway.isConnected,
-        available: new Set(this.gatewayHello?.features.methods ?? []).has("chat.history"),
+        available: this.historyAvailable(),
         primaryHealthy: this.sources.get("sessions")?.state === "live",
       });
       // An open transcript has no other way to learn that this round added to it:
@@ -630,6 +630,23 @@ export class CollectorRuntime {
     } finally {
       this.transcriptSyncing = false;
     }
+  }
+
+  /**
+   * Whether `chat.history` can be called.
+   *
+   * A probe that actually made the call wins over the advertisement, in both
+   * directions. Discovery is deliberately conservative — the amendment's §4.3 is
+   * explicit that absence does not imply unavailability, which is why
+   * `sessions.usage` is probed — and treating a missing entry as a verdict meant a
+   * Gateway build that simply does not list `chat.history` archived nothing at
+   * all, silently and with no path back. The advertisement is still what answers
+   * before any probe has returned.
+   */
+  private historyAvailable(): boolean {
+    const probed = this.capabilities.stateOf("chat.history");
+    if (probed !== "unknown") return probed === "live";
+    return new Set(this.gatewayHello?.features.methods ?? []).has("chat.history");
   }
 
   /** Counts and watermarks only; never message text. */
@@ -751,7 +768,10 @@ export class CollectorRuntime {
   private async probeCapabilities(): Promise<void> {
     if (!this.gateway.isConnected) return;
     try {
-      await this.capabilities.probeAll(async (method, params) => this.gateway.request(method, params));
+      const sessionKey = this.repository.mostRecentSessionKey();
+      await this.capabilities.probeAll(async (method, params) => this.gateway.request(method, params), {
+        ...(sessionKey ? { sessionKey } : {}),
+      });
     } catch {
       // probeAll already classifies per-method outcomes; a throw here would only
       // come from the caller itself and must not affect sync state.

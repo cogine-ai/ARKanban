@@ -230,7 +230,7 @@ sessions.list 分页
 
 ### 3.4 能力探测
 
-`sessions.usage`、`sessions.usage.timeseries`、`usage.cost` 不在 hello 的发现列表中，按 v1.1 修订 §4.3 处理：
+`sessions.usage`、`sessions.usage.timeseries`、`usage.cost`、`chat.history` 都按 v1.1 修订 §4.3 处理——前三个不在 hello 的发现列表中，`chat.history` 在本机 2026.7.1-2 上会 advertise，但**不能因此只信发现列表**：§4.3 的要点是「未 advertise 不等于不可用」，而正文同步原先正是按字面反过来用的，遇到不列出 `chat.history` 的构建就每轮判 `unavailable`、一条正文都不归档，且没有任何探测或重试能走出来。现在探测结果（任一确定verdict）优先于发现列表，只有还没探测出结果时才回落到发现列表。
 
 ```text
 连接就绪后 → 对每个不可发现方法执行一次最小参数探测
@@ -241,6 +241,8 @@ sessions.list 分页
 ```
 
 探测结果绑定在 connection generation 上；重连必须重新探测。
+
+探测本身必须是 Gateway 会接受的调用：`chat.history` 报告的是某个会话，拿一个编造的 key 去问，答案说的是那个 key 而不是这个方法存不存在。因此它用采集器已经见过的最近一个会话键（`repository.mostRecentSessionKey()`）；还没有任何会话时该项探测跳过、verdict 保持 `unknown`，下一轮再来。
 
 ### 3.5 失败隔离
 

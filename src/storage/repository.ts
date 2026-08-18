@@ -1202,6 +1202,20 @@ export class CollectorRepository {
   }
 
   /**
+   * The most recently active session key, or none if none has been observed.
+   *
+   * Exists for capability probing: `chat.history` needs a session to ask about,
+   * and asking about an invented key would report on that key rather than on
+   * whether the method exists at all.
+   */
+  mostRecentSessionKey(): string | undefined {
+    const row = this.db
+      .prepare("SELECT session_key FROM sessions ORDER BY last_activity_at DESC, session_key ASC LIMIT 1")
+      .get() as Record<string, unknown> | undefined;
+    return row === undefined ? undefined : String(row.session_key);
+  }
+
+  /**
    * Keyset-paginated session list.
    *
    * Fetches one row beyond the limit to decide whether a next page exists,

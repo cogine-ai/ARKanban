@@ -72,9 +72,32 @@ describe("CapabilityRegistry", () => {
     const registry = new CapabilityRegistry();
     await registry.probeAll(async () => ({}));
     expect(Object.keys(registry.snapshot()).sort()).toEqual([
+      "chat.history",
       "sessions.usage",
       "sessions.usage.timeseries",
       "usage.cost",
     ]);
+  });
+
+  /**
+   * A probe must be a call the Gateway would accept. `chat.history` reports on a
+   * session, so asking about an invented key would answer a question about that
+   * key rather than about whether the method exists.
+   */
+  it("waits for a real session before probing chat.history", async () => {
+    const registry = new CapabilityRegistry();
+    const asked: string[] = [];
+    const call = async (method: string, params: Record<string, unknown>): Promise<unknown> => {
+      asked.push(`${method}:${String(params.sessionKey ?? "-")}`);
+      return {};
+    };
+
+    await registry.probeAll(call);
+    expect(asked).not.toContain("chat.history:-");
+    expect(registry.stateOf("chat.history")).toBe("unknown");
+
+    await registry.probeAll(call, { sessionKey: "agent:builder:one" });
+    expect(asked).toContain("chat.history:agent:builder:one");
+    expect(registry.stateOf("chat.history")).toBe("live");
   });
 });

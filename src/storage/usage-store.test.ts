@@ -1,0 +1,411 @@
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import path from "node:path";
+import { afterEach, describe, expect, it } from "vitest";
+import { CollectorRepository } from "./repository.js";
+import { DAY_MS, type UsageWrite } from "./usage-store.js";
+
+const cleanups: Array<() => void> = [];
+afterEach(() => {
+  for (const cleanup of cleanups.splice(0)) cleanup();
+});
+
+const NOW = 1_800_000_000_000;
+
+function repository(): CollectorRepository {
+  const directory = mkdtempSync(path.join(tmpdir(), "collector-usage-"));
+  const repo = new CollectorRepository(path.join(directory, "collector.db"));
+  cleanups.push(() => {
+    repo.close();
+    rmSync(directory, { recursive: true, force: true });
+  });
+  return repo;
+}
+
+function session(
+  repo: CollectorRepository,
+  sessionKey: string,
+  agentId: string,
+  overrides: { hasActiveRun?: boolean; archived?: boolean; lastActivityAt?: number } = {},
+): void {
+  repo.upsertSessions([
+    {
+      sessionKey,
+      agentId,
+      label: sessionKey,
+      kindHint: "main",
+      archived: overrides.archived ?? false,
+      hasActiveRun: overrides.hasActiveRun ?? false,
+      lineage: {},
+      lastActivityAt: overrides.lastActivityAt ?? NOW,
+      observedAt: NOW,
+      coverage: { index: "live", detail: "not_observed", usage: "not_observed", messages: "not_observed" },
+    },
+  ]);
+}
+
+function usage(sessionKey: string, overrides: Partial<UsageWrite> = {}): UsageWrite {
+  return {
+    sessionKey,
+    observedAt: NOW,
+    inputTokens: 100,
+    outputTokens: 20,
+    cacheReadTokens: 5,
+    cacheWriteTokens: 1,
+    costMicroUsd: 1_500,
+    hasCost: true,
+    models: ["sonnet"],
+    unpricedModels: [],
+    ...overrides,
+  };
+}
+
+describe("UsageStore", () => {
+  it("keeps the newest reading per session instead of summing cumulative snapshots", () => {
+    const repo = repository();
+    session(repo, "agent:builder:1", "builder");
+    repo.usage.record([usage("agent:builder:1", { observedAt: NOW - 60_000, inputTokens: 100, costMicroUsd: 1_000 })]);
+    repo.usage.record([usage("agent:builder:1", { observedAt: NOW, inputTokens: 340, costMicroUsd: 3_400 })]);
+
+    const latest = repo.usage.latest("agent:builder:1");
+    expect(latest?.inputTokens).toBe(340);
+
+    const windows = repo.usage.agentWindows(["builder"], NOW);
+    expect(windows.get("builder")?.["24h"]).toMatchObject({
+      inputTokens: 340,
+      costMicroUsd: 3_400,
+      sessionCount: 1,
+    });
+  });
+
+  it("replaces a reading observed in the same millisecond rather than failing", () => {
+    const repo = repository();
+    session(repo, "agent:builder:1", "builder");
+    repo.usage.record([usage("agent:builder:1", { inputTokens: 10 })]);
+    repo.usage.record([usage("agent:builder:1", { inputTokens: 99 })]);
+    expect(repo.usage.latest("agent:builder:1")?.inputTokens).toBe(99);
+  });
+
+  it("separates an unpriced total from a genuinely free one", () => {
+    const repo = repository();
+    session(repo, "agent:builder:1", "builder");
+    session(repo, "agent:runner:1", "runner");
+    repo.usage.record([
+      usage("agent:builder:1", { hasCost: false, models: ["local-llm"], costMicroUsd: undefined }),
+      usage("agent:runner:1", { hasCost: true, costMicroUsd: 0 }),
+    ]);
+
+    const windows = repo.usage.agentWindows(["builder", "runner"], NOW);
+    expect(windows.get("builder")?.["24h"]).toMatchObject({ hasCost: false, unpricedModels: ["local-llm"] });
+    expect(windows.get("builder")?.["24h"]).not.toHaveProperty("costMicroUsd");
+    expect(windows.get("runner")?.["24h"]).toMatchObject({ hasCost: true, costMicroUsd: 0 });
+  });
+
+  /**
+   * The card asks what an agent spent in a window, and a cumulative reading is
+   * not that. A session running for weeks that reported an hour ago used to put
+   * its entire lifetime on the 24h card.
+   */
+  it("charges a window only for what was spent inside it", () => {
+    const repo = repository();
+    session(repo, "agent:builder:1", "builder");
+    repo.usage.record([
+      usage("agent:builder:1", { observedAt: NOW - 5 * DAY_MS, inputTokens: 1_000, costMicroUsd: 10_000 }),
+      usage("agent:builder:1", { observedAt: NOW - 60_000, inputTokens: 1_150, costMicroUsd: 11_500 }),
+    ]);
+
+    const windows = repo.usage.agentWindows(["builder"], NOW);
+    expect(windows.get("builder")?.["24h"]).toMatchObject({ inputTokens: 150, costMicroUsd: 1_500 });
+    expect(windows.get("builder")?.["7d"]).toMatchObject({ inputTokens: 1_150, costMicroUsd: 11_500 });
+  });
+
+  /**
+   * Once the older readings have been folded into daily rows and deleted, the
+   * watermark left behind is the only record of where the session stood.
+   */
+  it("uses the fold watermark as the baseline when the older readings are gone", () => {
+    const repo = repository();
+    session(repo, "agent:builder:1", "builder");
+    repo.usage.record([usage("agent:builder:1", { observedAt: NOW - 9 * DAY_MS, inputTokens: 800, costMicroUsd: 8_000 })]);
+    repo.usage.rollupOlderThan(NOW - 7 * DAY_MS);
+    repo.usage.record([usage("agent:builder:1", { observedAt: NOW - 60_000, inputTokens: 900, costMicroUsd: 9_000 })]);
+
+    const windows = repo.usage.agentWindows(["builder"], NOW);
+    expect(windows.get("builder")?.["24h"]).toMatchObject({ inputTokens: 100, costMicroUsd: 1_000 });
+  });
+
+  it("counts a reading toward 7d but not 24h once it ages out", () => {
+    const repo = repository();
+    session(repo, "agent:builder:1", "builder");
+    repo.usage.record([usage("agent:builder:1", { observedAt: NOW - 3 * DAY_MS })]);
+
+    const windows = repo.usage.agentWindows(["builder"], NOW);
+    expect(windows.get("builder")?.["24h"].sessionCount).toBe(0);
+    expect(windows.get("builder")?.["7d"].sessionCount).toBe(1);
+  });
+
+  it("reports zero for an agent with no usage instead of dropping it", () => {
+    const repo = repository();
+    session(repo, "agent:quiet:1", "quiet");
+    const windows = repo.usage.agentWindows(["quiet"], NOW);
+    expect(windows.get("quiet")?.["24h"]).toMatchObject({ sessionCount: 0, inputTokens: 0, hasCost: true });
+  });
+
+  /**
+   * The newest row is what every aggregate reads, and the calibration machine's
+   * usage endpoint answers with zeros for sessions it has already measured.
+   * Without the gate, that reply would replace a measured total with a claim that
+   * the session was free.
+   */
+  it("refuses a reading that would move a cumulative total backwards", () => {
+    const repo = repository();
+    session(repo, "agent:builder:1", "builder");
+    repo.usage.record([usage("agent:builder:1", { observedAt: NOW - 60_000 })]);
+
+    const written = repo.usage.record([
+      usage("agent:builder:1", {
+        observedAt: NOW,
+        inputTokens: 0,
+        outputTokens: 0,
+        cacheReadTokens: 0,
+        cacheWriteTokens: 0,
+        costMicroUsd: 0,
+      }),
+    ]);
+
+    expect(written).toBe(0);
+    expect(repo.usage.latest("agent:builder:1")).toMatchObject({ inputTokens: 100, costMicroUsd: 1_500 });
+  });
+
+  /**
+   * Cost can regress on its own: the same token counts come back with the price
+   * missing. The token comparison alone let that through and turned a measured
+   * cost into $0.00, which is the same false claim the gate above exists to stop.
+   */
+  it("keeps a price a later reading no longer reports", () => {
+    const repo = repository();
+    session(repo, "agent:builder:1", "builder");
+    repo.usage.record([usage("agent:builder:1", { observedAt: NOW - 60_000, costMicroUsd: 5_000 })]);
+
+    repo.usage.record([usage("agent:builder:1", { observedAt: NOW, costMicroUsd: undefined, hasCost: false })]);
+
+    expect(repo.usage.latest("agent:builder:1")).toMatchObject({ costMicroUsd: 5_000 });
+  });
+
+  /**
+   * The same reading also has to be able to report a model the Gateway could not
+   * price. Dropping it to protect the cost would lose that, and the total would
+   * keep claiming to be complete.
+   */
+  it("still takes the completeness of a reading whose price it declined", () => {
+    const repo = repository();
+    session(repo, "agent:builder:1", "builder");
+    repo.usage.record([usage("agent:builder:1", { observedAt: NOW - 60_000, costMicroUsd: 5_000 })]);
+
+    repo.usage.record([
+      usage("agent:builder:1", {
+        observedAt: NOW,
+        inputTokens: 400,
+        costMicroUsd: undefined,
+        hasCost: false,
+        models: ["local-llm"],
+        unpricedModels: ["local-llm"],
+      }),
+    ]);
+
+    expect(repo.usage.latest("agent:builder:1")).toMatchObject({
+      inputTokens: 400,
+      costMicroUsd: 5_000,
+      hasCost: false,
+      unpricedModels: ["local-llm"],
+    });
+  });
+});
+
+describe("UsageStore candidates", () => {
+  const options = {
+    now: NOW,
+    recentWindowMs: 15 * 60_000,
+    staleAfterMs: 6 * 60 * 60_000,
+    staleLimit: 20,
+    limit: 100,
+  };
+
+  it("puts running sessions ahead of merely recent ones", () => {
+    const repo = repository();
+    session(repo, "agent:builder:recent", "builder", { lastActivityAt: NOW - 60_000 });
+    session(repo, "agent:builder:running", "builder", { hasActiveRun: true, lastActivityAt: NOW - 600_000 });
+
+    const { candidates } = repo.usage.candidates(options);
+    expect(candidates.map((entry) => entry.sessionKey)).toEqual(["agent:builder:running", "agent:builder:recent"]);
+    expect(candidates[0]?.reason).toBe("active");
+  });
+
+  it("skips archived sessions and quiet ones that were measured recently", () => {
+    const repo = repository();
+    session(repo, "agent:builder:archived", "builder", { archived: true, hasActiveRun: true });
+    session(repo, "agent:builder:quiet", "builder", { lastActivityAt: NOW - 2 * DAY_MS });
+    repo.usage.record([usage("agent:builder:quiet", { observedAt: NOW - 60_000 })]);
+
+    expect(repo.usage.candidates(options).candidates).toEqual([]);
+  });
+
+  it("backfills a quiet session nobody has measured in hours", () => {
+    const repo = repository();
+    session(repo, "agent:builder:quiet", "builder", { lastActivityAt: NOW - 2 * DAY_MS });
+    const { candidates } = repo.usage.candidates(options);
+    expect(candidates).toEqual([{ sessionKey: "agent:builder:quiet", reason: "stale" }]);
+  });
+
+  it("caps the round but reports the demand behind it", () => {
+    const repo = repository();
+    for (let index = 0; index < 5; index += 1) {
+      session(repo, `agent:builder:${index}`, "builder", { hasActiveRun: true });
+    }
+    const { candidates, demand } = repo.usage.candidates({ ...options, limit: 2 });
+    expect(candidates).toHaveLength(2);
+    expect(demand).toBe(5);
+  });
+
+  it("does not let a long tail of stale sessions crowd out active ones", () => {
+    const repo = repository();
+    for (let index = 0; index < 30; index += 1) {
+      session(repo, `agent:builder:stale-${index}`, "builder", { lastActivityAt: NOW - 3 * DAY_MS });
+    }
+    session(repo, "agent:builder:live", "builder", { hasActiveRun: true });
+
+    const { candidates } = repo.usage.candidates({ ...options, staleLimit: 5 });
+    expect(candidates).toHaveLength(6);
+    expect(candidates[0]?.sessionKey).toBe("agent:builder:live");
+  });
+});
+
+describe("UsageStore rollup", () => {
+  it("folds each session-day down to its last reading and drops the raw rows", () => {
+    const repo = repository();
+    session(repo, "agent:builder:1", "builder");
+    const day = Math.floor((NOW - 10 * DAY_MS) / DAY_MS) * DAY_MS;
+    repo.usage.record([
+      usage("agent:builder:1", { observedAt: day + 1_000, inputTokens: 100, costMicroUsd: 1_000 }),
+      usage("agent:builder:1", { observedAt: day + 2_000, inputTokens: 250, costMicroUsd: 2_500 }),
+    ]);
+
+    const result = repo.usage.rollupOlderThan(NOW - 7 * DAY_MS);
+    expect(result).toEqual({ days: 1, snapshots: 2 });
+    expect(repo.usage.latest("agent:builder:1")).toBeUndefined();
+
+    const summary = repo.usage.summary(day, NOW);
+    expect(summary.totals).toMatchObject({ inputTokens: 250, costMicroUsd: 2_500, sessionCount: 1 });
+    expect(summary.byModel.get("sonnet")).toMatchObject({ inputTokens: 250 });
+  });
+
+  /**
+   * The reading folded on each day is cumulative, so a session that lived across
+   * days used to be counted once per day: 100 on Monday plus 300-cumulative on
+   * Tuesday reported 400 for a session that had spent 300. The error grew with
+   * every day a session stayed alive.
+   */
+  it("counts a session that spans days once, not once per day", () => {
+    const repo = repository();
+    session(repo, "agent:builder:1", "builder");
+    const monday = Math.floor((NOW - 12 * DAY_MS) / DAY_MS) * DAY_MS;
+    const tuesday = monday + DAY_MS;
+    repo.usage.record([
+      usage("agent:builder:1", { observedAt: monday + 1_000, inputTokens: 100, costMicroUsd: 1_000 }),
+      usage("agent:builder:1", { observedAt: tuesday + 1_000, inputTokens: 300, costMicroUsd: 3_000 }),
+    ]);
+
+    repo.usage.rollupOlderThan(NOW - 7 * DAY_MS);
+
+    const summary = repo.usage.summary(monday, NOW);
+    expect(summary.totals).toMatchObject({ inputTokens: 300, costMicroUsd: 3_000, sessionCount: 1 });
+  });
+
+  /**
+   * Half a session folded and half still raw is the normal state at the horizon.
+   * The raw row is cumulative, so it has to be reduced by what was folded or the
+   * folded part gets counted a second time.
+   */
+  it("does not count the folded part again through the session's live reading", () => {
+    const repo = repository();
+    session(repo, "agent:builder:1", "builder");
+    const oldDay = Math.floor((NOW - 9 * DAY_MS) / DAY_MS) * DAY_MS;
+    repo.usage.record([usage("agent:builder:1", { observedAt: oldDay + 1_000, inputTokens: 100, costMicroUsd: 1_000 })]);
+    repo.usage.rollupOlderThan(NOW - 7 * DAY_MS);
+    repo.usage.record([usage("agent:builder:1", { observedAt: NOW, inputTokens: 260, costMicroUsd: 2_600 })]);
+
+    const summary = repo.usage.summary(oldDay, NOW);
+    expect(summary.totals).toMatchObject({ inputTokens: 260, costMicroUsd: 2_600, sessionCount: 1 });
+  });
+
+  /**
+   * A session counted by a folded day outside the range still has to be counted
+   * by its live reading inside it, or a window that starts after the fold horizon
+   * would report tokens belonging to no session at all.
+   */
+  it("counts a straddling session once whether or not the folded day is in range", () => {
+    const repo = repository();
+    session(repo, "agent:builder:1", "builder");
+    const oldDay = Math.floor((NOW - 9 * DAY_MS) / DAY_MS) * DAY_MS;
+    repo.usage.record([usage("agent:builder:1", { observedAt: oldDay + 1_000, inputTokens: 100 })]);
+    repo.usage.rollupOlderThan(NOW - 7 * DAY_MS);
+    repo.usage.record([usage("agent:builder:1", { observedAt: NOW, inputTokens: 260 })]);
+
+    expect(repo.usage.summary(NOW - DAY_MS, NOW).totals).toMatchObject({ inputTokens: 160, sessionCount: 1 });
+  });
+
+  it("is idempotent when the same day is rolled up twice", () => {
+    const repo = repository();
+    session(repo, "agent:builder:1", "builder");
+    const day = Math.floor((NOW - 10 * DAY_MS) / DAY_MS) * DAY_MS;
+    repo.usage.record([usage("agent:builder:1", { observedAt: day + 1_000, inputTokens: 250 })]);
+    repo.usage.rollupOlderThan(NOW - 7 * DAY_MS);
+
+    repo.usage.record([usage("agent:builder:1", { observedAt: day + 1_000, inputTokens: 250 })]);
+    repo.usage.rollupOlderThan(NOW - 7 * DAY_MS);
+
+    expect(repo.usage.summary(day, NOW).totals.inputTokens).toBe(250);
+  });
+
+  it("keeps an unpriced day unpriced after it crosses the rollup horizon", () => {
+    const repo = repository();
+    session(repo, "agent:builder:1", "builder");
+    const day = Math.floor((NOW - 10 * DAY_MS) / DAY_MS) * DAY_MS;
+    repo.usage.record([
+      usage("agent:builder:1", {
+        observedAt: day + 1_000,
+        hasCost: false,
+        costMicroUsd: undefined,
+        models: ["local-llm"],
+      }),
+    ]);
+    repo.usage.rollupOlderThan(NOW - 7 * DAY_MS);
+
+    expect(repo.usage.summary(day, NOW).totals).toMatchObject({ hasCost: false, unpricedModels: ["local-llm"] });
+  });
+
+  it("spans the rollup horizon without a gap where raw rows were folded", () => {
+    const repo = repository();
+    session(repo, "agent:builder:1", "builder");
+    session(repo, "agent:builder:2", "builder");
+    const oldDay = Math.floor((NOW - 10 * DAY_MS) / DAY_MS) * DAY_MS;
+    repo.usage.record([usage("agent:builder:1", { observedAt: oldDay + 1_000, inputTokens: 100 })]);
+    repo.usage.rollupOlderThan(NOW - 7 * DAY_MS);
+    repo.usage.record([usage("agent:builder:2", { observedAt: NOW - 60_000, inputTokens: 40 })]);
+
+    const summary = repo.usage.summary(oldDay, NOW);
+    expect(summary.totals.inputTokens).toBe(140);
+    expect(summary.byAgent.get("builder")?.sessionCount).toBe(2);
+  });
+
+  it("prunes snapshots past the retention horizon", () => {
+    const repo = repository();
+    session(repo, "agent:builder:1", "builder");
+    repo.usage.record([
+      usage("agent:builder:1", { observedAt: NOW - 100 * DAY_MS }),
+      usage("agent:builder:1", { observedAt: NOW }),
+    ]);
+    expect(repo.usage.pruneSnapshots(NOW - 90 * DAY_MS)).toBe(1);
+    expect(repo.usage.latest("agent:builder:1")?.observedAt).toBe(NOW);
+  });
+});

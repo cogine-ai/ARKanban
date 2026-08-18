@@ -1,7 +1,9 @@
 import type {
   ActivityDetail,
+  ActivityOutcome,
   ActivityPhase,
   ActivitySnapshot,
+  AgentRollupWindow,
   CollectorStatus,
   CollectorSyncState,
   SettledGroupSnapshot,
@@ -10,7 +12,7 @@ import type {
   SourceCoverage,
   UpcomingScheduleSnapshot,
 } from "../contracts.js";
-import type { ResolvedCollectorConfig } from "../config.js";
+import { redactEndpoint, type ResolvedCollectorConfig } from "../config.js";
 import {
   agentIdFromSessionKey,
   attemptPatch,
@@ -39,15 +41,46 @@ import {
   type RepositoryChange,
   type StoredActivity,
 } from "../storage/repository.js";
+import { USAGE_ROLLUP_AFTER_DAYS } from "../storage/usage-store.js";
+import { SIGNAL_RECOMPUTE_BATCH } from "../storage/signal-store.js";
+import { SIGNAL_ALGORITHM_VERSION } from "../activity/session-signals.js";
 import {
   DUE_GRACE_MINUTES,
+  scheduleAgentIds,
   selectUpcomingSchedules,
   UPCOMING_WINDOW_MINUTES,
 } from "./upcoming-schedules.js";
+import { inferAgents, projectAgent, projectSession } from "../activity/session-projector.js";
+import { CapabilityRegistry, type CapabilityState } from "./capability-probe.js";
+import {
+  classifyUsageFailure,
+  USAGE_SYNC_MS,
+  UsageSynchronizer,
+  type UsageSyncOutcome,
+} from "./usage-sync.js";
+import {
+  classifyHistoryFailure,
+  TRANSCRIPT_SYNC_MS,
+  TranscriptSynchronizer,
+  type TranscriptSyncOutcome,
+} from "./transcript-sync.js";
+import { FieldInventory, type FieldInventoryReport } from "./field-inventory.js";
 
 const REQUIRED_METHODS = ["tasks.list", "sessions.list", "sessions.subscribe"] as const;
 const SCHEDULE_RECONCILE_MS = 60_000;
 const CRON_PAGE_LIMIT = 200;
+const AGENT_RECONCILE_MS = 300_000;
+const SIGNAL_RECOMPUTE_MS = 60_000;
+
+/** Last signal recompute pass, for the diagnostics surface. */
+export type SignalRecomputeStatus = {
+  computedAt: number;
+  rescored: number;
+  /** Non-zero when the batch limit was reached and work remains for the next pass. */
+  backlog: number;
+  algorithmVersion: number;
+  errorCode?: string;
+};
 
 type StatusListener = (status: CollectorStatus) => void;
 type ChangeListener = (change: RepositoryChange) => void;
@@ -77,6 +110,36 @@ function lifecycleOutcome(data: Record<string, unknown>): "failed" | "cancelled"
   return "unknown";
 }
 
+/**
+ * Terminal session status vocabularies, as alias sets.
+ *
+ * A run merely stopping is not a verdict, but a status of `done` is one the
+ * Gateway asserted, and dropping it leaves every clean session unclassified —
+ * which is indistinguishable from a session nobody can judge.
+ */
+/**
+ * Terminal session statuses and the outcome each asserts.
+ *
+ * The first alias of each row is the value OpenClaw 2026.7.1-2 actually sends
+ * (`running` aside, its session vocabulary is `done`, `failed`, `killed`,
+ * `timeout`), and the same four verdicts name the audit ledger's `succeeded`,
+ * `failed`, `cancelled`, `timed_out`. The rest are tolerance for other Gateway
+ * lines and cost nothing to keep.
+ */
+const TERMINAL_STATUS_OUTCOMES: Array<{ outcome: ActivityOutcome; aliases: readonly string[] }> = [
+  { outcome: "succeeded", aliases: ["done", "completed", "complete", "finished", "succeeded", "success", "ok"] },
+  { outcome: "failed", aliases: ["failed", "failure", "error", "errored"] },
+  { outcome: "cancelled", aliases: ["killed", "cancelled", "canceled", "aborted", "interrupted", "stopped"] },
+  { outcome: "timed_out", aliases: ["timeout", "timed_out", "timedout", "expired"] },
+];
+
+/** The outcome an explicit terminal status asserts, or undefined if it asserts none. */
+function outcomeFromStatus(status: string | undefined): ActivityOutcome | undefined {
+  if (!status) return undefined;
+  const lowered = status.toLowerCase();
+  return TERMINAL_STATUS_OUTCOMES.find((entry) => entry.aliases.includes(lowered))?.outcome;
+}
+
 function phaseForStream(stream: string, data: Record<string, unknown>): ActivityPhase {
   if (stream === "tool") {
     const name = stringField(data, "name")?.toLowerCase() ?? "";
@@ -103,9 +166,30 @@ export class CollectorRuntime {
   private sessionTimer?: NodeJS.Timeout;
   private scheduleTimer?: NodeJS.Timeout;
   private pruneTimer?: NodeJS.Timeout;
+  private agentTimer?: NodeJS.Timeout;
+  private transcriptTimer?: NodeJS.Timeout;
+  private usageTimer?: NodeJS.Timeout;
+  private signalTimer?: NodeJS.Timeout;
   private taskSyncing = false;
   private sessionSyncing = false;
   private scheduleSyncing = false;
+  private agentSyncing = false;
+  private transcriptSyncing = false;
+  private usageSyncing = false;
+  private signalRecomputing = false;
+  private readonly capabilities = new CapabilityRegistry();
+  private readonly sessionFields = new FieldInventory("sessions.list");
+  private readonly agentFields = new FieldInventory("agents.list");
+  private readonly messageFields = new FieldInventory("chat.history");
+  private readonly usageFields = new FieldInventory("sessions.usage");
+  private readonly costFields = new FieldInventory("usage.cost");
+  private readonly transcripts: TranscriptSynchronizer;
+  private readonly usage: UsageSynchronizer;
+  private transcriptStatus: TranscriptSyncOutcome | undefined;
+  private usageStatus: UsageSyncOutcome | undefined;
+  private signalStatus: SignalRecomputeStatus | undefined;
+  private sessionArchiveError?: string;
+  private pruneError?: string;
   private syncState: CollectorSyncState = "starting";
   private syncReasons: string[] = ["collector_starting"];
   private gatewayHello?: GatewayHello;
@@ -136,6 +220,19 @@ export class CollectorRuntime {
       onEvent: (event) => this.handleGatewayEvent(event),
       onGap: (gap) => this.handleGap(gap),
     });
+    this.transcripts = new TranscriptSynchronizer({
+      archive: this.repository.transcripts,
+      request: async (method, params) => this.gateway.request(method, params),
+      maxBytes: config.storage.transcriptMaxBytes,
+      enabled: config.storage.transcriptSync === "enabled",
+      inventory: this.messageFields,
+    });
+    this.usage = new UsageSynchronizer({
+      store: this.repository.usage,
+      request: async (method, params) => this.gateway.request(method, params),
+      inventory: this.usageFields,
+      costInventory: this.costFields,
+    });
   }
 
   start(): void {
@@ -145,6 +242,12 @@ export class CollectorRuntime {
     this.sessionTimer = setInterval(() => void this.syncSessions("session_interval"), this.config.reconcile.sessionsMs);
     this.scheduleTimer = setInterval(() => void this.syncSchedules("schedule_interval"), SCHEDULE_RECONCILE_MS);
     this.pruneTimer = setInterval(() => this.prune(), 6 * 60 * 60 * 1_000);
+    // Deliberately not sharing the 8s session tick: a slow roster call must not
+    // be able to delay session reconciliation.
+    this.agentTimer = setInterval(() => void this.syncAgents("agent_interval"), AGENT_RECONCILE_MS);
+    this.transcriptTimer = setInterval(() => void this.syncTranscripts(), TRANSCRIPT_SYNC_MS);
+    this.usageTimer = setInterval(() => void this.syncUsage(), USAGE_SYNC_MS);
+    this.signalTimer = setInterval(() => this.recomputeSignals(), SIGNAL_RECOMPUTE_MS);
     this.gateway.start();
   }
 
@@ -154,6 +257,10 @@ export class CollectorRuntime {
     if (this.sessionTimer) clearInterval(this.sessionTimer);
     if (this.scheduleTimer) clearInterval(this.scheduleTimer);
     if (this.pruneTimer) clearInterval(this.pruneTimer);
+    if (this.agentTimer) clearInterval(this.agentTimer);
+    if (this.transcriptTimer) clearInterval(this.transcriptTimer);
+    if (this.usageTimer) clearInterval(this.usageTimer);
+    if (this.signalTimer) clearInterval(this.signalTimer);
     this.gateway.stop();
     this.repository.close();
   }
@@ -183,7 +290,9 @@ export class CollectorRuntime {
       syncReasons: [...this.syncReasons],
       gateway: {
         name: this.config.gateway.name,
-        endpoint: this.config.gateway.url,
+        // Redacted for the same reason the CLI redacts it: `ws://user:pass@host`
+        // is a legal endpoint, and this field is read by a browser page.
+        endpoint: redactEndpoint(this.config.gateway.url),
         connected: this.gateway.isConnected,
         ...(this.gatewayHello?.server.version ? { serverVersion: this.gatewayHello.server.version } : {}),
         ...(this.gatewayHello?.protocol ? { protocolVersion: this.gatewayHello.protocol } : {}),
@@ -245,6 +354,16 @@ export class CollectorRuntime {
     } else if (state.state === "connected") {
       this.gatewayHello = state.hello;
       this.defaultAgentId = undefined;
+      // A reconnect may land on a different Gateway build, so probe verdicts and
+      // field observations from the previous connection are discarded.
+      this.capabilities.newGeneration();
+      this.sessionFields.reset();
+      this.agentFields.reset();
+      this.usageFields.reset();
+      this.costFields.reset();
+      // Prices are held in memory against a specific Gateway's pricing table,
+      // so they do not survive a reconnect either.
+      this.usage.resetCost();
       this.connectedAt = state.connectedAt;
       this.syncState = "reconciling";
       this.syncReasons = ["initial_snapshot"];
@@ -263,6 +382,9 @@ export class CollectorRuntime {
         this.setSource("events", { state: "unavailable", code: "sessions_subscribe_missing" });
       }
       await Promise.all([this.syncTasks("gateway_connected"), this.syncSessions("gateway_connected"), this.syncSchedules("gateway_connected")]);
+      // Roster and capability probing trail the required sources so they can
+      // never delay the first authoritative snapshot.
+      await Promise.all([this.syncAgents("gateway_connected"), this.probeCapabilities()]);
       this.deriveSyncState();
     } else if (state.state === "unauthorized") {
       this.syncState = "unauthorized";
@@ -349,6 +471,11 @@ export class CollectorRuntime {
         offset = nextOffset;
       }
       const now = Date.now();
+      // The session archive must record every row, including archived and idle
+      // ones that the Activity projection below deliberately skips. Failing here
+      // must not cost us the Live Flow projection, so it gets its own boundary.
+      this.archiveSessions(sessions, now);
+
       const writes: ActivityWrite[] = [];
       const activeSourceKeys = new Set<string>();
       for (const session of sessions) {
@@ -404,6 +531,254 @@ export class CollectorRuntime {
     }
   }
 
+  /**
+   * Persists the session archive from a `sessions.list` page set.
+   *
+   * Isolated from the Activity projection on purpose: the archive is a secondary
+   * product, and a failure here must leave Live Flow untouched rather than fail
+   * the whole session sync.
+   */
+  private archiveSessions(rows: Record<string, unknown>[], now: number): void {
+    try {
+      const writes = rows.flatMap((row) => {
+        const projected = projectSession(row, now, this.sessionFields);
+        return projected ? [projected] : [];
+      });
+      if (writes.length === 0) return;
+      this.repository.upsertSessions(writes);
+      this.repository.linkActivitySessions();
+      // Sessions carry agent ids even when agents.list is unavailable, so the
+      // roster stays populated either way. `observed` entries never overwrite
+      // authoritative ones.
+      this.repository.upsertAgents(inferAgents(writes.map((write) => write.agentId), now));
+      this.sessionArchiveError = undefined;
+    } catch (error) {
+      // Recorded as a diagnostic rather than through setSource: source states feed
+      // deriveSyncState, and the archive is not allowed to change sync state.
+      this.sessionArchiveError = storageErrorCode(error);
+    }
+  }
+
+  /**
+   * Refreshes the Agent roster. Runs on its own timer and swallows its own
+   * failures: an absent roster degrades Agent metadata to what sessions imply,
+   * which is a coverage question rather than a sync-state one.
+   */
+  private async syncAgents(reason: string): Promise<void> {
+    if (this.agentSyncing || !this.gateway.isConnected) return;
+    if (!new Set(this.gatewayHello?.features.methods ?? []).has("agents.list")) return;
+    this.agentSyncing = true;
+    try {
+      const response = record(await this.gateway.request("agents.list", {}));
+      this.defaultAgentId ??= stringField(response, "defaultId");
+      const now = Date.now();
+      const writes = arrayRecords(response.agents).flatMap((row) => {
+        const projected = projectAgent(row, now, this.agentFields);
+        return projected ? [projected] : [];
+      });
+      if (writes.length > 0) this.repository.upsertAgents(writes);
+    } catch {
+      // Roster stays at whatever sessions already implied; see inferAgents.
+    } finally {
+      this.agentSyncing = false;
+    }
+  }
+
+  /**
+   * Pulls session transcripts into the local archive.
+   *
+   * Runs behind the primary sources in every sense: its own timer, its own
+   * request budget, and a hard gate on the primary sync being healthy. The
+   * outcome never touches `CollectorSyncState` — a transcript that is behind is
+   * a coverage fact, not a reason to call the collector degraded.
+   */
+  private async syncTranscripts(): Promise<void> {
+    if (this.transcriptSyncing) return;
+    this.transcriptSyncing = true;
+    try {
+      this.transcriptStatus = await this.transcripts.runOnce({
+        now: Date.now(),
+        connected: this.gateway.isConnected,
+        available: new Set(this.gatewayHello?.features.methods ?? []).has("chat.history"),
+        primaryHealthy: this.sources.get("sessions")?.state === "live",
+      });
+      // An open transcript has no other way to learn that this round added to it:
+      // the archive is pulled on a timer, and without this frame a reader watching
+      // a live conversation sits on whatever was there when the page loaded.
+      // Counts and topic only — the frame never carries message text, and no
+      // session key, since a key is enough to say who was talking to whom.
+      if (this.transcriptStatus.inserted > 0) {
+        this.emitChange({
+          epoch: this.repository.epoch,
+          revision: this.repository.revision,
+          topics: ["messages"],
+          ids: [],
+          reasons: ["transcript_sync"],
+        });
+      }
+    } catch (error) {
+      // Closed-set code only: invariant 2 keeps transcript text out of logs.
+      this.transcriptStatus = {
+        requests: 0,
+        inserted: 0,
+        sessions: 0,
+        capacity: "ok",
+        evictedSessions: 0,
+        errorCode: classifyHistoryFailure(error),
+      };
+    } finally {
+      this.transcriptSyncing = false;
+    }
+  }
+
+  /** Counts and watermarks only; never message text. */
+  getTranscriptStatus(): TranscriptSyncOutcome | undefined {
+    return this.transcriptStatus;
+  }
+
+  /**
+   * Pulls token counts and cost.
+   *
+   * Isolated the same way transcripts are: own timer, own try boundary, no
+   * influence on `CollectorSyncState`. A Gateway that cannot price work is a
+   * coverage fact for the cost view, not a degraded collector.
+   */
+  private async syncUsage(): Promise<void> {
+    if (this.usageSyncing) return;
+    this.usageSyncing = true;
+    try {
+      this.usageStatus = await this.usage.runOnce({
+        now: Date.now(),
+        connected: this.gateway.isConnected,
+        usageState: this.capabilities.stateOf("sessions.usage"),
+        costState: this.capabilities.stateOf("usage.cost"),
+      });
+    } catch (error) {
+      this.usageStatus = {
+        requests: 0,
+        recorded: 0,
+        sessions: 0,
+        coverage: "error",
+        errorCode: classifyUsageFailure(error),
+        costRefreshed: false,
+      };
+    } finally {
+      this.usageSyncing = false;
+      // Guarded, and skipped once stopping. A round in flight when the process
+      // shuts down reaches this after the database has been closed, and an
+      // exception thrown from a `finally` leaves the enclosing catch behind: it
+      // surfaces as an unhandled rejection from the timer that has no caller to
+      // see it, which is enough to take the process down over bookkeeping nobody
+      // is waiting for.
+      if (!this.stopped) {
+        try {
+          this.repository.setUsageCoverage(this.usageStatus?.coverage ?? "not_observed");
+          this.repository.setUnreportedUsageSessions(this.usage.unreportedSessions());
+          if ((this.usageStatus?.recorded ?? 0) > 0 || this.usageStatus?.costRefreshed) {
+            this.emitChange({
+              epoch: this.repository.epoch,
+              revision: this.repository.revision,
+              topics: ["usage"],
+              ids: [],
+              reasons: ["usage_sync"],
+            });
+          }
+        } catch {
+          // Coverage is re-derived on the next round, so a lost write costs a
+          // stale badge for a minute rather than the collector.
+        }
+      }
+    }
+  }
+
+  getUsageStatus(): UsageSyncOutcome | undefined {
+    return this.usageStatus;
+  }
+
+  /**
+   * Rescores sessions whose stored signals fell behind the evidence.
+   *
+   * Purely local: signals derive from stored activities and observations, so
+   * this runs whether or not the Gateway is reachable, and a disconnection can
+   * never make a stored verdict go missing. Batched so a large archive — or a
+   * weight change that invalidates every row at once — drains over several
+   * passes instead of blocking one.
+   */
+  private recomputeSignals(): void {
+    if (this.signalRecomputing) return;
+    this.signalRecomputing = true;
+    const startedAt = Date.now();
+    try {
+      const rescored = this.repository.signals.recomputeStale(startedAt, SIGNAL_RECOMPUTE_BATCH);
+      const backlog = rescored === 0 ? 0 : this.repository.signals.staleSessions(1).length;
+      this.signalStatus = { computedAt: startedAt, rescored, backlog, algorithmVersion: SIGNAL_ALGORITHM_VERSION };
+      if (rescored > 0) {
+        this.emitChange({
+          epoch: this.repository.epoch,
+          revision: this.repository.revision,
+          topics: ["sessions"],
+          ids: [],
+          reasons: ["signals_recomputed"],
+        });
+      }
+    } catch (error) {
+      this.signalStatus = {
+        computedAt: startedAt,
+        rescored: 0,
+        backlog: 0,
+        algorithmVersion: SIGNAL_ALGORITHM_VERSION,
+        errorCode: error instanceof Error ? error.message : String(error),
+      };
+    } finally {
+      this.signalRecomputing = false;
+    }
+  }
+
+  getSignalStatus(): SignalRecomputeStatus | undefined {
+    return this.signalStatus;
+  }
+
+  /** Gateway-priced cost per agent, absent when `usage.cost` never answered. */
+  getAgentCost(window: AgentRollupWindow, agentId: string): number | undefined {
+    return this.usage.costFor(window, agentId);
+  }
+
+  /**
+   * One read-only probe per non-discoverable method, bound to the current
+   * connection generation.
+   */
+  private async probeCapabilities(): Promise<void> {
+    if (!this.gateway.isConnected) return;
+    try {
+      await this.capabilities.probeAll(async (method, params) => this.gateway.request(method, params));
+    } catch {
+      // probeAll already classifies per-method outcomes; a throw here would only
+      // come from the caller itself and must not affect sync state.
+    }
+  }
+
+  /** Field-mapping diagnostics for validating the projectors against a real Gateway. */
+  getFieldReports(): FieldInventoryReport[] {
+    return [
+      this.sessionFields.report(),
+      this.agentFields.report(),
+      this.messageFields.report(),
+      this.usageFields.report(),
+      this.costFields.report(),
+    ];
+  }
+
+  getCapabilities(): Record<string, CapabilityState> {
+    return this.capabilities.snapshot();
+  }
+
+  getArchiveDiagnostics(): { sessionArchiveError?: string; pruneError?: string } {
+    return {
+      ...(this.sessionArchiveError ? { sessionArchiveError: this.sessionArchiveError } : {}),
+      ...(this.pruneError ? { pruneError: this.pruneError } : {}),
+    };
+  }
+
   private async syncSchedules(reason: string): Promise<void> {
     if (this.scheduleSyncing || !this.gateway.isConnected) return;
     const methods = new Set(this.gatewayHello?.features.methods ?? []);
@@ -440,6 +815,9 @@ export class CollectorRuntime {
 
       const now = Date.now();
       const selected = selectUpcomingSchedules(jobs, { now, ...(this.defaultAgentId ? { defaultAgentId: this.defaultAgentId } : {}) });
+      // A cron job proves its agent exists even when the roster call omits it,
+      // and without this its schedule would render against no Agent card.
+      this.repository.upsertAgents(inferAgents(scheduleAgentIds(jobs, this.defaultAgentId), now));
       this.updateSchedule(
         {
           state: selected.omittedAgentCount > 0 ? "partial" : "live",
@@ -489,7 +867,8 @@ export class CollectorRuntime {
     const runRef = directRunRef ?? runRefs[0];
     const phase = stringField(payload, "phase");
     const active = payload.hasActiveRun === true || phase === "start" || stringField(payload, "status") === "running";
-    const terminal = phase === "end" || phase === "error" || (!active && (payload.hasActiveRun === false || ["done", "failed", "killed", "timeout"].includes(stringField(payload, "status") ?? "")));
+    const terminal = phase === "end" || phase === "error"
+      || (!active && (payload.hasActiveRun === false || outcomeFromStatus(stringField(payload, "status")) !== undefined));
     if (!active && !terminal) return;
     const existing = this.repository.findOpenAttempt({ ...(runRef ? { runRef } : {}), ...(key ? { sessionKey: key } : {}) })
       ?? (runRef ? this.repository.findBySourceKey(`attempt:run:${runRef}`) : undefined);
@@ -497,10 +876,15 @@ export class CollectorRuntime {
     const data = record(payload.data);
     const sourceKey = existing?.sourceKey ?? (runRef ? `attempt:run:${runRef}` : `attempt:session:${key ?? "unknown"}:${now}`);
     const status = stringField(payload, "status") ?? phase;
-    let outcome: "none" | "failed" | "cancelled" | "timed_out" | "unknown" = "none";
+    let outcome: ActivityOutcome = "none";
     if (terminal) {
-      const sessionStatus = stringField(payload, "status");
-      outcome = sessionStatus === "failed" ? "failed" : sessionStatus === "killed" ? "cancelled" : sessionStatus === "timeout" ? "timed_out" : lifecycleOutcome({ ...data, ...(phase === "error" ? { error: stringField(payload, "lastRunError") ?? "session error" } : {}) });
+      // `status` is the Gateway's own verdict and wins when it asserts one;
+      // `phase: "error"` is itself an assertion of failure. 2026.7.1-2 sends the
+      // session snapshot flattened onto this event, with no `lastRunError` and no
+      // top-level `data` — lifecycle detail rides the separate `agent` event — so
+      // once those two are exhausted this stays `unknown` instead of guessing.
+      outcome = outcomeFromStatus(stringField(payload, "status"))
+        ?? lifecycleOutcome({ ...data, ...(phase === "error" ? { error: "session error" } : {}) });
     }
     const write = attemptPatch({
       id: existing?.id ?? newAttemptActivityId(),
@@ -659,11 +1043,57 @@ export class CollectorRuntime {
     }
 
     this.schedule = { ...next, revision: this.schedule.revision + 1 };
-    this.emitChange({ epoch: this.repository.epoch, revision: this.repository.revision, ids: [], reasons: [reason] });
+    this.emitChange({
+      epoch: this.repository.epoch,
+      revision: this.repository.revision,
+      // The upcoming-schedule forecast is rendered by the activities surface.
+      topics: ["activities"],
+      ids: [],
+      reasons: [reason],
+    });
   }
 
+  /**
+   * Runs on a timer, so an exception here would reach the event loop with no
+   * frame to catch it and take the process down. A prune that fails is a
+   * database that keeps growing until the next pass, which is survivable.
+   */
   private prune(): void {
-    const cutoff = Date.now() - this.config.storage.terminalRetentionDays * 24 * 60 * 60 * 1_000;
-    this.repository.prune(cutoff);
+    const now = Date.now();
+    const day = 24 * 60 * 60 * 1_000;
+    try {
+      // Usage folds before sessions age out: rollup reads the agent through the
+      // session row, so deleting sessions first would strand the spend as
+      // unattributable.
+      this.repository.usage.rollupOlderThan(now - USAGE_ROLLUP_AFTER_DAYS * day);
+      this.repository.usage.pruneSnapshots(now - this.config.storage.usageRetentionDays * day);
+      this.repository.prune(now - this.config.storage.terminalRetentionDays * day);
+      this.repository.pruneSessions(now - this.config.storage.sessionRetentionDays * day);
+      // Transcripts have two gates: age here, and the size ceiling the sync loop
+      // enforces. Age runs first so eviction only ever has to handle real growth.
+      this.repository.transcripts.pruneOlderThan(now - this.config.storage.transcriptRetentionDays * day);
+      this.repository.transcripts.evictOldestSessions(this.config.storage.transcriptMaxBytes);
+      this.pruneError = undefined;
+    } catch (error) {
+      this.pruneError = storageErrorCode(error);
+    }
   }
+}
+
+/**
+ * A storage failure reduced to something safe to serve.
+ *
+ * These reach `/api/v1/diagnostics/field-coverage`, and a SQLite message names
+ * the database file — which is a path through the operator's home directory, and
+ * sometimes a fragment of the statement that failed. The code is what tells an
+ * operator whether the disk is full or the file is locked, which is the whole
+ * reason the field is there.
+ */
+function storageErrorCode(error: unknown): string {
+  if (error instanceof Error) {
+    const code = (error as { code?: unknown }).code;
+    if (typeof code === "string" && code) return code;
+    return error.name;
+  }
+  return "unknown_error";
 }

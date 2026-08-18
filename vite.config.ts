@@ -2,6 +2,8 @@ import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react";
 import tailwindcss from "@tailwindcss/vite";
 
+const collector = process.env.COLLECTOR_ORIGIN ?? "http://127.0.0.1:47123";
+
 export default defineConfig({
   plugins: [react(), tailwindcss()],
   root: "web",
@@ -10,12 +12,14 @@ export default defineConfig({
     emptyOutDir: true,
   },
   server: {
-    port: 5173,
+    port: Number(process.env.WEB_PORT ?? 5173),
     strictPort: true,
+    // Overridable so the UI can be pointed at a second collector — a scratch
+    // instance on another port — without editing this file.
     proxy: {
-      "/api": "http://127.0.0.1:47123",
-      "/healthz": "http://127.0.0.1:47123",
-      "/readyz": "http://127.0.0.1:47123",
+      "/api": collector,
+      "/healthz": collector,
+      "/readyz": collector,
     },
   },
 });

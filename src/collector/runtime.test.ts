@@ -36,7 +36,12 @@ describe("CollectorRuntime", () => {
     const config: ResolvedCollectorConfig = {
       gateway: { name: "test", url: `ws://127.0.0.1:${address.port}`, tokenEnv: "TEST_GATEWAY_TOKEN", token: "test-token" },
       server: { host: "127.0.0.1", port: 47_123 },
-      storage: { path: path.join(directory, "collector.sqlite"), terminalRetentionDays: 1 },
+      storage: {
+        path: path.join(directory, "collector.sqlite"),
+        terminalRetentionDays: 1,
+        usageRetentionDays: 14,
+        sessionRetentionDays: 90,
+      },
       reconcile: { tasksMs: 60_000, sessionsMs: 60_000 },
       ui: { recentLimit: 200 },
       configPath: path.join(directory, "config.json"),
@@ -84,7 +89,12 @@ describe("CollectorRuntime", () => {
     const config: ResolvedCollectorConfig = {
       gateway: { name: "test", url: `ws://127.0.0.1:${address.port}`, tokenEnv: "TEST_GATEWAY_TOKEN", token: "test-token" },
       server: { host: "127.0.0.1", port: 47_124 },
-      storage: { path: path.join(directory, "collector.sqlite"), terminalRetentionDays: 1 },
+      storage: {
+        path: path.join(directory, "collector.sqlite"),
+        terminalRetentionDays: 1,
+        usageRetentionDays: 14,
+        sessionRetentionDays: 90,
+      },
       reconcile: { tasksMs: 60_000, sessionsMs: 60_000 },
       ui: { recentLimit: 200 },
       configPath: path.join(directory, "config.json"),
@@ -120,9 +130,25 @@ describe("CollectorRuntime", () => {
       seq: 2,
       payload: { runId: runRef, sessionKey, agentId: "pm-awb", phase: "end", status: "done", ts: 4_000 },
     }));
-    await vi.waitFor(() => expect(runtime.getSnapshot().items[0]).toMatchObject({ state: "terminal" }));
+    // A status of `done` is the Gateway asserting a clean finish. Recording it as
+    // `unknown` would leave every healthy session unclassified, which reads the
+    // same as a session nobody could judge.
+    await vi.waitFor(() => expect(runtime.getSnapshot().items[0]).toMatchObject({ state: "terminal", outcome: "succeeded" }));
     expect(runtime.getSnapshot().items).toHaveLength(1);
     expect(runtime.getSnapshot().items.some((item) => item.agentId === "Unattributed")).toBe(false);
+
+    // A later run of the same session that fails is classified from its status,
+    // and is what flags the session for attention.
+    clientSocket?.send(JSON.stringify({
+      type: "event",
+      event: "sessions.changed",
+      seq: 3,
+      payload: { runId: "run-feishu-two", sessionKey, agentId: "pm-awb", phase: "error", status: "failed", lastRunError: "boom", ts: 5_000 },
+    }));
+    await vi.waitFor(() => {
+      const failed = runtime.getSnapshot().items.find((item) => item.outcome === "failed");
+      expect(failed).toMatchObject({ state: "terminal", attention: "error" });
+    });
   });
 
   it("publishes the next-hour cron forecast separately from operational activity", async () => {
@@ -154,7 +180,12 @@ describe("CollectorRuntime", () => {
     const config: ResolvedCollectorConfig = {
       gateway: { name: "test", url: `ws://127.0.0.1:${address.port}`, tokenEnv: "TEST_GATEWAY_TOKEN", token: "test-token" },
       server: { host: "127.0.0.1", port: 47_125 },
-      storage: { path: path.join(directory, "collector.sqlite"), terminalRetentionDays: 1 },
+      storage: {
+        path: path.join(directory, "collector.sqlite"),
+        terminalRetentionDays: 1,
+        usageRetentionDays: 14,
+        sessionRetentionDays: 90,
+      },
       reconcile: { tasksMs: 60_000, sessionsMs: 60_000 },
       ui: { recentLimit: 200 },
       configPath: path.join(directory, "config.json"),

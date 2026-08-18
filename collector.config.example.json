@@ -10,7 +10,12 @@
   },
   "storage": {
     "path": "./data/collector.sqlite",
-    "terminalRetentionDays": 30
+    "terminalRetentionDays": 30,
+    "usageRetentionDays": 14,
+    "sessionRetentionDays": 90,
+    "transcriptSync": "disabled",
+    "transcriptRetentionDays": 180,
+    "transcriptMaxBytes": 2147483648
   },
   "reconcile": {
     "tasksMs": 15000,

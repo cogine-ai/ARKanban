@@ -6,6 +6,7 @@ node_modules/
 dist/
 coverage/
 data/
+.fixtures/
 collector.config.json
 *.db
 *.db-shm

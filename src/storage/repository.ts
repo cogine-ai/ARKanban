@@ -1,14 +1,32 @@
 import { createHash, randomUUID } from "node:crypto";
-import { mkdirSync } from "node:fs";
+import { chmodSync, mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import { DatabaseSync, type StatementSync } from "node:sqlite";
 import type {
   ActivityDetail,
   ActivityItem,
+  ActivityOutcome,
   ActivityRelation,
+  AgentActivityRollup,
+  AgentKind,
+  AgentOrigin,
+  AgentOverview,
+  AgentRollupWindow,
+  AgentSummary,
+  ChangeTopic,
   EvidenceState,
   LaneSummary,
   ObservationView,
+  SessionConfidence,
+  SessionCoverage,
+  SessionKindHint,
+  SessionLineage,
+  SessionOutcomeClass,
+  SessionRecord,
+  SessionSignalGrade,
+  SessionSignalsBrief,
+  SessionSummary,
+  SessionUsageCoverage,
   SettledGroupSnapshot,
   SettledGroupSummary,
   SettledOutcomeCounts,
@@ -16,12 +34,19 @@ import type {
   SettledRange,
   SettledSeriesRuns,
   StageCounts,
+  UsageTotals,
 } from "../contracts.js";
 import { agentIdFromSessionKey, type ActivityWrite } from "../activity/projector.js";
+import { applyMigrations, type MigrationResult } from "./migrations.js";
+import { encodeCursor, type KeysetCursor, type SessionSort } from "./keyset-cursor.js";
+import { GRADE_SEVERITY, SignalStore } from "./signal-store.js";
+import { TranscriptArchive } from "./transcript-archive.js";
+import { UsageStore } from "./usage-store.js";
 
 export type RepositoryChange = {
   epoch: string;
   revision: number;
+  topics: ChangeTopic[];
   ids: string[];
   reasons: string[];
 };
@@ -34,7 +59,123 @@ export type StoredActivity = ActivityItem & {
   parentTaskId?: string;
 };
 
+export type AgentWrite = {
+  id: string;
+  displayName: string;
+  kind: AgentKind;
+  runtime?: string;
+  model?: string;
+  origin: AgentOrigin;
+  observedAt: number;
+  lastActivityAt?: number;
+};
+
+export type SessionWrite = {
+  sessionKey: string;
+  sessionId?: string;
+  agentId: string;
+  label: string;
+  runtime?: string;
+  model?: string;
+  category?: string;
+  kindHint: SessionKindHint;
+  archived: boolean;
+  hasActiveRun: boolean;
+  placement?: string;
+  lineage: SessionLineage;
+  createdAt?: number;
+  lastActivityAt: number;
+  observedAt: number;
+  coverage: SessionCoverage;
+};
+
+export type SessionListQuery = {
+  agentId?: string;
+  includeArchived?: boolean;
+  limit?: number;
+};
+
+/**
+ * `active` and `archived` are read straight off the row. `terminal` is the
+ * remainder — observed, not archived, nothing running — which is a real state
+ * the schema stores no column for.
+ */
+export type SessionStateFilter = "active" | "terminal" | "archived";
+
+export type SessionPageQuery = {
+  agentId?: string;
+  state?: SessionStateFilter;
+  grade?: SessionSignalGrade;
+  since?: number;
+  until?: number;
+  sort: SessionSort;
+  limit: number;
+  cursor?: KeysetCursor;
+};
+
+export type SessionPage = {
+  items: SessionSummary[];
+  nextCursor?: string;
+};
+
 type ActivityRow = Record<string, unknown>;
+
+/** Grade of one session, correlated by primary key. */
+const SIGNAL_GRADE_SUBQUERY = "(SELECT g.grade FROM session_signals g WHERE g.session_key = s.session_key)";
+
+/**
+ * Compact signal columns for list rows.
+ *
+ * A join would be tidier, but `sessions s` is already the driving table for the
+ * keyset scan and correlated primary-key lookups keep that plan intact.
+ */
+const SIGNAL_BRIEF_COLUMNS = `
+  ${SIGNAL_GRADE_SUBQUERY} AS signal_grade,
+  (SELECT g.score FROM session_signals g WHERE g.session_key = s.session_key) AS signal_score,
+  (SELECT g.outcome FROM session_signals g WHERE g.session_key = s.session_key) AS signal_outcome,
+  (SELECT g.confidence FROM session_signals g WHERE g.session_key = s.session_key) AS signal_confidence
+`;
+
+function rowToSignalsBrief(row: ActivityRow): SessionSignalsBrief | undefined {
+  if (typeof row.signal_grade !== "string") return undefined;
+  const score = asNumber(row.signal_score);
+  return {
+    grade: row.signal_grade as SessionSignalGrade,
+    ...(score !== undefined ? { score } : {}),
+    outcome: String(row.signal_outcome ?? "unknown") as SessionOutcomeClass,
+    confidence: String(row.signal_confidence ?? "low") as SessionConfidence,
+  };
+}
+
+const AGENT_ROLLUP_WINDOW_MS: Record<AgentRollupWindow, number> = {
+  "24h": 24 * 60 * 60 * 1_000,
+  "7d": 7 * 24 * 60 * 60 * 1_000,
+};
+
+function emptyRollup(): AgentActivityRollup {
+  return {
+    completed: 0,
+    succeeded: 0,
+    failed: 0,
+    cancelled: 0,
+    timedOut: 0,
+    blocked: 0,
+    unknown: 0,
+    durationSampleCount: 0,
+  };
+}
+
+function emptyUsageTotals(): UsageTotals {
+  return {
+    inputTokens: 0,
+    outputTokens: 0,
+    cacheReadTokens: 0,
+    cacheWriteTokens: 0,
+    hasCost: true,
+    sessionCount: 0,
+    unpricedModels: [],
+  };
+}
 
 const EMPTY_COUNTS: StageCounts = {
   incoming: 0,
@@ -149,6 +290,24 @@ function aggregateSettledGroups(
   return { groupsByAgent, outcomeCounts, totalSeries: groups.length };
 }
 
+/**
+ * Narrows a path to its owner, reporting whether the mode now holds.
+ *
+ * A file SQLite has not created yet needs no narrowing. Every other refusal —
+ * a directory owned by someone else, a volume without POSIX modes — is real:
+ * the mode does not hold, and the caller has to say so rather than crash, since
+ * refusing to start would leave the operator with no collector and no
+ * explanation of why.
+ */
+function restrictToOwner(target: string, mode: number): boolean {
+  try {
+    chmodSync(target, mode);
+    return true;
+  } catch (error) {
+    return (error as { code?: string }).code === "ENOENT";
+  }
+}
+
 function asString(value: unknown): string | undefined {
   return typeof value === "string" && value.length > 0 ? value : undefined;
 }
@@ -210,6 +369,111 @@ function rowToStored(row: ActivityRow): StoredActivity {
 function publicItem(item: StoredActivity): ActivityItem {
   const { sourceKey: _sourceKey, taskId: _taskId, runRef: _runRef, sessionKey: _sessionKey, parentTaskId: _parentTaskId, ...view } = item;
   return view;
+}
+
+const DEFAULT_SESSION_COVERAGE: SessionCoverage = {
+  index: "unavailable",
+  detail: "not_observed",
+  usage: "not_observed",
+  messages: "not_observed",
+};
+
+function agentFingerprint(write: AgentWrite): string {
+  return JSON.stringify([write.displayName, write.kind, write.runtime, write.model, write.origin]);
+}
+
+/**
+ * `identity` selects where the descriptive columns come from on conflict:
+ * `excluded` lets the incoming write win, `agents` keeps the stored row.
+ */
+function agentUpsertSql(identity: "excluded" | "agents"): string {
+  return `
+    INSERT INTO agents (
+      id, display_name, kind, runtime, model, origin, first_observed_at, last_activity_at, fingerprint
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(id) DO UPDATE SET
+      display_name = ${identity}.display_name,
+      kind = ${identity}.kind,
+      fingerprint = ${identity}.fingerprint,
+      runtime = COALESCE(excluded.runtime, agents.runtime),
+      model = COALESCE(excluded.model, agents.model),
+      origin = CASE WHEN excluded.origin = 'roster' THEN 'roster' ELSE agents.origin END,
+      first_observed_at = MIN(excluded.first_observed_at, agents.first_observed_at),
+      last_activity_at = CASE
+        WHEN excluded.last_activity_at IS NULL THEN agents.last_activity_at
+        WHEN agents.last_activity_at IS NULL THEN excluded.last_activity_at
+        ELSE MAX(excluded.last_activity_at, agents.last_activity_at)
+      END
+  `;
+}
+
+function sessionFingerprint(write: SessionWrite): string {
+  return JSON.stringify([
+    write.sessionId,
+    write.agentId,
+    write.label,
+    write.runtime,
+    write.model,
+    write.category,
+    write.kindHint,
+    write.archived,
+    write.hasActiveRun,
+    write.placement,
+    write.lineage,
+    write.createdAt,
+    write.coverage,
+  ]);
+}
+
+function rowToAgent(row: ActivityRow): AgentSummary {
+  return {
+    id: String(row.id),
+    displayName: String(row.display_name),
+    kind: row.kind as AgentSummary["kind"],
+    ...(asString(row.runtime) ? { runtime: asString(row.runtime) } : {}),
+    ...(asString(row.model) ? { model: asString(row.model) } : {}),
+    origin: row.origin as AgentSummary["origin"],
+    firstObservedAt: Number(row.first_observed_at),
+    ...(asNumber(row.last_activity_at) !== undefined ? { lastActivityAt: asNumber(row.last_activity_at) } : {}),
+  };
+}
+
+function rowToSessionSummary(row: ActivityRow): SessionSummary {
+  const signals = rowToSignalsBrief(row);
+  return {
+    sessionKey: String(row.session_key),
+    ...(asString(row.session_id) ? { sessionId: asString(row.session_id) } : {}),
+    agentId: String(row.agent_id),
+    label: String(row.label),
+    ...(asString(row.runtime) ? { runtime: asString(row.runtime) } : {}),
+    ...(asString(row.model) ? { model: asString(row.model) } : {}),
+    ...(asString(row.category) ? { category: asString(row.category) } : {}),
+    kindHint: row.kind_hint as SessionKindHint,
+    archived: Number(row.archived) === 1,
+    hasActiveRun: Number(row.has_active_run) === 1,
+    ...(asString(row.placement) ? { placement: asString(row.placement) } : {}),
+    ...(asNumber(row.created_at) !== undefined ? { createdAt: asNumber(row.created_at) } : {}),
+    lastActivityAt: Number(row.last_activity_at),
+    lastObservedAt: Number(row.last_observed_at),
+    activityCount: Number(row.activity_count ?? 0),
+    coverage: parseJson(row.coverage_json, DEFAULT_SESSION_COVERAGE),
+    ...(signals ? { signals } : {}),
+  };
+}
+
+function rowToSessionRecord(row: ActivityRow): SessionRecord {
+  return {
+    ...rowToSessionSummary(row),
+    lineage: {
+      ...(asString(row.parent_session_key) ? { parentSessionKey: asString(row.parent_session_key) } : {}),
+      ...(asString(row.previous_session_id) ? { previousSessionId: asString(row.previous_session_id) } : {}),
+      ...(asString(row.fork_source_key) ? { forkSourceKey: asString(row.fork_source_key) } : {}),
+      ...(asString(row.spawned_by) ? { spawnedBy: asString(row.spawned_by) } : {}),
+      ...(asNumber(row.spawn_depth) !== undefined ? { spawnDepth: asNumber(row.spawn_depth) } : {}),
+      ...(asString(row.subagent_role) ? { subagentRole: asString(row.subagent_role) } : {}),
+      ...(asString(row.worktree_branch) ? { worktreeBranch: asString(row.worktree_branch) } : {}),
+    },
+  };
 }
 
 function coreFingerprint(item: ActivityWrite): string {
@@ -310,6 +574,17 @@ function buildRelations(stored: StoredActivity[]): ActivityRelation[] {
 
 export class CollectorRepository {
   readonly epoch = randomUUID();
+  readonly migration: MigrationResult;
+  /** The only permitted write path for session transcripts. */
+  readonly transcripts: TranscriptArchive;
+  readonly usage: UsageStore;
+  readonly signals: SignalStore;
+  /**
+   * False when this filesystem would not hold the database to its owner, so the
+   * archive disclosure can say that the text is readable by other users here
+   * instead of implying a protection that is not in place.
+   */
+  readonly filePermissionsEnforced: boolean;
   private readonly db: DatabaseSync;
   private readonly listeners = new Set<(change: RepositoryChange) => void>();
   private readonly findFingerprint: StatementSync;
@@ -318,66 +593,26 @@ export class CollectorRepository {
   private currentRevision = 0;
 
   constructor(databasePath: string) {
-    mkdirSync(dirname(databasePath), { recursive: true });
+    mkdirSync(dirname(databasePath), { recursive: true, mode: 0o700 });
     this.db = new DatabaseSync(databasePath);
     this.db.exec("PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL; PRAGMA busy_timeout = 3000;");
-    this.db.exec(`
-      CREATE TABLE IF NOT EXISTS meta (
-        key TEXT PRIMARY KEY,
-        value TEXT NOT NULL
-      );
-
-      CREATE TABLE IF NOT EXISTS activities (
-        id TEXT PRIMARY KEY,
-        source_key TEXT NOT NULL UNIQUE,
-        kind TEXT NOT NULL,
-        origin TEXT NOT NULL,
-        catalog TEXT NOT NULL,
-        task_id TEXT,
-        run_ref TEXT,
-        session_key TEXT,
-        parent_task_id TEXT,
-        flow_id TEXT,
-        agent_id TEXT NOT NULL,
-        runtime TEXT,
-        title TEXT NOT NULL,
-        state TEXT NOT NULL,
-        outcome TEXT NOT NULL,
-        phase TEXT NOT NULL,
-        attention TEXT NOT NULL,
-        stage TEXT NOT NULL,
-        freshness TEXT NOT NULL,
-        progress_summary TEXT,
-        last_tool_name TEXT,
-        created_at INTEGER,
-        started_at INTEGER,
-        ended_at INTEGER,
-        updated_at INTEGER NOT NULL,
-        last_observed_at INTEGER NOT NULL,
-        evidence_json TEXT NOT NULL,
-        fingerprint TEXT NOT NULL
-      );
-
-      CREATE INDEX IF NOT EXISTS idx_activities_run_ref ON activities(run_ref);
-      CREATE INDEX IF NOT EXISTS idx_activities_session_key ON activities(session_key);
-      CREATE INDEX IF NOT EXISTS idx_activities_updated_at ON activities(updated_at DESC);
-      CREATE INDEX IF NOT EXISTS idx_activities_terminal_at
-        ON activities(catalog, COALESCE(ended_at, updated_at) DESC);
-
-      CREATE TABLE IF NOT EXISTS observations (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        activity_id TEXT NOT NULL,
-        source TEXT NOT NULL,
-        kind TEXT NOT NULL,
-        phase TEXT,
-        status TEXT,
-        tool_name TEXT,
-        occurred_at INTEGER NOT NULL,
-        FOREIGN KEY(activity_id) REFERENCES activities(id) ON DELETE CASCADE
-      );
-
-      CREATE INDEX IF NOT EXISTS idx_observations_activity ON observations(activity_id, occurred_at DESC);
-    `);
+    // Overwrite deleted rows instead of leaving them legible in freed pages:
+    // retention and capacity eviction both delete transcript text, and neither
+    // can afford to VACUUM the whole file on every pass.
+    this.db.exec("PRAGMA secure_delete = ON;");
+    // Loopback does not isolate the other OS users on this machine, and this file
+    // holds conversation text. SQLite creates the database, WAL and SHM under the
+    // ambient umask, so each is narrowed once it exists. The file modes are what
+    // actually withhold the text; the directory is depth, and a directory this
+    // process does not own is not a reason to stop.
+    restrictToOwner(dirname(databasePath), 0o700);
+    this.filePermissionsEnforced = ["", "-wal", "-shm"].every((suffix) =>
+      restrictToOwner(`${databasePath}${suffix}`, 0o600),
+    );
+    this.migration = applyMigrations(this.db, databasePath);
+    this.transcripts = new TranscriptArchive(this.db);
+    this.usage = new UsageStore(this.db);
+    this.signals = new SignalStore(this.db);
     this.db.prepare("INSERT OR REPLACE INTO meta(key, value) VALUES ('epoch', ?)").run(this.epoch);
     this.db.prepare("INSERT OR REPLACE INTO meta(key, value) VALUES ('revision', '0')").run();
 
@@ -436,6 +671,24 @@ export class CollectorRepository {
 
   close(): void {
     this.db.close();
+  }
+
+  /**
+   * Rewrites the database file so pages freed by a delete stop holding their old
+   * contents. Cannot run inside a transaction, so it is never part of one.
+   */
+  vacuum(): void {
+    this.db.exec("VACUUM");
+  }
+
+  /**
+   * Throws unless this connection can take the database exclusively, which is as
+   * close as SQLite gets to asking "is anyone else here?". Acquired and released
+   * immediately: the answer is what the caller wants, not the lock.
+   */
+  probeExclusive(): void {
+    this.db.exec("BEGIN EXCLUSIVE");
+    this.db.exec("ROLLBACK");
   }
 
   subscribe(listener: (change: RepositoryChange) => void): () => void {
@@ -766,11 +1019,542 @@ export class CollectorRepository {
     };
   }
 
+  /**
+   * Agent roster upsert. An authoritative `roster` entry is never downgraded to
+   * `observed` by a later inference, and `runtime`/`model` are only widened so a
+   * partial observation cannot erase known facts.
+   */
+  upsertAgents(writes: AgentWrite[]): number {
+    if (writes.length === 0) return 0;
+    const authoritative = this.db.prepare(agentUpsertSql("excluded"));
+    const subordinate = this.db.prepare(agentUpsertSql("agents"));
+    const findExisting = this.db.prepare("SELECT origin, fingerprint FROM agents WHERE id = ?");
+    let changed = 0;
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      for (const write of writes) {
+        const fingerprint = agentFingerprint(write);
+        const existing = findExisting.get(write.id) as { origin?: string; fingerprint?: string } | undefined;
+        // An inferred write carries a placeholder display name and an unknown
+        // kind. Those are real values, not nulls, so COALESCE cannot protect the
+        // authoritative row — and inference runs far more often than the roster
+        // refresh, so without this guard the roster is clobbered within seconds.
+        const held = existing?.origin === "roster" && write.origin !== "roster";
+        const stored = held ? existing.fingerprint : fingerprint;
+        if (existing?.fingerprint !== stored) changed += 1;
+        (held ? subordinate : authoritative).run(
+          write.id,
+          write.displayName,
+          write.kind,
+          write.runtime ?? null,
+          write.model ?? null,
+          write.origin,
+          write.observedAt,
+          write.lastActivityAt ?? null,
+          fingerprint,
+        );
+      }
+      this.db.exec("COMMIT");
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
+    if (changed > 0) {
+      this.bumpRevision();
+      this.emit([], ["agents_upserted"], ["agents"]);
+    }
+    return changed;
+  }
+
+  listAgents(): AgentSummary[] {
+    const rows = this.db
+      .prepare("SELECT * FROM agents ORDER BY COALESCE(last_activity_at, first_observed_at) DESC, id ASC")
+      .all() as ActivityRow[];
+    return rows.map(rowToAgent);
+  }
+
+  /**
+   * Session archive upsert.
+   *
+   * Current-truth fields (label, archived, active run, category, placement hint)
+   * take the incoming value. Write-once lineage facts are merged with COALESCE
+   * because Gateway rows can omit them, and a partial observation must not erase
+   * a fork source or subagent role that was already established.
+   */
+  upsertSessions(writes: SessionWrite[]): number {
+    if (writes.length === 0) return 0;
+    const statement = this.db.prepare(`
+      INSERT INTO sessions (
+        session_key, session_id, agent_id, label, runtime, model, category, kind_hint,
+        archived, has_active_run, placement, parent_session_key, previous_session_id,
+        fork_source_key, spawned_by, spawn_depth, subagent_role, worktree_branch,
+        created_at, last_activity_at, last_observed_at, coverage_json, fingerprint
+      ) VALUES (
+        ?, ?, ?, ?, ?, ?, ?, ?,
+        ?, ?, ?, ?, ?,
+        ?, ?, ?, ?, ?,
+        ?, ?, ?, ?, ?
+      )
+      ON CONFLICT(session_key) DO UPDATE SET
+        session_id = COALESCE(excluded.session_id, sessions.session_id),
+        agent_id = excluded.agent_id,
+        label = excluded.label,
+        runtime = COALESCE(excluded.runtime, sessions.runtime),
+        model = COALESCE(excluded.model, sessions.model),
+        category = excluded.category,
+        kind_hint = excluded.kind_hint,
+        archived = excluded.archived,
+        has_active_run = excluded.has_active_run,
+        placement = COALESCE(excluded.placement, sessions.placement),
+        parent_session_key = COALESCE(excluded.parent_session_key, sessions.parent_session_key),
+        previous_session_id = COALESCE(excluded.previous_session_id, sessions.previous_session_id),
+        fork_source_key = COALESCE(excluded.fork_source_key, sessions.fork_source_key),
+        spawned_by = COALESCE(excluded.spawned_by, sessions.spawned_by),
+        spawn_depth = COALESCE(excluded.spawn_depth, sessions.spawn_depth),
+        subagent_role = COALESCE(excluded.subagent_role, sessions.subagent_role),
+        worktree_branch = COALESCE(excluded.worktree_branch, sessions.worktree_branch),
+        created_at = COALESCE(sessions.created_at, excluded.created_at),
+        last_activity_at = MAX(excluded.last_activity_at, sessions.last_activity_at),
+        last_observed_at = MAX(excluded.last_observed_at, sessions.last_observed_at),
+        coverage_json = excluded.coverage_json,
+        fingerprint = excluded.fingerprint
+    `);
+    const findFingerprint = this.db.prepare("SELECT fingerprint FROM sessions WHERE session_key = ?");
+    let changed = 0;
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      for (const write of writes) {
+        const fingerprint = sessionFingerprint(write);
+        const existing = findFingerprint.get(write.sessionKey) as { fingerprint?: string } | undefined;
+        if (existing?.fingerprint !== fingerprint) changed += 1;
+        statement.run(
+          write.sessionKey,
+          write.sessionId ?? null,
+          write.agentId,
+          write.label,
+          write.runtime ?? null,
+          write.model ?? null,
+          write.category ?? null,
+          write.kindHint,
+          write.archived ? 1 : 0,
+          write.hasActiveRun ? 1 : 0,
+          write.placement ?? null,
+          write.lineage.parentSessionKey ?? null,
+          write.lineage.previousSessionId ?? null,
+          write.lineage.forkSourceKey ?? null,
+          write.lineage.spawnedBy ?? null,
+          write.lineage.spawnDepth ?? null,
+          write.lineage.subagentRole ?? null,
+          write.lineage.worktreeBranch ?? null,
+          write.createdAt ?? null,
+          write.lastActivityAt,
+          write.observedAt,
+          JSON.stringify(write.coverage),
+          fingerprint,
+        );
+      }
+      this.db.exec("COMMIT");
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
+    // Reconciles run every few seconds and are usually no-ops, so only a real
+    // fingerprint change earns a revision bump and an invalidate frame.
+    if (changed > 0) {
+      this.bumpRevision();
+      this.emit([], ["sessions_upserted"], ["sessions"]);
+    }
+    return changed;
+  }
+
+  getSession(sessionKey: string): SessionRecord | undefined {
+    const row = this.db
+      .prepare(`
+        SELECT s.*, (SELECT COUNT(*) FROM activities a WHERE a.session_ref = s.session_key) AS activity_count,
+               EXISTS(SELECT 1 FROM session_usage_snapshots u WHERE u.session_key = s.session_key) AS has_usage,
+               ${SIGNAL_BRIEF_COLUMNS}
+        FROM sessions s WHERE s.session_key = ?
+      `)
+      .get(sessionKey) as ActivityRow | undefined;
+    return row ? this.withUsageCoverage(rowToSessionRecord(row), row) : undefined;
+  }
+
+  listSessions(query: SessionListQuery = {}): SessionSummary[] {
+    const conditions: string[] = [];
+    const parameters: Array<string | number> = [];
+    if (query.agentId !== undefined) {
+      conditions.push("s.agent_id = ?");
+      parameters.push(query.agentId);
+    }
+    if (query.includeArchived !== true) conditions.push("s.archived = 0");
+    const where = conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : "";
+    parameters.push(query.limit ?? 100);
+    const rows = this.db
+      .prepare(`
+        SELECT s.*, (SELECT COUNT(*) FROM activities a WHERE a.session_ref = s.session_key) AS activity_count
+        FROM sessions s
+        ${where}
+        ORDER BY s.last_activity_at DESC, s.session_key ASC
+        LIMIT ?
+      `)
+      .all(...parameters) as ActivityRow[];
+    return rows.map(rowToSessionSummary);
+  }
+
+  /**
+   * Keyset-paginated session list.
+   *
+   * Fetches one row beyond the limit to decide whether a next page exists,
+   * which avoids a second COUNT query whose answer would already be stale by
+   * the time the page is served.
+   */
+  listSessionsPage(query: SessionPageQuery): SessionPage {
+    const conditions: string[] = [];
+    const parameters: Array<string | number> = [];
+
+    if (query.agentId !== undefined) {
+      conditions.push("s.agent_id = ?");
+      parameters.push(query.agentId);
+    }
+    if (query.state === "active") conditions.push("s.archived = 0 AND s.has_active_run = 1");
+    else if (query.state === "terminal") conditions.push("s.archived = 0 AND s.has_active_run = 0");
+    else if (query.state === "archived") conditions.push("s.archived = 1");
+    if (query.grade !== undefined) {
+      // A session with no stored row reads as `unscored`, which is what it is:
+      // the recompute pass has not reached it yet.
+      conditions.push(`COALESCE(${SIGNAL_GRADE_SUBQUERY}, 'unscored') = ?`);
+      parameters.push(query.grade);
+    }
+    if (query.since !== undefined) {
+      conditions.push("s.last_activity_at >= ?");
+      parameters.push(query.since);
+    }
+    if (query.until !== undefined) {
+      conditions.push("s.last_activity_at <= ?");
+      parameters.push(query.until);
+    }
+
+    // Sorting on an expression requires the cursor comparison to repeat that
+    // exact expression, so both are derived from one definition.
+    const sortExpression = ((): string => {
+      switch (query.sort) {
+        case "lastActivity":
+          return "s.last_activity_at";
+        case "duration":
+          return "(s.last_activity_at - COALESCE(s.created_at, s.last_activity_at))";
+        case "cost":
+          // A descending scan needs a number for every row, so a session that
+          // was never priced sorts as zero and lands at the bottom. Its usage
+          // coverage is what tells the reader that zero is not a measurement.
+          return `COALESCE((
+            SELECT u.cost_micro_usd FROM session_usage_snapshots u
+            WHERE u.session_key = s.session_key
+            ORDER BY u.observed_at DESC LIMIT 1
+          ), 0)`;
+        case "grade":
+          // Worst first, which is the order a review pass wants. Unscored ranks
+          // lowest so rows the scorer could not judge sit below every judged one.
+          return `CASE ${SIGNAL_GRADE_SUBQUERY}
+            ${(Object.entries(GRADE_SEVERITY) as Array<[string, number]>)
+              .filter(([grade]) => grade !== "unscored")
+              .map(([grade, rank]) => `WHEN '${grade}' THEN ${rank}`)
+              .join("\n            ")}
+            ELSE ${GRADE_SEVERITY.unscored} END`;
+        default: {
+          const exhaustive: never = query.sort;
+          throw new Error(`Unhandled session sort: ${String(exhaustive)}`);
+        }
+      }
+    })();
+
+    if (query.cursor) {
+      // Strict inequality on the tiebreaker prevents re-emitting the boundary row.
+      conditions.push(`(${sortExpression} < ? OR (${sortExpression} = ? AND s.session_key > ?))`);
+      parameters.push(query.cursor.value, query.cursor.value, query.cursor.sessionKey);
+    }
+
+    const where = conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : "";
+    parameters.push(query.limit + 1);
+
+    const rows = this.db
+      .prepare(`
+        SELECT s.*, ${sortExpression} AS sort_value,
+               (SELECT COUNT(*) FROM activities a WHERE a.session_ref = s.session_key) AS activity_count,
+               EXISTS(SELECT 1 FROM session_usage_snapshots u WHERE u.session_key = s.session_key) AS has_usage,
+               ${SIGNAL_BRIEF_COLUMNS}
+        FROM sessions s
+        ${where}
+        ORDER BY sort_value DESC, s.session_key ASC
+        LIMIT ?
+      `)
+      .all(...parameters) as ActivityRow[];
+
+    const hasMore = rows.length > query.limit;
+    const page = hasMore ? rows.slice(0, query.limit) : rows;
+    const items = page.map((row) => this.withUsageCoverage(rowToSessionSummary(row), row));
+    const last = page.at(-1);
+    if (!hasMore || !last) return { items };
+
+    return {
+      items,
+      nextCursor: encodeCursor({
+        sort: query.sort,
+        value: Number(last.sort_value ?? 0),
+        sessionKey: String(last.session_key),
+      }),
+    };
+  }
+
+  /**
+   * Roster joined with per-agent session counts.
+   *
+   * Aggregated in SQL rather than by loading sessions into memory, because the
+   * roster is small but the session archive is not bounded by the UI's page size.
+   */
+  listAgentOverviews(rangeEnd = Date.now()): AgentOverview[] {
+    const rows = this.db
+      .prepare(`
+        SELECT a.*,
+               COUNT(s.session_key) AS session_count,
+               COALESCE(SUM(CASE WHEN s.has_active_run = 1 AND s.archived = 0 THEN 1 ELSE 0 END), 0) AS active_count,
+               COALESCE(SUM(CASE WHEN s.archived = 1 THEN 1 ELSE 0 END), 0) AS archived_count,
+               MAX(s.last_activity_at) AS last_session_activity_at
+        FROM agents a
+        LEFT JOIN sessions s ON s.agent_id = a.id
+        GROUP BY a.id
+        ORDER BY COALESCE(MAX(s.last_activity_at), a.last_activity_at, a.first_observed_at) DESC, a.id ASC
+      `)
+      .all() as ActivityRow[];
+
+    const activityCounts = new Map<string, number>(
+      (this.db.prepare("SELECT agent_id, COUNT(*) AS c FROM activities GROUP BY agent_id").all() as ActivityRow[]).map(
+        (row) => [String(row.agent_id), Number(row.c ?? 0)],
+      ),
+    );
+
+    const recent = {
+      "24h": this.agentRollups("24h", rangeEnd),
+      "7d": this.agentRollups("7d", rangeEnd),
+    };
+    const agentIds = rows.map((row) => String(row.id));
+    const costWindows = this.usage.agentWindows(agentIds, rangeEnd);
+    const usageCoverage = this.usageCoverage;
+
+    return rows.map((row) => {
+      const id = String(row.id);
+      return {
+        ...rowToAgent(row),
+        sessionCount: Number(row.session_count ?? 0),
+        activeSessionCount: Number(row.active_count ?? 0),
+        archivedSessionCount: Number(row.archived_count ?? 0),
+        activityCount: activityCounts.get(id) ?? 0,
+        ...(asNumber(row.last_session_activity_at) !== undefined
+          ? { lastSessionActivityAt: asNumber(row.last_session_activity_at) }
+          : {}),
+        recent: {
+          "24h": recent["24h"].get(id) ?? emptyRollup(),
+          "7d": recent["7d"].get(id) ?? emptyRollup(),
+        },
+        cost: {
+          coverage: usageCoverage,
+          source: "snapshots" as const,
+          windows: costWindows.get(id) ?? { "24h": emptyUsageTotals(), "7d": emptyUsageTotals() },
+        },
+      };
+    });
+  }
+
+  /**
+   * Coverage for the usage panes, set by the collection loop.
+   *
+   * Held here rather than derived from the rows because "no usage stored" and
+   * "usage could not be collected" look identical in the table and mean
+   * opposite things on a cost view.
+   */
+  private usageCoverage: SessionUsageCoverage = "not_observed";
+
+  /**
+   * Replaces the coverage the session projector wrote with what the usage loop
+   * actually achieved for this row.
+   *
+   * The stored value comes from `sessions.list`, which knows nothing about
+   * usage, so it would report `not_observed` forever. A session that has a
+   * stored reading but has not been refreshed this run reads as `snapshot`
+   * rather than `live`, which is the honest description after a restart.
+   */
+  private withUsageCoverage<T extends SessionSummary>(session: T, row: ActivityRow): T {
+    const hasSnapshot = Number(row.has_usage ?? 0) === 1;
+    const usage: SessionUsageCoverage =
+      this.usageCoverage === "unavailable" || this.usageCoverage === "unauthorized"
+        ? this.usageCoverage
+        : !hasSnapshot
+          // `unreported` outranks `not_observed` for a session the loop did read
+          // and the Gateway had no usage to give: a different instruction to the
+          // reader than "not read yet".
+          ? this.unreportedUsage.has(session.sessionKey)
+            ? "unreported"
+            : "not_observed"
+          : this.usageCoverage === "not_observed"
+            ? "snapshot"
+            : this.usageCoverage;
+    return { ...session, coverage: { ...session.coverage, usage } };
+  }
+
+  setUsageCoverage(coverage: SessionUsageCoverage): void {
+    this.usageCoverage = coverage;
+  }
+
+  /**
+   * Sessions the usage endpoint answered for while reporting nothing.
+   *
+   * Not stored: it describes the last round rather than the session, and a
+   * restart should go back to saying "not read yet" instead of asserting that a
+   * session has no accounting on evidence it no longer holds.
+   */
+  private unreportedUsage: ReadonlySet<string> = new Set();
+
+  setUnreportedUsageSessions(sessionKeys: readonly string[]): void {
+    this.unreportedUsage = new Set(sessionKeys);
+  }
+
+  getUsageCoverage(): SessionUsageCoverage {
+    return this.usageCoverage;
+  }
+
+  /**
+   * Terminal-activity rollup per agent for one window.
+   *
+   * Duration is averaged only over runs that reported both a start and an end.
+   * Falling back to `updated_at` would let the reconcile cadence, rather than
+   * the run, decide the number.
+   */
+  private agentRollups(window: AgentRollupWindow, rangeEnd: number): Map<string, AgentActivityRollup> {
+    const rangeStart = rangeEnd - AGENT_ROLLUP_WINDOW_MS[window];
+    const rows = this.db
+      .prepare(`
+        SELECT agent_id,
+               outcome,
+               COUNT(*) AS run_count,
+               SUM(CASE WHEN started_at IS NOT NULL AND ended_at IS NOT NULL AND ended_at >= started_at
+                        THEN 1 ELSE 0 END) AS duration_samples,
+               SUM(CASE WHEN started_at IS NOT NULL AND ended_at IS NOT NULL AND ended_at >= started_at
+                        THEN ended_at - started_at ELSE 0 END) AS duration_total
+        FROM activities
+        WHERE state = 'terminal'
+          AND COALESCE(ended_at, updated_at) >= ?
+          AND COALESCE(ended_at, updated_at) <= ?
+        GROUP BY agent_id, outcome
+      `)
+      .all(rangeStart, rangeEnd) as ActivityRow[];
+
+    const byAgent = new Map<string, AgentActivityRollup>();
+    const durationTotals = new Map<string, number>();
+
+    for (const row of rows) {
+      const agentId = String(row.agent_id);
+      const rollup = byAgent.get(agentId) ?? emptyRollup();
+      const runCount = Number(row.run_count ?? 0);
+      rollup.completed += runCount;
+      switch (row.outcome as ActivityOutcome) {
+        case "succeeded": rollup.succeeded += runCount; break;
+        case "failed": rollup.failed += runCount; break;
+        case "cancelled": rollup.cancelled += runCount; break;
+        case "timed_out": rollup.timedOut += runCount; break;
+        case "blocked": rollup.blocked += runCount; break;
+        case "unknown": rollup.unknown += runCount; break;
+        case "none": break;
+        default: {
+          const exhaustive: never = row.outcome as never;
+          throw new Error(`Unhandled activity outcome: ${String(exhaustive)}`);
+        }
+      }
+      rollup.durationSampleCount += Number(row.duration_samples ?? 0);
+      durationTotals.set(agentId, (durationTotals.get(agentId) ?? 0) + Number(row.duration_total ?? 0));
+      byAgent.set(agentId, rollup);
+    }
+
+    for (const [agentId, rollup] of byAgent) {
+      if (rollup.completed > 0) rollup.successRate = rollup.succeeded / rollup.completed;
+      if (rollup.durationSampleCount > 0) {
+        rollup.avgDurationMs = Math.round((durationTotals.get(agentId) ?? 0) / rollup.durationSampleCount);
+      }
+    }
+    return byAgent;
+  }
+
+  getAgentOverview(agentId: string, rangeEnd = Date.now()): AgentOverview | undefined {
+    return this.listAgentOverviews(rangeEnd).find((agent) => agent.id === agentId);
+  }
+
+  /** Activity timeline for one session, newest first. */
+  /**
+   * Projected like every other list: the stored row carries the Gateway's task ids
+   * and run refs, which this timeline has no use for and which the rest of the API
+   * keeps out of responses.
+   */
+  listSessionActivities(sessionKey: string, limit = 200): ActivityItem[] {
+    const rows = this.db
+      .prepare(`
+        SELECT * FROM activities
+        WHERE session_ref = ? OR session_key = ?
+        ORDER BY last_observed_at DESC, id ASC
+        LIMIT ?
+      `)
+      .all(sessionKey, sessionKey, limit) as ActivityRow[];
+    return rows.map((row) => publicItem(rowToStored(row)));
+  }
+
+  /**
+   * Promotes claimed `session_key` values to confirmed `session_ref` foreign keys
+   * once the matching Session row exists. Activities whose session has not been
+   * observed yet keep a null ref, which is a legitimate state rather than an error.
+   */
+  linkActivitySessions(): number {
+    const result = this.db
+      .prepare(`
+        UPDATE activities
+        SET session_ref = session_key
+        WHERE session_ref IS NULL
+          AND session_key IS NOT NULL
+          AND session_key IN (SELECT session_key FROM sessions)
+      `)
+      .run();
+    return Number(result.changes);
+  }
+
   prune(cutoff: number): number {
     const result = this.db
       .prepare("DELETE FROM activities WHERE catalog = 'terminal_history' AND updated_at < ?")
       .run(cutoff);
     this.db.prepare("DELETE FROM observations WHERE activity_id NOT IN (SELECT id FROM activities)").run();
+    return Number(result.changes);
+  }
+
+  /**
+   * Session archives outlive terminal Activity on purpose, so only archived
+   * sessions age out. Transcripts go first: they have no foreign key to ride out
+   * on, and `activities.session_ref` is a plain column, so both are cleaned up
+   * here rather than by the database.
+   */
+  pruneSessions(cutoff: number): number {
+    const doomed = (
+      this.db
+        .prepare("SELECT session_key FROM sessions WHERE archived = 1 AND last_activity_at < ?")
+        .all(cutoff) as Array<Record<string, unknown>>
+    ).map((row) => String(row.session_key));
+    if (doomed.length === 0) return 0;
+
+    this.transcripts.dropSessions(doomed);
+    const result = this.db
+      .prepare("DELETE FROM sessions WHERE archived = 1 AND last_activity_at < ?")
+      .run(cutoff);
+    this.db
+      .prepare(`
+        UPDATE activities SET session_ref = NULL
+        WHERE session_ref IS NOT NULL
+          AND session_ref NOT IN (SELECT session_key FROM sessions)
+      `)
+      .run();
     return Number(result.changes);
   }
 
@@ -793,8 +1577,8 @@ export class CollectorRepository {
     this.db.prepare("UPDATE meta SET value = ? WHERE key = 'revision'").run(String(this.currentRevision));
   }
 
-  private emit(ids: string[], reasons: string[]): RepositoryChange {
-    const change = { epoch: this.epoch, revision: this.currentRevision, ids, reasons };
+  private emit(ids: string[], reasons: string[], topics: ChangeTopic[] = ["activities"]): RepositoryChange {
+    const change = { epoch: this.epoch, revision: this.currentRevision, topics, ids, reasons };
     for (const listener of this.listeners) listener(change);
     return change;
   }

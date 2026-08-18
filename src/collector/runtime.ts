@@ -600,6 +600,20 @@ export class CollectorRuntime {
         available: new Set(this.gatewayHello?.features.methods ?? []).has("chat.history"),
         primaryHealthy: this.sources.get("sessions")?.state === "live",
       });
+      // An open transcript has no other way to learn that this round added to it:
+      // the archive is pulled on a timer, and without this frame a reader watching
+      // a live conversation sits on whatever was there when the page loaded.
+      // Counts and topic only — the frame never carries message text, and no
+      // session key, since a key is enough to say who was talking to whom.
+      if (this.transcriptStatus.inserted > 0) {
+        this.emitChange({
+          epoch: this.repository.epoch,
+          revision: this.repository.revision,
+          topics: ["messages"],
+          ids: [],
+          reasons: ["transcript_sync"],
+        });
+      }
     } catch (error) {
       // Closed-set code only: invariant 2 keeps transcript text out of logs.
       this.transcriptStatus = {

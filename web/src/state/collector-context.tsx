@@ -48,7 +48,7 @@ export type CollectorContextValue = {
   subscribeTopics: (topics: readonly ChangeTopic[], listener: () => void) => () => void;
 };
 
-const ALL_TOPICS: ChangeTopic[] = ["activities", "sessions", "usage", "agents"];
+const ALL_TOPICS: ChangeTopic[] = ["activities", "sessions", "usage", "agents", "messages"];
 
 const CollectorContext = createContext<CollectorContextValue | undefined>(undefined);
 

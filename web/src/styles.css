@@ -351,8 +351,8 @@ button { color: inherit; }
 .session-state { color: var(--secondary); font-size: 9px; text-align: right; }
 .session-state[data-active="true"] { color: #277540; font-weight: 640; }
 .session-count, .session-seen { color: var(--secondary); font-size: 9px; text-align: right; font-variant-numeric: tabular-nums; }
-.session-load-more { margin-top: 11px; padding: 8px 14px; border: 1px solid var(--line); border-radius: 10px; background: #fff; color: var(--ink); font-size: 10px; cursor: pointer; }
-.session-load-more:disabled { color: var(--tertiary); cursor: default; }
+.session-load-more, .transcript-more { margin-top: 11px; padding: 8px 14px; border: 1px solid var(--line); border-radius: 10px; background: #fff; color: var(--ink); font-size: 10px; cursor: pointer; }
+.session-load-more:disabled, .transcript-more:disabled { color: var(--tertiary); cursor: default; }
 
 .session-detail .session-key { display: block; margin-top: 4px; color: var(--tertiary); font-size: 9px; }
 .detail-badges { display: flex; align-items: center; gap: 8px; }
@@ -382,6 +382,7 @@ button { color: inherit; }
 .transcript-search .eyebrow { margin-bottom: 0; font-size: 8px; }
 .transcript-search input { min-height: 29px; padding: 0 8px; border: 1px solid var(--line); border-radius: 9px; font-size: 10px; }
 .transcript-search small { font-size: 8px; }
+.transcript-truncation { margin: 0 0 8px; font-size: 9px; }
 .transcript { margin: 0; padding: 0; list-style: none; display: grid; gap: 8px; }
 .transcript-message { padding: 9px 11px; border-radius: 11px; background: var(--canvas); }
 .transcript-message[data-role="assistant"] { background: rgba(0,122,255,.05); }

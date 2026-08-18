@@ -115,14 +115,23 @@ function UsagePanel({ usage, coverage }: { usage?: SessionUsage; coverage: strin
   );
 }
 
-function TranscriptPanel({ sessionKey }: { sessionKey: string }) {
+function TranscriptPanel({ sessionKey, revision }: { sessionKey: string; revision: number }) {
   const [messages, setMessages] = useState<ArchivedMessage[]>();
   const [sync, setSync] = useState<TranscriptSyncState>();
   const [error, setError] = useState<string>();
+  const [loadingMore, setLoadingMore] = useState(false);
   const [query, setQuery] = useState("");
+  const [hits, setHits] = useState<ArchivedMessage[]>();
+  const [searching, setSearching] = useState(false);
 
   useEffect(() => {
     let active = true;
+    // Reset first. Held state belongs to the session that has just been left, and
+    // rendering it under the new key puts one conversation's text on another
+    // conversation's page for as long as the request takes.
+    setMessages(undefined);
+    setSync(undefined);
+    setError(undefined);
     void (async () => {
       try {
         const page = await collectorApi.sessionMessages(sessionKey);
@@ -138,11 +147,77 @@ function TranscriptPanel({ sessionKey }: { sessionKey: string }) {
     };
   }, [sessionKey]);
 
-  const matched = useMemo(() => {
-    const needle = query.trim().toLowerCase();
-    if (needle.length === 0) return messages ?? [];
-    return (messages ?? []).filter((message) => message.content.toLowerCase().includes(needle));
-  }, [messages, query]);
+  /**
+   * Extends the loaded range from the highest sequence already on screen.
+   *
+   * Serves both the button and the sync loop, because from here they are the same
+   * request. Appending rather than reloading is what keeps a reader who has paged
+   * through a long transcript where they were.
+   */
+  const extend = useCallback(async () => {
+    const loaded = messages;
+    if (!loaded || loaded.length === 0) return;
+    setLoadingMore(true);
+    try {
+      const page = await collectorApi.sessionMessages(sessionKey, loaded[loaded.length - 1]!.seq);
+      setMessages((current) => [...(current ?? []), ...page.messages]);
+      setSync(page.sync);
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : String(cause));
+    } finally {
+      setLoadingMore(false);
+    }
+  }, [messages, sessionKey]);
+
+  const extendRef = useRef(extend);
+  useEffect(() => {
+    extendRef.current = extend;
+  }, [extend]);
+
+  // A round of transcript sync that added messages. Without this an open
+  // transcript stays frozen at the moment the page loaded, while the sync loop
+  // keeps archiving the conversation the reader is watching.
+  useEffect(() => {
+    if (revision === 0) return;
+    void extendRef.current();
+  }, [revision]);
+
+  /**
+   * Searching runs against the archive, not against what happens to be on
+   * screen. Filtering the loaded page locally made this box disagree with the
+   * cross-session search: a phrase further down the transcript was reported as
+   * absent here while the other search found it.
+   */
+  useEffect(() => {
+    const needle = query.trim();
+    if (needle.length === 0) {
+      setHits(undefined);
+      return;
+    }
+    let active = true;
+    setSearching(true);
+    const timer = setTimeout(() => {
+      void (async () => {
+        try {
+          const result = await collectorApi.searchMessages({ q: needle, sessionKey }, 200);
+          if (active) setHits(result.hits.map((hit) => hit.message));
+        } catch (cause) {
+          if (active) setError(cause instanceof Error ? cause.message : String(cause));
+        } finally {
+          if (active) setSearching(false);
+        }
+      })();
+    }, 200);
+    return () => {
+      active = false;
+      clearTimeout(timer);
+    };
+  }, [query, sessionKey]);
+
+  const searchActive = query.trim().length > 0;
+  const shown = searchActive ? (hits ?? []) : (messages ?? []);
+  const archived = sync?.syncedCount ?? 0;
+  const remaining = messages === undefined ? 0 : Math.max(0, archived - messages.length);
 
   return (
     <div className="detail-panel transcript-panel">
@@ -165,12 +240,24 @@ function TranscriptPanel({ sessionKey }: { sessionKey: string }) {
         <label className="transcript-search">
           <span className="eyebrow">FIND IN TRANSCRIPT</span>
           <input type="search" value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Search this session" />
-          {query.trim() ? <small className="muted">{matched.length} of {messages.length} messages</small> : null}
+          {searchActive ? (
+            <small className="muted">
+              {searching ? "searching the archive…" : `${shown.length} matching ${shown.length === 1 ? "message" : "messages"}`}
+            </small>
+          ) : null}
         </label>
       ) : null}
 
+      {/* The list is paged, so how much of the transcript is on screen is stated
+          rather than left to be inferred from where the scrollbar stops. */}
+      {!searchActive && messages && remaining > 0 ? (
+        <p className="transcript-truncation muted">
+          Showing the oldest {messages.length} of {archived} archived messages.
+        </p>
+      ) : null}
+
       <ol className="transcript">
-        {matched.map((message) => (
+        {shown.map((message) => (
           <li key={message.id} className="transcript-message" data-role={message.role}>
             <header>
               <span className="transcript-role">{message.role}</span>
@@ -188,6 +275,12 @@ function TranscriptPanel({ sessionKey }: { sessionKey: string }) {
           </li>
         ))}
       </ol>
+
+      {!searchActive && remaining > 0 ? (
+        <button type="button" className="transcript-more" onClick={() => void extend()} disabled={loadingMore}>
+          {loadingMore ? "Loading…" : `Load ${Math.min(remaining, 200)} more`}
+        </button>
+      ) : null}
     </div>
   );
 }
@@ -220,6 +313,9 @@ export function SessionDetailView({ sessionKey }: { sessionKey: string }) {
   const [detail, setDetail] = useState<SessionDetailData>();
   const [activities, setActivities] = useState<ActivityItem[]>();
   const [error, setError] = useState<string>();
+  // Counts rounds of transcript sync that added something, which is what tells
+  // the panel below to pick up messages archived since the page opened.
+  const [transcriptRevision, setTranscriptRevision] = useState(0);
 
   // Change events can arrive faster than a fetch completes, and the key changes
   // when the reader follows a link from here. Only the newest request may write:
@@ -251,6 +347,11 @@ export function SessionDetailView({ sessionKey }: { sessionKey: string }) {
     void reload();
     return subscribeTopics(["sessions", "activities", "usage"], () => void reload());
   }, [reload, subscribeTopics]);
+
+  useEffect(
+    () => subscribeTopics(["messages"], () => setTranscriptRevision((current) => current + 1)),
+    [subscribeTopics],
+  );
 
   if (error) {
     return (
@@ -327,7 +428,7 @@ export function SessionDetailView({ sessionKey }: { sessionKey: string }) {
         <TimelinePanel activities={activities} />
       </div>
 
-      <TranscriptPanel sessionKey={sessionKey} />
+      <TranscriptPanel sessionKey={sessionKey} revision={transcriptRevision} />
     </section>
   );
 }

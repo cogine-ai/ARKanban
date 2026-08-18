@@ -500,7 +500,7 @@ export type SettledSeriesRuns = {
   runs: SettledRunSummary[];
 };
 
-export type ChangeTopic = "activities" | "sessions" | "usage" | "agents";
+export type ChangeTopic = "activities" | "sessions" | "usage" | "agents" | "messages";
 
 export type CollectorChange = {
   epoch: string;

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import type { AgentOverview } from "../../../src/contracts";
 import { collectorApi } from "../api";
 import { useCollector } from "./collector-context";
@@ -20,12 +20,19 @@ export function useAgents(): {
   const [agents, setAgents] = useState<AgentOverview[]>();
   const [error, setError] = useState<string>();
 
+  // Those four topics can fire faster than the roster comes back, and only the
+  // newest answer may be written: an earlier one landing later would put stale
+  // rollups on the cards, or revive an error the retry had already cleared.
+  const generation = useRef(0);
   const reload = useCallback(async () => {
+    const requested = (generation.current += 1);
     try {
       const response = await collectorApi.agents();
+      if (requested !== generation.current) return;
       setAgents(response.agents);
       setError(undefined);
     } catch (cause) {
+      if (requested !== generation.current) return;
       setError(cause instanceof Error ? cause.message : String(cause));
     }
   }, []);

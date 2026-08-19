@@ -382,6 +382,8 @@ export class CollectorRuntime {
       this.sessionFields.reset();
       this.agentFields.reset();
       this.usageFields.reset();
+      this.messageFields.reset();
+      this.auditFields.reset();
       // Prices are held in memory against a specific Gateway's pricing table,
       // so they do not survive a reconnect either.
       this.usage.resetCost();

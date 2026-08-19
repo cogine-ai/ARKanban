@@ -141,7 +141,8 @@ export class AuditSynchronizer {
       }
       if (page.nextCursor === undefined) {
         // Read from the newest record to the oldest one the Gateway still keeps,
-        // which settles both questions at once.
+        // which settles both questions at once. A page whose rows were all
+        // unreadable is not that: it carries a cursor, so the walk continues.
         caughtUp = true;
         complete = true;
         this.deps.store.writeBackfillComplete(true);
@@ -227,9 +228,12 @@ export class AuditSynchronizer {
       inserted += result.inserted;
       for (const key of result.sessionKeys) gained.add(key);
 
-      // No readable record below the cursor is the end of the trail as far as this
-      // collector can ever see it.
-      if (page.writes.length === 0 || page.nextCursor === undefined) {
+      // The absence of a cursor is the end of the trail, and the only thing that
+      // is: a page this build could read nothing on still says where the older
+      // records are, and calling that the end would set a flag that stops this
+      // walk permanently. Walking an unreadable stretch costs requests without
+      // storing anything, which the round budget already bounds.
+      if (page.nextCursor === undefined) {
         this.deps.store.writeBackfillComplete(true);
         return { requests, inserted, complete: true };
       }

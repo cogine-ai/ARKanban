@@ -347,6 +347,22 @@ describe("SignalStore evidence", () => {
     });
   });
 
+  /**
+   * The verdict on record belongs to a run that already ended, and this session is
+   * running now. Its own activity rows can be silent about earlier runs — they age
+   * out a year sooner than the trail does — so the fallback has to check.
+   */
+  it("does not settle a session that is still running from an earlier run's verdict", () => {
+    const repo = repository();
+    session(repo, "agent:builder:still-going", { hasActiveRun: true, lastActivityAt: NOW - 9 * 60 * 60 * 1_000 });
+    auditRun(repo, "agent:builder:still-going", 1, "succeeded", NOW - 9 * 60 * 60 * 1_000);
+
+    const signals = repo.signals.recompute("agent:builder:still-going", NOW);
+
+    expect(signals?.outcome).toBe("unknown");
+    expect(signals?.grade).toBe("unscored");
+  });
+
   it("does not let a run verdict overrule an outcome the Activity rows classified", () => {
     const repo = repository();
     session(repo, "agent:builder:contested");

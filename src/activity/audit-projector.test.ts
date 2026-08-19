@@ -129,12 +129,22 @@ describe("projectAuditPage", () => {
   });
 
   /**
-   * The cursor means "sequence below this one", so a page whose records were all
-   * unreadable leaves nothing to continue from — following its cursor would send
-   * the next round back to the same page for as long as the build stayed broken.
+   * The cursor comes from the Gateway's own last row rather than from what this
+   * projector kept, so it still points below the page even when every record on it
+   * was dropped. Withholding it would report an unreadable stretch as the end of
+   * the trail, and the end of the trail is the one answer that stops the backwards
+   * walk permanently.
    */
-  it("withholds a cursor from a page that yielded nothing", () => {
+  it("passes on the cursor from a page that yielded nothing", () => {
     const page = projectAuditPage({ events: [event({ eventId: undefined })], nextCursor: "40" }, { observedAt: NOW });
+
+    expect(page.writes).toEqual([]);
+    expect(page.dropped).toBe(1);
+    expect(page.nextCursor).toBe("40");
+  });
+
+  it("reports no cursor when the Gateway sent none", () => {
+    const page = projectAuditPage({ events: [event({})] }, { observedAt: NOW });
 
     expect(page.nextCursor).toBeUndefined();
   });

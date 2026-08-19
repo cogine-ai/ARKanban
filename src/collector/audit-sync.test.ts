@@ -209,6 +209,65 @@ describe("AuditSynchronizer tail", () => {
   });
 });
 
+/**
+ * A record this build cannot read is not the end of the trail.
+ *
+ * The projector drops rows without an identity, and rows that do not promise
+ * `metadata_only`. A page made entirely of those still carries the Gateway's
+ * cursor, and treating its absence of writes as the bottom would set the flag
+ * that stops the backwards walk for good — on a database that would then never
+ * collect history again.
+ */
+describe("AuditSynchronizer unreadable pages", () => {
+  function unreadable(nextCursor: string): Record<string, unknown> {
+    return {
+      events: [{ eventId: "leaked", sequence: 90, occurredAt: NOW, kind: "tool_action", status: "failed", redaction: "full" }],
+      nextCursor,
+    };
+  }
+
+  it("keeps walking past a page it could read nothing on", async () => {
+    const repo = repository();
+    const asked: Array<string | undefined> = [];
+    const sync = new AuditSynchronizer({
+      store: repo.audit,
+      request: async (_method, params) => {
+        const cursor = typeof params.cursor === "string" ? params.cursor : undefined;
+        asked.push(cursor);
+        if (cursor === undefined) return unreadable("90");
+        return page([80, 79]);
+      },
+    });
+
+    const outcome = await sync.runOnce({ now: NOW, connected: true, auditState: "live" });
+
+    expect(asked).toEqual([undefined, "90"]);
+    expect(outcome.inserted).toBe(2);
+  });
+
+  it("does not report the trail finished because a page was unreadable", async () => {
+    const repo = repository();
+    repo.audit.append([
+      {
+        eventId: "known",
+        sequence: 100,
+        occurredAt: NOW - 1_000,
+        kind: "tool_action",
+        status: "succeeded",
+        sessionKey: "agent:main:one",
+        observedAt: NOW,
+      },
+    ]);
+    repo.audit.writeNewestMark(100);
+    const sync = new AuditSynchronizer({ store: repo.audit, request: async () => unreadable("99") });
+
+    const outcome = await sync.runOnce({ now: NOW, connected: true, auditState: "live" });
+
+    expect(outcome.complete).toBe(false);
+    expect(repo.audit.readBackfillComplete()).toBe(false);
+  });
+});
+
 describe("AuditSynchronizer failures", () => {
   it("reports a closed-set code and keeps what it had already stored", async () => {
     const repo = repository();

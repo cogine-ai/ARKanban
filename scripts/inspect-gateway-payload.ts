@@ -32,6 +32,7 @@
 import {
   AUDIT_KIND_RUN,
   AUDIT_KIND_TOOL,
+  AUDIT_PAGE_ALIASES,
   AUDIT_RUN_OUTCOMES,
   auditToolVerdict,
   projectAuditPage,
@@ -168,8 +169,11 @@ if (mode === "shape") {
   const page = projectAuditPage(payload, { observedAt: now, inventory });
   const kinds = new Map<string, number>();
   for (const write of page.writes) kinds.set(write.kind, (kinds.get(write.kind) ?? 0) + 1);
-  const inPayload = Array.isArray(payload.events) ? payload.events.length : 0;
-  process.stdout.write(`events in payload: ${inPayload}\n`);
+  // Counted through the projector's own aliases. Reading `events` alone would
+  // report zero against a build that named the array something else, next to a
+  // non-zero projected count — in the one tool whose job is to explain that gap.
+  const rawEvents = AUDIT_PAGE_ALIASES.events.map((alias) => payload[alias]).find(Array.isArray);
+  process.stdout.write(`events in payload: ${Array.isArray(rawEvents) ? rawEvents.length : 0}\n`);
   process.stdout.write(`projected:         ${page.writes.length}\n`);
   // A drop here is either a record missing an identity field or one that did not
   // promise `metadata_only`; both are reasons this table stays metadata.

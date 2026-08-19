@@ -256,14 +256,22 @@ export function computeSessionSignals(evidence: SignalEvidence, now: number): Se
   const quietFor = now - evidence.lastActivityAt;
 
   /**
-   * The audit trail speaks only into a silence.
+   * The audit trail speaks only into a silence, and only once the session is quiet.
+   *
+   * A run in flight has no ending to state, so the newest verdict on record
+   * belongs to a run that already finished — and a session whose activity rows
+   * hold no classified outcome is exactly where that is reachable: the rows aged
+   * out under `terminalRetentionDays` while the trail kept its verdicts for a year.
+   * Scoring the live run on them would grade a session as finished while it works,
+   * and would then grade it again differently when it actually ends.
    *
    * `attention` comes from the observed row when there is one: it describes
    * whether the session was left needing a human, which the audit trail says
    * nothing about either way, so dropping it would forgive a session for the
    * accident of its outcome having been stated elsewhere.
    */
-  const stated = observed !== undefined && isClassified(observed.outcome) ? undefined : evidence.auditRun;
+  const spoken = observed !== undefined && isClassified(observed.outcome);
+  const stated = spoken || evidence.hasActiveRun ? undefined : evidence.auditRun;
   const deciding: ActivityEvidence | undefined = stated
     ? {
         state: "terminal",

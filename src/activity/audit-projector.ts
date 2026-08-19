@@ -162,23 +162,36 @@ export function projectAuditPage(payload: Record<string, unknown>, options: Proj
     const actorType = actor ? asString(pick(actor, "actorType", AUDIT_FIELD_ALIASES.actorType, options.inventory)) : undefined;
     const actorId = actor ? asString(pick(actor, "actorId", AUDIT_FIELD_ALIASES.actorId, options.inventory)) : undefined;
 
+    // Read once each. Every one of these is optional, and the spread below omits
+    // the absent ones rather than storing a blank: a row that did not report a
+    // session is not a row about a session named "".
+    const sourceSequence = asInteger(read("sourceSequence"));
+    const action = asString(read("action"));
+    const errorCode = asString(read("errorCode"));
+    const agentId = asString(read("agentId"));
+    const sessionKey = asString(read("sessionKey"));
+    const sessionId = asString(read("sessionId"));
+    const runId = asString(read("runId"));
+    const toolCallId = asString(read("toolCallId"));
+    const toolName = asString(read("toolName"));
+
     writes.push({
       eventId,
       sequence,
-      ...(asInteger(read("sourceSequence")) !== undefined ? { sourceSequence: asInteger(read("sourceSequence"))! } : {}),
+      ...(sourceSequence !== undefined ? { sourceSequence } : {}),
       occurredAt,
       kind,
-      ...(asString(read("action")) ? { action: asString(read("action"))! } : {}),
+      ...(action ? { action } : {}),
       status,
-      ...(asString(read("errorCode")) ? { errorCode: asString(read("errorCode"))! } : {}),
+      ...(errorCode ? { errorCode } : {}),
       ...(actorType ? { actorType } : {}),
       ...(actorId ? { actorId } : {}),
-      ...(asString(read("agentId")) ? { agentId: asString(read("agentId"))! } : {}),
-      ...(asString(read("sessionKey")) ? { sessionKey: asString(read("sessionKey"))! } : {}),
-      ...(asString(read("sessionId")) ? { sessionId: asString(read("sessionId"))! } : {}),
-      ...(asString(read("runId")) ? { runId: asString(read("runId"))! } : {}),
-      ...(asString(read("toolCallId")) ? { toolCallId: asString(read("toolCallId"))! } : {}),
-      ...(asString(read("toolName")) ? { toolName: asString(read("toolName"))! } : {}),
+      ...(agentId ? { agentId } : {}),
+      ...(sessionKey ? { sessionKey } : {}),
+      ...(sessionId ? { sessionId } : {}),
+      ...(runId ? { runId } : {}),
+      ...(toolCallId ? { toolCallId } : {}),
+      ...(toolName ? { toolName } : {}),
       observedAt: options.observedAt,
     });
   }
@@ -188,10 +201,12 @@ export function projectAuditPage(payload: Record<string, unknown>, options: Proj
 
   return {
     writes,
-    // A cursor with nothing to continue from would send the next round back to the
-    // same page: the Gateway pages by "sequence below this one", so a page whose
-    // rows were all unreadable leaves nowhere lower to ask about.
-    ...(nextCursor !== undefined && writes.length > 0 ? { nextCursor } : {}),
+    // Passed on whenever the Gateway sent one, including from a page none of whose
+    // rows could be read. The cursor is derived from the Gateway's own last row,
+    // not from what this projector kept, so it still points below this page — and
+    // dropping it would report an unreadable stretch as the end of the trail,
+    // which is the one conclusion that stops the backwards walk for good.
+    ...(nextCursor !== undefined ? { nextCursor } : {}),
     ...(sequences.length > 0 ? { newestSequence: Math.max(...sequences) } : {}),
     ...(sequences.length > 0 ? { oldestSequence: Math.min(...sequences) } : {}),
     dropped,

@@ -136,9 +136,14 @@ const auditTrail = (() => {
       // rather than every session scoring the same.
       const failed = index % 5 === 0 && call === 1;
       const actor = { type: "agent", id: session.agentId };
+      // Advanced before the row is built, so an id and the sequence it names agree.
+      // They are separate fields on purpose — identity is `eventId`, ordering is
+      // `sequence` — but a fixture where row `audit-4001` reports sequence 4002
+      // only ever misleads whoever is reading a paging bug.
+      sequence += 1;
       events.push({
         eventId: `audit-${sequence}`,
-        sequence: (sequence += 1),
+        sequence,
         occurredAt: at,
         kind: "tool_action",
         action: "tool.action.started",
@@ -152,11 +157,12 @@ const auditTrail = (() => {
         toolName,
         redaction: "metadata_only",
       });
+      sequence += 1;
       events.push({
         eventId: `audit-${sequence}`,
         // A settled call shares its start's millisecond, which is exactly the
         // tie the sequence has to break.
-        sequence: (sequence += 1),
+        sequence,
         occurredAt: at,
         kind: "tool_action",
         action: "tool.action.finished",
@@ -175,9 +181,10 @@ const auditTrail = (() => {
     // Only the runs that ended have a verdict; a live session's run has not
     // finished, and inventing an ending for it would grade it as complete.
     if (!session.hasActiveRun) {
+      sequence += 1;
       events.push({
         eventId: `audit-${sequence}`,
-        sequence: (sequence += 1),
+        sequence,
         occurredAt: session.lastActivityAt,
         kind: "agent_run",
         action: "agent.run.finished",
@@ -646,6 +653,15 @@ let tick = 0;
  */
 let auditSequence = Number(auditTrail[0]?.sequence ?? 0);
 
+/**
+ * Bounded the way the Gateway bounds its own ledger (100,000 rows, plus a 30-day
+ * cutoff). A mock left running for an afternoon would otherwise grow without end,
+ * and the oldest rows dropping off is itself worth exercising: it is why the
+ * backwards walk records that it finished rather than re-deriving it from what is
+ * still there.
+ */
+const AUDIT_TRAIL_MAX = 5_000;
+
 function recordAudit(event: Record<string, unknown>): void {
   auditSequence += 1;
   auditTrail.unshift({
@@ -655,6 +671,7 @@ function recordAudit(event: Record<string, unknown>): void {
     redaction: "metadata_only",
     ...event,
   });
+  if (auditTrail.length > AUDIT_TRAIL_MAX) auditTrail.length = AUDIT_TRAIL_MAX;
 }
 
 const eventTimer = setInterval(() => {

@@ -17,6 +17,20 @@ function workspace(): string {
   return directory;
 }
 
+/**
+ * Brings a database to the state it would be in just before `version`.
+ *
+ * The stored version is the highest one applied, not how many ran: `pendingFrom`
+ * selects by version, so a gap in the numbering would leave a count-based value
+ * pointing at a migration that has already run.
+ */
+function migrateTo(db: DatabaseSync, version: number): void {
+  const previous = MIGRATIONS.filter((entry) => entry.version < version);
+  for (const migration of previous) migration.up(db);
+  const applied = previous.reduce((highest, entry) => Math.max(highest, entry.version), 0);
+  db.prepare("INSERT OR REPLACE INTO meta(key, value) VALUES ('schema_version', ?)").run(String(applied));
+}
+
 /** Recreates the pre-framework layout: baseline DDL, meta rows, no schema_version. */
 function legacyDatabase(databasePath: string): void {
   const db = new DatabaseSync(databasePath);
@@ -77,9 +91,7 @@ describe("schema migrations", () => {
     const databasePath = path.join(workspace(), "upgrade.sqlite");
     const db = new DatabaseSync(databasePath);
     cleanups.push(() => db.close());
-    const previous = MIGRATIONS.filter((entry) => entry.version < 5);
-    for (const migration of previous) migration.up(db);
-    db.prepare("INSERT OR REPLACE INTO meta(key, value) VALUES ('schema_version', ?)").run(String(previous.length));
+    migrateTo(db, 5);
     db.exec(`
       INSERT INTO session_messages (
         session_key, session_id, seq, role, content, content_bytes, created_at, observed_at
@@ -96,9 +108,7 @@ describe("schema migrations", () => {
     const databasePath = path.join(workspace(), "audit-upgrade.sqlite");
     const db = new DatabaseSync(databasePath);
     cleanups.push(() => db.close());
-    const previous = MIGRATIONS.filter((entry) => entry.version < 6);
-    for (const migration of previous) migration.up(db);
-    db.prepare("INSERT OR REPLACE INTO meta(key, value) VALUES ('schema_version', ?)").run(String(previous.length));
+    migrateTo(db, 6);
     db.exec(`
       INSERT INTO session_messages (
         session_key, session_id, seq, role, content, content_bytes, created_at, observed_at

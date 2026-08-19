@@ -281,6 +281,9 @@ export async function createHttpServer(
     gateway: runtime.getStatus().gateway,
     capabilities: runtime.getCapabilities(),
     fields: runtime.getFieldReports(),
+    // Counts, watermarks and a closed-set failure code. The audit trail is
+    // metadata by contract, and this endpoint states no identities regardless.
+    audit: { sync: runtime.getAuditStatus() ?? null, ...runtime.repository.audit.totals() },
     ...runtime.getArchiveDiagnostics(),
   }));
   app.get<{ Querystring: { range?: string; rangeEnd?: string } }>("/api/v1/settled-groups", async (request, reply) => {

@@ -24,6 +24,12 @@ export const NON_DISCOVERABLE_METHODS = [
   "sessions.usage",
   "sessions.usage.timeseries",
   "chat.history",
+  // The advertisement carries plugin and startup-channel methods, and the audit
+  // trail is neither: 2026.7.1-2 registers `audit.list` as a core `operator.read`
+  // method and never lists it. The blueprint's `audit.activity.list` and
+  // `audit.run.inspect` do not exist on that build at all, so a probe is also how
+  // the difference becomes visible instead of looking like a collection failure.
+  "audit.list",
 ] as const;
 
 export type NonDiscoverableMethod = (typeof NON_DISCOVERABLE_METHODS)[number];
@@ -78,6 +84,7 @@ const PROBE_PARAMS: Record<
   "sessions.usage.timeseries": () => ({ limit: 1 }),
   "chat.history": (context) =>
     context.sessionKey === undefined ? undefined : { sessionKey: context.sessionKey, limit: 1 },
+  "audit.list": () => ({ limit: 1 }),
 };
 
 export type ProbeCaller = (method: string, params: Record<string, unknown>) => Promise<unknown>;

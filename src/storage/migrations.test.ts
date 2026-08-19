@@ -17,6 +17,20 @@ function workspace(): string {
   return directory;
 }
 
+/**
+ * Brings a database to the state it would be in just before `version`.
+ *
+ * The stored version is the highest one applied, not how many ran: `pendingFrom`
+ * selects by version, so a gap in the numbering would leave a count-based value
+ * pointing at a migration that has already run.
+ */
+function migrateTo(db: DatabaseSync, version: number): void {
+  const previous = MIGRATIONS.filter((entry) => entry.version < version);
+  for (const migration of previous) migration.up(db);
+  const applied = previous.reduce((highest, entry) => Math.max(highest, entry.version), 0);
+  db.prepare("INSERT OR REPLACE INTO meta(key, value) VALUES ('schema_version', ?)").run(String(applied));
+}
+
 /** Recreates the pre-framework layout: baseline DDL, meta rows, no schema_version. */
 function legacyDatabase(databasePath: string): void {
   const db = new DatabaseSync(databasePath);
@@ -77,9 +91,7 @@ describe("schema migrations", () => {
     const databasePath = path.join(workspace(), "upgrade.sqlite");
     const db = new DatabaseSync(databasePath);
     cleanups.push(() => db.close());
-    const previous = MIGRATIONS.filter((entry) => entry.version < 5);
-    for (const migration of previous) migration.up(db);
-    db.prepare("INSERT OR REPLACE INTO meta(key, value) VALUES ('schema_version', ?)").run(String(previous.length));
+    migrateTo(db, 5);
     db.exec(`
       INSERT INTO session_messages (
         session_key, session_id, seq, role, content, content_bytes, created_at, observed_at
@@ -90,6 +102,25 @@ describe("schema migrations", () => {
 
     const row = db.prepare("SELECT is_error FROM session_messages WHERE seq = 0").get() as { is_error: unknown };
     expect(row.is_error).toBeNull();
+  });
+
+  it("adds the audit trail to an existing database without touching what it holds", () => {
+    const databasePath = path.join(workspace(), "audit-upgrade.sqlite");
+    const db = new DatabaseSync(databasePath);
+    cleanups.push(() => db.close());
+    migrateTo(db, 6);
+    db.exec(`
+      INSERT INTO session_messages (
+        session_key, session_id, seq, role, content, content_bytes, created_at, observed_at
+      ) VALUES ('agent:builder:one', 'gen-1', 0, 'tool', 'output', 6, 1000, 1000)
+    `);
+
+    applyMigrations(db, databasePath);
+
+    const events = db.prepare("SELECT COUNT(*) AS events FROM audit_events").get() as { events: number };
+    expect(events.events).toBe(0);
+    const messages = db.prepare("SELECT COUNT(*) AS messages FROM session_messages").get() as { messages: number };
+    expect(messages.messages).toBe(1);
   });
 
   it("writes a 0600 backup before upgrading a database that already holds data", () => {

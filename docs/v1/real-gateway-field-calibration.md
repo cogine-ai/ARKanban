@@ -17,7 +17,7 @@ openclaw gateway call sessions.list --json --params '{"limit":20}' \
   | npx tsx scripts/inspect-gateway-payload.ts sessions
 ```
 
-`scripts/inspect-gateway-payload.ts` 有四个模式：`shape` 只打印字段名、类型和字符串长度；`sessions`/`history`/`usage` 把真实 payload 喂进 collector 自己的投影器，报出哪些字段真的填上了。
+`scripts/inspect-gateway-payload.ts` 有五个模式：`shape` 只打印字段名、类型和字符串长度；`sessions`/`history`/`usage`/`audit` 把真实 payload 喂进 collector 自己的投影器，报出哪些字段真的填上了。
 
 **它不打印任何字符串值。** payload 里除了对话正文，还有 `senderName` 这类联系人标识和 `MediaPath` 这类宿主机路径——「正文不进日志和诊断」这条规矩同样管这个脚本。抓下来的 payload 文件用完就删，别留在 `.fixtures/` 里。
 
@@ -226,16 +226,46 @@ sessions.usage 参数（additionalProperties: false）
 
 它的状态词表是 `started`/`succeeded`/`failed`/`cancelled`/`timed_out`/`blocked`/`unknown`，和我们派生信号的结论对得上。
 
-而且：**collector 目前一个 audit 方法都没调用。** 蓝图要求的「advertise 之后必须采集」从未落地。所以这里既是版本差异，也是功能缺口——真机上先跑 `openclaw` 的 `audit.list` 看看有没有数据，再决定要不要接。
+### 真机形状与参数（2026-08-19，已接入）
+
+契约来自装好的那份构建自己的文档与 handler（`docs/gateway/protocol.md` 第 533 节起、`dist/audit-*.js`），不是从回包猜的：
+
+```text
+audit.list({ limit?: 1..500 (默认 100), cursor?, agentId?, sessionKey?, runId?, kind?, status?, after?, before? })
+→ { events: [...] }                             最新在前
+→ { events: [...], nextCursor: "<sequence>" }   仅当还有更旧的记录
+```
+
+- `limit` 超界是**截断而不是报错**（handler 写的是 `Math.min(params.limit ?? 100, 500)`），所以分页上限不是一条能把采集打断的路——这与 `sessions.usage` 的 `additionalProperties: false` 正相反，那边多一个参数就整轮失败。我们发 500。
+- 权限是 `operator.read`，与现有 token 一致，不需要新 scope。
+- **Gateway 自己会裁剪这份轨**：超过 30 天的记录查不到，共享 SQLite ledger 上限 10 万行，启动时 / 每小时 / 后续写入时都会删。所以本机保留期不能比它短（删掉的结论取不回来），倒序水位线也必须能识别序号回退。
+- `audit.enabled` 关掉之后，方法仍然存在、仍然返回此前写下的记录。**空轨不是错误**：能力探测会判 `live`，而回包里一条都没有。
+
+实机复核（`openclaw gateway call audit.list --params '{"limit":100}' | awk 'NR>1' | npx tsx scripts/inspect-gateway-payload.ts audit`，脚本新增 `audit` 模式）：
+
+```text
+events in payload: 54      projected: 54      dropped: 0
+kinds:             agent_run=14 tool_action=40
+statuses:          succeeded=22 started=27 failed=5
+tool verdicts:     failed=5 ok=15 unsettled=20
+run outcomes:      classified=7/14
+sessions attached: 54/54    tool call ids: 40/40
+sequence range:    1..54     nextCursor: none
+unknown keys:      none
+```
+
+读法：`unsettled=20` 与 `classified=7/14` 都是 `started`——一条只有开始的记录什么都没结算，把它算成任何一种结论都是编的。54 条全部带 `sessionKey`、40 条工具记录全部带 `toolCallId`，这两项是它比 observation 更可信的原因：配对是它自己做的，不是我们按时间猜的。`redaction` 全为 `metadata_only`，文档也写了「always」——投影器仍然检查并整条丢掉别的值，因为那种构建等于绕过归档的全部开关递出内容。
+
+一处名字上的坑：`sequence` 是 ledger 的行号，`sourceSequence` 是来源事件的序号，真机两者都发。分页、水位线与排序全用前者；后者只存下来备查。上面那一页的 `missing` 只有 `nextCursor`，因为整条轨（54 条）一页就装完了——最后一页没有游标是正常的，回填正是靠它判「走到底了」。
 
 ---
 
 ## 4. 还没做的事
 
 1. ~~**`usage.cost` 的成本覆盖层**要改成读 `sessions.usage` 的 `aggregates.byAgent`~~ 已改，见 §2.4 末尾的形状与参数。真机复核（同节）修正了 §2.6 的适用范围：**范围聚合有 token**（7 天窗口 27,844），零 token 只对按会话读那条路成立；**但成本仍然没有**——`totalCost: 0` 配 `missingCostEntries: 1`，即一条都没定出价，按上面那条规则不报金额。所以这条修完在这台机器上看到的是 token 而不是钱：它修掉的是「每轮调用直接失败」，金额要等一个有价目表的 provider。
-2. ~~**消息级 `isError` 没被读**~~ 已接：`session_messages` 加了 `is_error`（schema v5），投影器只认布尔值——`NULL` 表示「这条不是工具结果」，和「调用成功」是两件事，混同会把每条普通消息都算成一次成功的工具调用。派生信号在归档与 observations 之间取已结算调用更多的那一份（打平归档优先）：两边描述的是同一批调用，相加等于同一次失败罚两次分；而回填到一半的归档只有最新一页，无条件优先它会把更早的失败丢掉。已换代（`superseded_by_session_id`）的那一代不计，否则跨过一次压缩的会话每条失败都会翻倍。算法版本 2 → 3，存量行自动重算。（同一批消息的 `usage` 全是零，见 §2.6，别指望它。）
+2. ~~**消息级 `isError` 没被读**~~ 已接：`session_messages` 加了 `is_error`（schema v5），投影器只认布尔值——`NULL` 表示「这条不是工具结果」，和「调用成功」是两件事，混同会把每条普通消息都算成一次成功的工具调用。派生信号在审计轨、归档与 observations 之间取已结算调用更多的那一份（打平按「审计 > 归档 > 观测」，见下面第 4 条）：两边描述的是同一批调用，相加等于同一次失败罚两次分；而回填到一半的归档只有最新一页，无条件优先它会把更早的失败丢掉。已换代（`superseded_by_session_id`）的那一代不计，否则跨过一次压缩的会话每条失败都会翻倍。算法版本 2 → 3，存量行自动重算。（同一批消息的 `usage` 全是零，见 §2.6，别指望它。）
 3. **`peakContextTokens` 没有数据源**，而 `sessions.list` 的 `totalTokens` 就是上下文占用量（§2.7）。要接的话得单独走一条不进成本聚合的写入路径——直接写进用量快照会让零 token 的会话进入成本视图。
-4. **audit 采集**完全没实现（§3）。
+4. ~~**audit 采集**完全没实现~~ 已接（§3 有真机形状与复核）：`audit_events` 表（schema v6）按 `eventId` 幂等，同步是「尾读到已知水位线 + 往下回填」，水位线只在读到已知记录后前移，并识别 Gateway 侧裁剪导致的序号回退。审计结论成为派生信号的**首选**工具证据（算法版本 3 → 4），`agent_run` 的结论只在「本机 Activity 行一条都没分类出结论」**且**「会话当前没有在跑的 run」时补位——在跑的 run 没有结束可言，轨上那条结论属于已经结束的某次运行。诊断端点新增 `audit`（同步结果 + 行数 + 序号区间）。
 5. ~~**Agents 页的「系统 agent 折叠」没有数据来源**~~ 已按后者处理：分组与 SYSTEM 徽号都已删除，规格第 7 节与 §9.6 同步修订。换别的信号（例如只由 cron 触发的 agent）是采集器自己编的区分，不做。`kind` 仍留在契约里，别的 Gateway 版本发这个字段时它就是诚实数据。
 
 ---
@@ -260,7 +290,7 @@ curl -s http://127.0.0.1:47123/api/v1/diagnostics/field-coverage | jq
 
 ### 改映射的规则
 
-改 `src/activity/session-projector.ts`、`message-projector.ts`、`usage-projector.ts` 顶部的别名表，**把真名加到列表最前面，不要删旧别名**（别的 Gateway 版本可能还在用）。匹配按顺序取第一个非 null 值。
+改 `src/activity/session-projector.ts`、`message-projector.ts`、`usage-projector.ts`、`audit-projector.ts` 顶部的别名表，**把真名加到列表最前面，不要删旧别名**（别的 Gateway 版本可能还在用）。匹配按顺序取第一个非 null 值。
 
 如果真名对应的是**对象**，别名不够——得用 `asNamed()` 那类取值函数，见 session projector 里 `agentRuntime` 的处理。
 
@@ -279,6 +309,9 @@ SELECT kind_hint, COUNT(*) FROM sessions GROUP BY kind_hint;
 SELECT origin, COUNT(*) FROM agents GROUP BY origin;
 SELECT COUNT(*) AS with_runtime FROM sessions WHERE runtime IS NOT NULL;
 SELECT COUNT(*) AS with_usage FROM session_usage_snapshots;
+SELECT kind, COUNT(*) FROM audit_events GROUP BY kind;
+SELECT COUNT(*) AS scored_v4 FROM session_signals
+  WHERE algorithm_version >= 4 AND grade <> 'unscored';
 SQL
 ```
 
@@ -289,6 +322,8 @@ SQL
 3. **`with_runtime` 应该非零**。这一项专门盯 §1 里那个「对象当字符串读」的错误——它修好之前这里恒为 0。
 4. **`with_usage` 应该非零**。修好之前 `sessions.usage` 每次调用都报错，这张表永远是空的。
 5. `kind_hint` 的 `unknown` 占比高**不一定**是问题，见 §2.1。
+6. `audit_events` 两个 `kind` 都该有行；全空要先分诊断端点的 `audit.sync`——`errorCode` 有值是调用失败，能力判 `unavailable` 是这个构建没这个方法，两者都不是「没有数据」。轨本身空掉也可能是 `audit.enabled` 被关了（§3）。
+7. `scored_v4` 非零说明审计结论真的进了评分：这一项与 `audit_events` 同时非零、而 `scored_v4` 为零，意味着重算没跑或证据没接上。
 
 ---
 

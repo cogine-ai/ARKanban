@@ -22,7 +22,7 @@ import type {
  * per §2.4 of the spec.
  */
 
-export const SIGNAL_ALGORITHM_VERSION = 3;
+export const SIGNAL_ALGORITHM_VERSION = 4;
 
 /**
  * Points deducted from 100. Each entry is capped so one pathological session
@@ -80,10 +80,11 @@ export type ToolEventEvidence = {
   /**
    * A stated outcome, from a source that gives one outright.
    *
-   * An archived `toolResult` message carries the Gateway's own `isError`, so
-   * there is nothing to infer from a phase vocabulary that was guessed from
-   * documentation. When this is set it decides the event, and the event counts as
-   * settled whichever way it reads.
+   * An audit record and an archived `toolResult` message both carry the Gateway's
+   * own verdict — `status` in one, `isError` in the other — so there is nothing to
+   * infer from a phase vocabulary that was guessed from documentation. When this is
+   * set it decides the event, and the event counts as settled whichever way it
+   * reads.
    */
   failed?: boolean;
   occurredAt: number;
@@ -104,6 +105,18 @@ export type SignalEvidence = {
   activities: ActivityEvidence[];
   /** Ordered oldest first; ordering is what makes streaks and retries readable. */
   toolEvents: ToolEventEvidence[];
+  /**
+   * How the Gateway's audit trail says the newest run ended.
+   *
+   * Read only where the Activity rows state nothing, which is the case this
+   * fills: a session whose runs are all over but whose newest terminal row
+   * carries no classified outcome is currently graded on quiet time, and calling
+   * that `abandoned` after six hours is a guess about a run the Gateway can
+   * describe. It never overrides a classified Activity outcome — two sources for
+   * the same fact need a rule, and the rule is that observation of this run wins
+   * over a summary of the session's runs.
+   */
+  auditRun?: { outcome: ActivityOutcome; endedAt: number };
 };
 
 function matches(haystack: string | undefined, needles: readonly string[]): boolean {
@@ -233,15 +246,46 @@ function charge(
  * there would be indistinguishable from a measured one on every surface that
  * reads it.
  */
+function isClassified(outcome: ActivityOutcome): boolean {
+  return outcome !== "none" && outcome !== "unknown";
+}
+
 export function computeSessionSignals(evidence: SignalEvidence, now: number): SessionSignals {
   const tally = tallyToolEvents(evidence.toolEvents);
-  const deciding = decidingActivity(evidence.activities);
+  const observed = decidingActivity(evidence.activities);
   const quietFor = now - evidence.lastActivityAt;
+
+  /**
+   * The audit trail speaks only into a silence, and only once the session is quiet.
+   *
+   * A run in flight has no ending to state, so the newest verdict on record
+   * belongs to a run that already finished — and a session whose activity rows
+   * hold no classified outcome is exactly where that is reachable: the rows aged
+   * out under `terminalRetentionDays` while the trail kept its verdicts for a year.
+   * Scoring the live run on them would grade a session as finished while it works,
+   * and would then grade it again differently when it actually ends.
+   *
+   * `attention` comes from the observed row when there is one: it describes
+   * whether the session was left needing a human, which the audit trail says
+   * nothing about either way, so dropping it would forgive a session for the
+   * accident of its outcome having been stated elsewhere.
+   */
+  const spoken = observed !== undefined && isClassified(observed.outcome);
+  const stated = spoken || evidence.hasActiveRun ? undefined : evidence.auditRun;
+  const deciding: ActivityEvidence | undefined = stated
+    ? {
+        state: "terminal",
+        outcome: stated.outcome,
+        attention: observed?.attention ?? "none",
+        endedAt: stated.endedAt,
+        updatedAt: stated.endedAt,
+      }
+    : observed;
 
   // "Something ended" is not a verdict. Session-level terminal events often
   // carry no classified outcome at all, and treating that as success would
   // hand out clean grades on the strength of a run merely stopping.
-  const hasVerdict = deciding !== undefined && deciding.outcome !== "none" && deciding.outcome !== "unknown";
+  const hasVerdict = deciding !== undefined && isClassified(deciding.outcome);
 
   const outcome: SessionOutcomeClass = deciding
     ? outcomeClass(deciding.outcome)

@@ -131,6 +131,55 @@ function terminalRun(
   );
 }
 
+/** A tool verdict the Gateway stated in its audit trail. */
+function auditTool(
+  repo: CollectorRepository,
+  sessionKey: string,
+  sequence: number,
+  toolName: string,
+  status: string,
+  at: number,
+): void {
+  repo.audit.append([
+    {
+      eventId: `${sessionKey}:tool:${sequence}`,
+      sequence,
+      occurredAt: at,
+      kind: "tool_action",
+      action: "tool.action.finished",
+      status,
+      agentId: "builder",
+      sessionKey,
+      runId: "run-1",
+      toolName,
+      observedAt: at,
+    },
+  ]);
+}
+
+function auditRun(
+  repo: CollectorRepository,
+  sessionKey: string,
+  sequence: number,
+  status: string,
+  at: number,
+): void {
+  repo.audit.append([
+    {
+      eventId: `${sessionKey}:run:${sequence}`,
+      sequence,
+      occurredAt: at,
+      kind: "agent_run",
+      action: "agent.run.finished",
+      status,
+      agentId: "builder",
+      sessionKey,
+      runId: "run-1",
+      observedAt: at,
+    },
+  ]);
+}
+
 describe("SignalStore evidence", () => {
   it("scores from stored activities and tool observations", () => {
     const repo = repository();
@@ -230,6 +279,100 @@ describe("SignalStore evidence", () => {
     const signals = repo.signals.recompute("agent:builder:compacted", NOW);
 
     expect(signals?.toolFailures).toBe(1);
+  });
+
+  it("scores the audit trail when it holds the most settled calls", () => {
+    const repo = repository();
+    session(repo, "agent:builder:audited");
+    toolEvent(repo, "agent:builder:audited", "t1", "error", "exec", NOW - 9_000);
+    auditTool(repo, "agent:builder:audited", 1, "exec", "failed", NOW - 9_000);
+    auditTool(repo, "agent:builder:audited", 2, "exec", "failed", NOW - 8_000);
+    auditTool(repo, "agent:builder:audited", 3, "exec", "succeeded", NOW - 7_000);
+
+    const signals = repo.signals.recompute("agent:builder:audited", NOW);
+
+    expect(signals).toMatchObject({ toolFailures: 2, toolRetries: 2, consecutiveFailureMax: 2 });
+  });
+
+  /**
+   * Both state the outcome, but the audit trail pairs each call by `toolCallId`
+   * while the archive holds whichever pages have been fetched, so a tie goes to
+   * the trail.
+   */
+  it("takes the audit trail over the archive when they saw the same number of calls", () => {
+    const repo = repository();
+    session(repo, "agent:builder:tie");
+    toolResult(repo, "agent:builder:tie", 1, "exec", false, NOW - 5_000);
+    auditTool(repo, "agent:builder:tie", 1, "exec", "failed", NOW - 5_000);
+
+    const signals = repo.signals.recompute("agent:builder:tie", NOW);
+
+    expect(signals?.toolFailures).toBe(1);
+  });
+
+  /**
+   * The backwards walk has only reached the newest record. Scoring on it alone
+   * would drop the failures the events already recorded — and the grade would
+   * improve as collection caught up.
+   */
+  it("keeps the richer observations while the audit walk is still catching up", () => {
+    const repo = repository();
+    session(repo, "agent:builder:partial");
+    toolEvent(repo, "agent:builder:partial", "t1", "error", "exec", NOW - 9_000);
+    toolEvent(repo, "agent:builder:partial", "t2", "error", "exec", NOW - 8_000);
+    toolEvent(repo, "agent:builder:partial", "t3", "error", "deploy", NOW - 7_000);
+    auditTool(repo, "agent:builder:partial", 9, "search", "succeeded", NOW - 1_000);
+
+    const signals = repo.signals.recompute("agent:builder:partial", NOW);
+
+    expect(signals?.toolFailures).toBe(3);
+    expect(signals?.consecutiveFailureMax).toBe(3);
+  });
+
+  /**
+   * Without a run verdict this session is graded on quiet time alone, which calls
+   * a finished run abandoned six hours after it ended.
+   */
+  it("fills an outcome nothing else classified from the audit trail's run verdict", () => {
+    const repo = repository();
+    const quietSince = NOW - 8 * 60 * 60 * 1_000;
+    session(repo, "agent:builder:quiet-run", { lastActivityAt: quietSince });
+    expect(repo.signals.recompute("agent:builder:quiet-run", NOW)).toMatchObject({ outcome: "abandoned" });
+
+    auditRun(repo, "agent:builder:quiet-run", 1, "succeeded", quietSince);
+
+    expect(repo.signals.recompute("agent:builder:quiet-run", NOW)).toMatchObject({
+      outcome: "completed",
+      penalties: [],
+    });
+  });
+
+  /**
+   * The verdict on record belongs to a run that already ended, and this session is
+   * running now. Its own activity rows can be silent about earlier runs — they age
+   * out a year sooner than the trail does — so the fallback has to check.
+   */
+  it("does not settle a session that is still running from an earlier run's verdict", () => {
+    const repo = repository();
+    session(repo, "agent:builder:still-going", { hasActiveRun: true, lastActivityAt: NOW - 9 * 60 * 60 * 1_000 });
+    auditRun(repo, "agent:builder:still-going", 1, "succeeded", NOW - 9 * 60 * 60 * 1_000);
+
+    const signals = repo.signals.recompute("agent:builder:still-going", NOW);
+
+    expect(signals?.outcome).toBe("unknown");
+    expect(signals?.grade).toBe("unscored");
+  });
+
+  it("does not let a run verdict overrule an outcome the Activity rows classified", () => {
+    const repo = repository();
+    session(repo, "agent:builder:contested");
+    terminalRun(repo, "agent:builder:contested", "r1", "failed", NOW - 2_000);
+    auditRun(repo, "agent:builder:contested", 1, "succeeded", NOW - 1_000);
+
+    const signals = repo.signals.recompute("agent:builder:contested", NOW);
+
+    expect(signals?.outcome).toBe("errored");
+    expect(signals?.penalties.map((penalty) => penalty.code)).toContain("errored_outcome");
   });
 
   it("ignores messages that are not tool results at all", () => {

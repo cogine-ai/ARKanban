@@ -166,9 +166,10 @@ export type SessionSignals = {
 实现补充（S7）：
 
 - 评分只读本机已存的 `activities`、`observations` 与归档消息，不回查 Gateway，因此离线可算、可重算。权重表见 `SIGNAL_PENALTIES`，每一类都带上限，避免单个病态会话把分数拉到任意负值——那会让 F 这个桶失去意义。
-- 工具结论有两个来源，二选一而非相加。归档里的 `toolResult` 消息带 Gateway 直接给的 `is_error`；observation 只有生命周期阶段，其失败词表还是我们从文档里猜的。两者描述的是同一批调用，相加等于同一次失败罚两次分，所以**取已结算调用更多的那一份**，打平时归档优先（结论是它直接说的，不是推的）。不是「有归档就用归档」：归档是一页一页攒起来的，回填到一半的会话手里只有最新一页，让那两条结论代表一个事件流里有十条的会话，等于把更早的失败、它们组成的连败和之后的重试全部丢掉——而且分数会随着归档变全而变好，与「证据越多越准」正好相反。已被换代标记的那一代不计：压缩会把存活下来的轮次以新 `sessionId` 重发一遍，两代都算的话，跨过一次压缩的会话每条失败都会翻倍。
+- 工具结论有**三个**来源，取一而非相加。`audit.list` 的 `tool_action` 行是 Gateway 自己的审计结论，词表是从 handler 上读来的闭集，并且带 `toolCallId`，能把 start 与 finished 精确配对；归档里的 `toolResult` 消息带 Gateway 直接给的 `is_error`；observation 只有生命周期阶段，其失败词表还是我们从文档里猜的。三者描述的是同一批调用，相加等于同一次失败罚两次分，所以**取已结算调用更多的那一份**，打平时按「审计 > 归档 > 观测」定序：越靠前的来源，结论越是它直接说的、而不是我们推的。审计轨与归档各有自己的回填进度，谁读得更全不是固定的，因此这里比的是本轮实际结算数，而不是来源本身。不是「有归档就用归档」：归档是一页一页攒起来的，回填到一半的会话手里只有最新一页，让那两条结论代表一个事件流里有十条的会话，等于把更早的失败、它们组成的连败和之后的重试全部丢掉——而且分数会随着归档变全而变好，与「证据越多越准」正好相反。已被换代标记的那一代不计：压缩会把存活下来的轮次以新 `sessionId` 重发一遍，两代都算的话，跨过一次压缩的会话每条失败都会翻倍。
 - 回填页会带来「会话本身没动，证据却到了」的情况：陈旧判定看的是 `last_activity_at`，而上周历史的一页不会碰它。因此 transcript 同步每轮回报本轮真正新增了消息的会话，运行时就地重算这几个会话，不等定时批次。
 - 给分门槛：必须存在**已分类的终态结论**或**至少一次已结算的工具调用**，否则返回 `unscored`。「有东西结束了」不是结论：会话级终态事件经常不带任何 outcome，把它当成功会仅凭「运行停了」就发出干净的分数。
+- 终态结论同样先看审计轨的 `agent_run` 行，但有两道闸：本机 Activity 行**一条都没分类出结论**，且该会话**当前没有在跑的 run**。Activity 是采集器持续维护的会话状态，审计轨是补一个我们本来没有的答案，不是拿来盖掉已有答案的——顺序反过来会让一次运行结束后又重启的会话被更旧的那次结论定性。第二道闸针对的是同一件事的另一半：在跑的 run 没有结束可言，轨上最新的那条结论一定属于已经结束的某次运行，而「有在跑的 run 且本机没有已分类结论」恰好可达——Activity 按 `terminalRetentionDays` 只留 30 天，审计轨留一年，长命会话（`agent:main` 就是）早期那些运行的行早就过期了。少这道闸，一个正在干活的会话会被判成已完成，等它真的结束再改判成另一个结论。它补的正是「运行确实结束过、但没有任何事件说它怎么结束」这一类：此前这类会话只能靠静默时长判，六小时后一律记成 `abandoned`。
 - 判定用哪一行终态时，**最新的已分类结论优先于更新的未分类行**。`unknown` 不携带信息，而它经常就是最新的一行：运行结束后才到的事件会开出一个新的 attempt，下一轮快照发现 Gateway 不再广告它，就把它关成 `unknown`。直接取最新行会让这类记账盖掉 Gateway 真正给过的结论。
 - 与之配套，`sessions.changed` 的终态 `status` 现在按别名表映射成 outcome，其中包含 `succeeded`（`done` / `completed` / `finished` …）。此前只分类失败、其余一律 `unknown`，结果是所有健康会话都拿不到结论，读起来与「无从判断的会话」完全一样。
 - 重算由后台循环按批推进（`SIGNAL_RECOMPUTE_BATCH`），挑选未评分、算法版本落后、或活动时间晚于 `computed_at` 的会话，活跃会话优先。打开详情页时对该会话按需重算一次：那正是结论最要紧的时刻，一个会话只值几次带索引的读。
@@ -184,7 +185,7 @@ export type SessionSignals = {
 | `sessions.describe` | 按需 | 打开 Session 详情、或该会话首次转 terminal | 单条 |
 | `sessions.usage` | 60s | 只覆盖候选集，见 3.3 | 见 3.3 |
 | `sessions.usage`（`agentScope: "all"`） | 300s | Agents 总览的成本卡 | 一次一个日历跨度 |
-| `audit.activity.list`（`kind: "message"`） | 300s，后台 | 增量游标 | limit 500 |
+| `audit.list`（原写 `audit.activity.list`，`kind: "message"`） | 300s，后台 | 倒序序号游标 | limit 500 |
 | `chat.history` | 30s（活跃会话增量）+ 空闲期回填 | 见第 7 节 | 游标 |
 
 `sessions.list` 参数继续保持 v1 的隐私设置，**不得**为了拿标题而打开 `includeLastMessage` 或 `includeDerivedTitles`：
@@ -250,6 +251,27 @@ sessions.list 分页
 
 「下一轮再来」必须真有下一轮。连接时只探测一次意味着：Gateway 当时空跑（没有任何会话可供组装调用），verdict 就在这条连接的余生里停在 `unknown`——不 advertise 该方法的构建于是一条正文都不归档，无论期间起了多少会话；一次瞬时失败同理，`error` 不等于 `live`，连接建立那一刻的抖动足以让正文同步歇到下次重连。因此在**会话同步之后**重试探测：那正是缺失的前提（一个真实会话键）到位的时刻。`probeAll` 会跳过已定论的方法，所以这只在答案确实未知时每轮多一次请求，定论之后归零；`transcriptSync` 关闭时完全不发。调用点放在会话同步的 try 边界之外，既不拖慢快照，也不会被误记成一次会话同步失败——代价是它得自己扛住关停：`stop()` 不等在飞的那一轮就关掉数据库，而各轮由定时器以 `void` 发起、没有任何调用方接得住它的拒绝，于是关停时序稍一交错，一次没人在等的探测就足以用「database is not open」结束进程。因此这里与用量轮一样先看 `stopped`、再把仓储读取与探测整体包住；用量轮的注释解释的是同一件事。
 
+### 3.4.1 审计轨（`audit.list`）
+
+方法名与形状都与原计划不同，实机（2026.7.1-2）为准：
+
+```text
+audit.list({ limit: 500, cursor?, kind? })
+→ { events: [...] }                    最新在前
+→ { events: [...], nextCursor: "<sequence>" }  仅当还有更旧的记录
+```
+
+`kind` 取 `agent_run` 与 `tool_action`，没有原计划里的 `message`——正文不在审计轨里，这条采集因此与正文归档无关，也不构成第二条正文通路。每行带 `redaction: "metadata_only"`，投影器把值不是它的行整条丢掉：一个在这里放了别的东西的构建，等于绕过归档的全部开关递出内容。
+
+- **游标是倒序序号，不是 offset**。一页的含义是「`sequence` 小于该值的那些行」。`occurredAt` 在一对记录内会打平（一次快到毫秒内结束的工具调用，start 与 finished 同毫秒），所以序号是唯一可用的全序，也因此同时充当分页游标、同步水位线与排序键。身份用 `eventId`（`sequence` 在跨 Gateway 时不唯一），重放同一页因此幂等。
+- **同步分两段**，与正文同步同源的理由：先从最新往下读到已知水位线（尾读），再从本机最旧一行继续往下走历史（回填）。尾读每轮限 4 页、整轮限 12 页。
+- **水位线只在本轮确实读到了已知记录之后才前移**。尾读用完预算就停时，它下面是个空洞；此时把最新序号记成「已读」，下一轮就会在第一页停住，那个空洞再也没人去问。
+- **读不懂的一页不是轨底**。只有「Gateway 没给 `nextCursor`」才是走到底了。游标是 Gateway 按它自己最后一行给的，与我们能读懂几行无关；把一页全丢的情况当轨底，会写下那个永久停掉回填的标记。走过一段读不懂的记录只花请求、不入库，而每轮的页数预算已经把它框住了。
+- **必须识别序号回退**：Gateway 自己会按时间与行数裁剪审计轨，状态库重置后序号还会从 1 重新开始。不识别的话，停止条件会把每一条新记录都当成读过的，采集就无声停在那里，直到进程重启。第一页的最新序号低于本机水位线即判回退，随后重置水位线与回填标记，重新走一遍。
+- 保留期跟随 `sessionRetentionDays`，与会话档案同批清理。
+
+它对派生信号的作用见 §2.4：审计轨说出的结论优先于我们推出来的结论。
+
 ### 3.5 失败隔离
 
 新增的每一路采集都在独立的 try 边界内。任何一路失败只影响自己的 coverage，不得：
@@ -286,7 +308,7 @@ migrations[]         —— 有序数组，每项 { version, up(db) }
 
 备份**不能覆盖同名的既有备份**。复制这一步只能在写锁之外做——把 WAL 合回主文件不允许在事务里执行——所以两个同时启动的进程都会走到这里，后到的那个可能是在前者迁移完成之后才复制：覆盖等于把「迁移前的副本」换成迁移后的副本，而文件名仍在承诺前者，这是这个文件唯一职责上的唯一一种失效方式。既然文件名已经断言了它是哪个目标版本之前的副本，同名文件存在时就保留它（上一次半途死掉的升级留下的同样是迁移前副本，正是想要的那份）。
 
-v1 基线库视为 version 1；本次交付 version 2。
+v1 基线库视为 version 1；本次交付 version 2。此后按顺序追加，当前目标版本为 6：v3 用量 rollup 增量、v4 删除未使用的消息统计列、v5 `session_messages.is_error`、v6 审计轨（本节末）。
 
 ### 4.2 新增表
 
@@ -442,6 +464,39 @@ CREATE TABLE session_transcript_sync (
 唯一约束取 `(session_key, seq, session_id)` 而不是 `(session_key, seq)`，因为同一 key 下 transcript 换代后 `seq` 会从 0 重新开始，旧代际必须能与新代际共存。
 
 FTS5 使用 external content 模式（`content='session_messages'`），索引不重复存储原文。触发器负责索引同步，写入路径不得绕过 `session_messages` 直接写索引。
+
+审计轨（schema v6，见 §3.4.1）：
+
+```sql
+CREATE TABLE audit_events (
+  event_id TEXT PRIMARY KEY,
+  sequence INTEGER NOT NULL,
+  source_sequence INTEGER,
+  occurred_at INTEGER NOT NULL,
+  kind TEXT NOT NULL,
+  -- 可空：空字符串会读成「一个没有名字的动作」，而不是「没报动作名」。
+  action TEXT,
+  status TEXT NOT NULL,
+  error_code TEXT,
+  actor_type TEXT,
+  actor_id TEXT,
+  agent_id TEXT,
+  -- 可空：属于某次 run 而非某个会话的记录不带这两项。没有会话的结论无从计分，
+  -- 存成空字符串会把所有这类记录挂到同一个不存在的会话上。
+  session_key TEXT,
+  session_id TEXT,
+  run_id TEXT,
+  tool_call_id TEXT,
+  tool_name TEXT,
+  observed_at INTEGER NOT NULL
+);
+
+CREATE INDEX idx_audit_events_session ON audit_events(session_key, occurred_at);
+CREATE INDEX idx_audit_events_sequence ON audit_events(sequence DESC);
+CREATE INDEX idx_audit_events_occurred ON audit_events(occurred_at);
+```
+
+身份是 `event_id` 而不是 `sequence`：后者是单个 Gateway 的行计数器，跨 Gateway 不唯一。这里不会遇到（一个 collector 跟一个 Gateway），但它决定了主键该选哪个。`session_key` 不设外键：回填会读到早于本机会话档案的记录，加了外键等于把它们拒在库外，而它们正是这批数据最有价值的部分（会话表里已经没有的那些）。它按自己的年龄清理，与会话档案同一个保留期（`sessionRetentionDays`），不更早——Gateway 自己的审计轨只留 30 天且按行数裁剪，这里删掉的结论取不回来，会话的分数会随之无声改变。
 
 ### 4.3 activities 表变更
 

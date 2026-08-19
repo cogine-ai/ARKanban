@@ -22,17 +22,28 @@
  *   openclaw gateway call sessions.usage --json --params '{"key":"…","range":"all"}' \
  *     | npx tsx scripts/inspect-gateway-payload.ts usage
  *
+ *   openclaw gateway call audit.list --json --params '{"limit":100}' \
+ *     | npx tsx scripts/inspect-gateway-payload.ts audit
+ *
  * Any method can be explored with `shape`, which is how the mismatches recorded
  * in docs/v1/real-gateway-field-calibration.md were found.
  */
 
+import {
+  AUDIT_KIND_RUN,
+  AUDIT_KIND_TOOL,
+  AUDIT_PAGE_ALIASES,
+  AUDIT_RUN_OUTCOMES,
+  auditToolVerdict,
+  projectAuditPage,
+} from "../src/activity/audit-projector.js";
 import { projectHistoryPage } from "../src/activity/message-projector.js";
 import { HISTORY_PAGE_LIMIT } from "../src/collector/transcript-sync.js";
 import { projectSession } from "../src/activity/session-projector.js";
 import { projectUsagePage } from "../src/activity/usage-projector.js";
 import { FieldInventory } from "../src/collector/field-inventory.js";
 
-const MODES = ["shape", "history", "sessions", "usage"] as const;
+const MODES = ["shape", "history", "sessions", "usage", "audit"] as const;
 type Mode = (typeof MODES)[number];
 
 const requested = process.argv[2] ?? "shape";
@@ -152,6 +163,39 @@ if (mode === "shape") {
   // the unknown list below and are deliberately unconsumed: the runtime assigns
   // them per run rather than accumulating, so they describe the last run and not
   // the session. Reporting them here would invite reading them as spend.
+  reportInventory(inventory);
+} else if (mode === "audit") {
+  const inventory = new FieldInventory("audit.list");
+  const page = projectAuditPage(payload, { observedAt: now, inventory });
+  const kinds = new Map<string, number>();
+  for (const write of page.writes) kinds.set(write.kind, (kinds.get(write.kind) ?? 0) + 1);
+  // Counted through the projector's own aliases. Reading `events` alone would
+  // report zero against a build that named the array something else, next to a
+  // non-zero projected count — in the one tool whose job is to explain that gap.
+  const rawEvents = AUDIT_PAGE_ALIASES.events.map((alias) => payload[alias]).find(Array.isArray);
+  process.stdout.write(`events in payload: ${Array.isArray(rawEvents) ? rawEvents.length : 0}\n`);
+  process.stdout.write(`projected:         ${page.writes.length}\n`);
+  // A drop here is either a record missing an identity field or one that did not
+  // promise `metadata_only`; both are reasons this table stays metadata.
+  process.stdout.write(`dropped:           ${page.dropped}\n`);
+  process.stdout.write(`kinds:             ${[...kinds].map(([kind, n]) => `${kind}=${n}`).join(" ") || "none"}\n`);
+  const statuses = new Map<string, number>();
+  for (const write of page.writes) statuses.set(write.status, (statuses.get(write.status) ?? 0) + 1);
+  process.stdout.write(`statuses:          ${[...statuses].map(([status, n]) => `${status}=${n}`).join(" ")}\n`);
+  // What the trail can actually settle, which is the reason to collect it: a
+  // status this build cannot read either way is worth as much as no record.
+  const tools = page.writes.filter((write) => write.kind === AUDIT_KIND_TOOL);
+  const settled = tools.map((write) => auditToolVerdict(write.status, write.errorCode));
+  process.stdout.write(
+    `tool verdicts:     failed=${settled.filter((v) => v === true).length} ok=${settled.filter((v) => v === false).length} unsettled=${settled.filter((v) => v === undefined).length}\n`,
+  );
+  const runs = page.writes.filter((write) => write.kind === AUDIT_KIND_RUN);
+  const classified = runs.filter((write) => AUDIT_RUN_OUTCOMES[write.status.toLowerCase()] !== undefined);
+  process.stdout.write(`run outcomes:      classified=${classified.length}/${runs.length}\n`);
+  process.stdout.write(`sessions attached: ${page.writes.filter((w) => w.sessionKey !== undefined).length}/${page.writes.length}\n`);
+  process.stdout.write(`tool call ids:     ${tools.filter((w) => w.toolCallId !== undefined).length}/${tools.length}\n`);
+  process.stdout.write(`sequence range:    ${page.oldestSequence ?? "none"}..${page.newestSequence ?? "none"}\n`);
+  process.stdout.write(`nextCursor:        ${page.nextCursor ?? "none"}\n`);
   reportInventory(inventory);
 } else {
   const inventory = new FieldInventory("sessions.usage");

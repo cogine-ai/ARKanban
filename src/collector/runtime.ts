@@ -68,6 +68,12 @@ import {
   TranscriptSynchronizer,
   type TranscriptSyncOutcome,
 } from "./transcript-sync.js";
+import {
+  AUDIT_SYNC_MS,
+  AuditSynchronizer,
+  classifyAuditFailure,
+  type AuditSyncOutcome,
+} from "./audit-sync.js";
 import { FieldInventory, type FieldInventoryReport } from "./field-inventory.js";
 
 const REQUIRED_METHODS = ["tasks.list", "sessions.list", "sessions.subscribe"] as const;
@@ -173,6 +179,7 @@ export class CollectorRuntime {
   private agentTimer?: NodeJS.Timeout;
   private transcriptTimer?: NodeJS.Timeout;
   private usageTimer?: NodeJS.Timeout;
+  private auditTimer?: NodeJS.Timeout;
   private signalTimer?: NodeJS.Timeout;
   private taskSyncing = false;
   private sessionSyncing = false;
@@ -180,16 +187,20 @@ export class CollectorRuntime {
   private agentSyncing = false;
   private transcriptSyncing = false;
   private usageSyncing = false;
+  private auditSyncing = false;
   private signalRecomputing = false;
   private readonly capabilities = new CapabilityRegistry();
   private readonly sessionFields = new FieldInventory("sessions.list");
   private readonly agentFields = new FieldInventory("agents.list");
   private readonly messageFields = new FieldInventory("chat.history");
   private readonly usageFields = new FieldInventory("sessions.usage");
+  private readonly auditFields = new FieldInventory("audit.list");
   private readonly transcripts: TranscriptSynchronizer;
   private readonly usage: UsageSynchronizer;
+  private readonly audit: AuditSynchronizer;
   private transcriptStatus: TranscriptSyncOutcome | undefined;
   private usageStatus: UsageSyncOutcome | undefined;
+  private auditStatus: AuditSyncOutcome | undefined;
   private signalStatus: SignalRecomputeStatus | undefined;
   private sessionArchiveError?: string;
   private pruneError?: string;
@@ -229,12 +240,18 @@ export class CollectorRuntime {
       maxBytes: config.storage.transcriptMaxBytes,
       enabled: config.storage.transcriptSync === "enabled",
       inventory: this.messageFields,
-      onArchived: (sessionKeys) => this.rescoreArchived(sessionKeys),
+      onArchived: (sessionKeys) => this.rescoreEvidence(sessionKeys),
     });
     this.usage = new UsageSynchronizer({
       store: this.repository.usage,
       request: async (method, params) => this.gateway.request(method, params),
       inventory: this.usageFields,
+    });
+    this.audit = new AuditSynchronizer({
+      store: this.repository.audit,
+      request: async (method, params) => this.gateway.request(method, params),
+      inventory: this.auditFields,
+      onRecorded: (sessionKeys) => this.rescoreEvidence(sessionKeys),
     });
   }
 
@@ -250,6 +267,7 @@ export class CollectorRuntime {
     this.agentTimer = setInterval(() => void this.syncAgents("agent_interval"), AGENT_RECONCILE_MS);
     this.transcriptTimer = setInterval(() => void this.syncTranscripts(), TRANSCRIPT_SYNC_MS);
     this.usageTimer = setInterval(() => void this.syncUsage(), USAGE_SYNC_MS);
+    this.auditTimer = setInterval(() => void this.syncAudit(), AUDIT_SYNC_MS);
     this.signalTimer = setInterval(() => this.recomputeSignals(), SIGNAL_RECOMPUTE_MS);
     this.gateway.start();
   }
@@ -263,6 +281,7 @@ export class CollectorRuntime {
     if (this.agentTimer) clearInterval(this.agentTimer);
     if (this.transcriptTimer) clearInterval(this.transcriptTimer);
     if (this.usageTimer) clearInterval(this.usageTimer);
+    if (this.auditTimer) clearInterval(this.auditTimer);
     if (this.signalTimer) clearInterval(this.signalTimer);
     this.gateway.stop();
     this.repository.close();
@@ -363,6 +382,8 @@ export class CollectorRuntime {
       this.sessionFields.reset();
       this.agentFields.reset();
       this.usageFields.reset();
+      this.messageFields.reset();
+      this.auditFields.reset();
       // Prices are held in memory against a specific Gateway's pricing table,
       // so they do not survive a reconnect either.
       this.usage.resetCost();
@@ -638,16 +659,16 @@ export class CollectorRuntime {
   }
 
   /**
-   * Rescores the sessions a transcript round added messages to.
+   * Rescores the sessions a collection round found new evidence for.
    *
-   * Done here rather than left to the periodic pass because a backfill page is
-   * evidence arriving for a session that has not moved: the staleness check reads
-   * `last_activity_at`, so a page of last week's tool failures would sit in the
-   * archive unscored until something else happened in that session. The set is
-   * bounded by the round's request budget, and scoring one session is a couple of
-   * indexed reads.
+   * Done here rather than left to the periodic pass because a backfill page — of
+   * transcript or of audit trail — is evidence arriving for a session that has not
+   * moved: the staleness check reads `last_activity_at`, so last week's tool
+   * failures would sit unscored until something else happened in that session. The
+   * set is bounded by the round's request budget, and scoring one session is a
+   * couple of indexed reads.
    */
-  private rescoreArchived(sessionKeys: readonly string[]): void {
+  private rescoreEvidence(sessionKeys: readonly string[]): void {
     if (this.stopped) return;
     const now = Date.now();
     let rescored = 0;
@@ -783,6 +804,43 @@ export class CollectorRuntime {
   }
 
   /**
+   * Pulls the Gateway's audit trail.
+   *
+   * Isolated like the other secondary loops: own timer, own try boundary, no
+   * influence on `CollectorSyncState`. A Gateway build without `audit.list` is a
+   * missing evidence source for scoring, not a degraded collector — the grades
+   * simply fall back to the transcript and the observations, which is what they
+   * were computed from before this loop existed.
+   */
+  private async syncAudit(): Promise<void> {
+    if (this.auditSyncing) return;
+    this.auditSyncing = true;
+    try {
+      this.auditStatus = await this.audit.runOnce({
+        now: Date.now(),
+        connected: this.gateway.isConnected,
+        auditState: this.capabilities.stateOf("audit.list"),
+      });
+    } catch (error) {
+      this.auditStatus = {
+        requests: 0,
+        inserted: 0,
+        caughtUp: false,
+        complete: false,
+        rewound: false,
+        errorCode: classifyAuditFailure(error),
+      };
+    } finally {
+      this.auditSyncing = false;
+    }
+  }
+
+  /** Counts and watermarks only; the trail carries no conversation text to leak. */
+  getAuditStatus(): AuditSyncOutcome | undefined {
+    return this.auditStatus;
+  }
+
+  /**
    * Rescores sessions whose stored signals fell behind the evidence.
    *
    * Purely local: signals derive from stored activities and observations, so
@@ -859,6 +917,7 @@ export class CollectorRuntime {
       this.agentFields.report(),
       this.messageFields.report(),
       this.usageFields.report(),
+      this.auditFields.report(),
     ];
   }
 
@@ -1181,6 +1240,13 @@ export class CollectorRuntime {
         protectSince: now - ACTIVE_WINDOW_MS,
       });
       if (aged > 0 || evicted.messages > 0) topics.add("messages");
+      // The audit trail ages out with the sessions it scores. Deliberately not
+      // sooner: the Gateway keeps its own trail for 30 days and prunes by row count
+      // too, so a verdict deleted here cannot be fetched again, and a session would
+      // silently regrade as its evidence disappeared.
+      if (this.repository.audit.pruneOlderThan(now - this.config.storage.sessionRetentionDays * day) > 0) {
+        topics.add("sessions");
+      }
       // This pass is where the archive's real page cost gets re-measured: it has
       // just deleted rows the sync loop cannot see, and its own estimate would
       // still be counting them.

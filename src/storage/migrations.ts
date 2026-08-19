@@ -371,12 +371,71 @@ const messageToolError: Migration = {
   },
 };
 
+/**
+ * Version 6 holds the Gateway's own audit trail.
+ *
+ * `audit.list` states what a tool call and a run ended as, which until now this
+ * collector could only infer: from an event phase vocabulary guessed out of
+ * documentation, or from an archived `toolResult` that exists only where
+ * transcript sync is on and has reached that page. The records are metadata —
+ * every row carries `redaction: "metadata_only"` and the projector drops any that
+ * does not — so this table holds no conversation text and is not part of the
+ * archive's disclosure surface.
+ *
+ * `sequence` is the Gateway's own row counter and the reason paging works at all:
+ * it is the cursor, the sync watermark and the only stable ordering, since
+ * `occurred_at` ties between the start and end of a fast tool call. It is not
+ * unique across Gateways, which does not arise here — one collector follows one
+ * Gateway — but is why `event_id` rather than `sequence` is the identity.
+ */
+const gatewayAuditTrail: Migration = {
+  version: 6,
+  name: "gateway-audit-trail",
+  up(db) {
+    db.exec(`
+      CREATE TABLE audit_events (
+        event_id TEXT PRIMARY KEY,
+        sequence INTEGER NOT NULL,
+        source_sequence INTEGER,
+        occurred_at INTEGER NOT NULL,
+        kind TEXT NOT NULL,
+        -- Nullable, though every observed row carries one: an empty string here
+        -- would read as an action named nothing rather than as one not reported.
+        action TEXT,
+        status TEXT NOT NULL,
+        error_code TEXT,
+        actor_type TEXT,
+        actor_id TEXT,
+        agent_id TEXT,
+        -- Nullable because the Gateway omits them on records that belong to a run
+        -- rather than a conversation. A verdict with no session cannot be scored,
+        -- and storing it as an empty string would attach every one of them to the
+        -- same imaginary session.
+        session_key TEXT,
+        session_id TEXT,
+        run_id TEXT,
+        tool_call_id TEXT,
+        tool_name TEXT,
+        observed_at INTEGER NOT NULL
+      );
+
+      -- Scoring reads one session's verdicts in order.
+      CREATE INDEX idx_audit_events_session ON audit_events(session_key, occurred_at);
+      -- The watermark is a MAX over this column, and paging orders by it.
+      CREATE INDEX idx_audit_events_sequence ON audit_events(sequence DESC);
+      -- Retention deletes by age.
+      CREATE INDEX idx_audit_events_occurred ON audit_events(occurred_at);
+    `);
+  },
+};
+
 export const MIGRATIONS: readonly Migration[] = [
   baseline,
   agentsSessionSurface,
   usageRollupIncrements,
   dropUnusedMessageStats,
   messageToolError,
+  gatewayAuditTrail,
 ];
 
 export const TARGET_SCHEMA_VERSION = MIGRATIONS.reduce(

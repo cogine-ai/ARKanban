@@ -16,6 +16,7 @@ import type {
   SessionSignalGrade,
   SessionSignals,
 } from "../contracts.js";
+import type { AuditStore } from "./audit-store.js";
 
 /**
  * Storage for derived session signals.
@@ -86,7 +87,10 @@ function rowToSignals(row: Row): SessionSignals {
 }
 
 export class SignalStore {
-  constructor(private readonly db: DatabaseSync) {}
+  constructor(
+    private readonly db: DatabaseSync,
+    private readonly audit: AuditStore,
+  ) {}
 
   get(sessionKey: string): SessionSignals | undefined {
     const row = this.db.prepare("SELECT * FROM session_signals WHERE session_key = ?").get(sessionKey) as Row | undefined;
@@ -179,20 +183,24 @@ export class SignalStore {
   /**
    * Loads the evidence one session's score rests on.
    *
-   * Tool outcomes have two possible sources. An archived `toolResult` message
-   * states the outcome outright in `is_error`; an observation only carries a
-   * lifecycle phase whose failure vocabulary this codebase had to guess. Both
-   * describe the same calls, so they are alternatives rather than additions —
-   * summing them would charge one failed call twice — so the one that settled
-   * more calls is the one scored, with the transcript taking a tie because its
-   * verdicts are stated rather than inferred.
+   * Tool outcomes have three possible sources. The audit trail states the verdict
+   * in `status` and pairs each call by `toolCallId`; an archived `toolResult`
+   * message states it in `is_error`; an observation carries only a lifecycle phase
+   * whose failure vocabulary this codebase had to guess. All three describe the
+   * same calls, so they are alternatives rather than additions — summing them would
+   * charge one failed call twice, or three times — and the one that settled more
+   * calls is the one scored.
    *
-   * "Whichever saw more" rather than "the transcript whenever it has anything":
-   * an archive is built a page at a time, and a session mid-backfill holds only
-   * its newest page. Letting two archived results speak for a session whose
+   * "Whichever saw more" rather than "the stated source whenever it has anything":
+   * every one of them is assembled a page at a time, and a session mid-backfill
+   * holds only its newest page. Letting two records speak for a session whose
    * events recorded ten would drop the older failures, the streak they formed and
-   * the retries after them — and the grade would improve as the archive grew,
-   * which is the opposite of what collecting more evidence should do.
+   * the retries after them — and the grade would improve as collection caught up,
+   * which is the opposite of what more evidence should do.
+   *
+   * Ties go to the audit trail, then the transcript, then observations: that is
+   * the order in which the Gateway stated the verdict rather than this codebase
+   * inferring it.
    *
    * Ordering by `occurred_at` / `created_at` is what makes failure streaks and
    * retry loops readable at all.
@@ -274,17 +282,33 @@ export class SignalStore {
       };
     });
 
-    // Every archived row is a settled call by construction: it is there because
-    // the Gateway stated an outcome for it. Observations have to be counted,
-    // since a `start` with no recorded end settles nothing.
-    const settledObservations = tallyToolEvents(observedTools).settled;
+    const auditTools: ToolEventEvidence[] = this.audit.toolVerdicts(sessionKey).map((verdict) => ({
+      ...(verdict.toolName ? { toolName: verdict.toolName } : {}),
+      kind: "audit.tool_action",
+      failed: verdict.failed,
+      occurredAt: verdict.occurredAt,
+    }));
+
+    // Audit and archive rows are settled calls by construction: each is there
+    // because the Gateway stated an outcome for it, and the unsettled ones were
+    // dropped on the way in. Observations have to be counted, since a `start` with
+    // no recorded end settles nothing.
+    const candidates = [
+      { events: auditTools, settled: auditTools.length },
+      { events: archivedTools, settled: archivedTools.length },
+      { events: observedTools, settled: tallyToolEvents(observedTools).settled },
+    ];
+    // First maximum wins, so the array order above is the tiebreak.
+    const richest = candidates.reduce((best, candidate) => (candidate.settled > best.settled ? candidate : best));
+    const auditRun = this.audit.runVerdict(sessionKey);
 
     return {
       sessionKey: String(session.session_key),
       lastActivityAt: Number(session.last_activity_at ?? 0),
       hasActiveRun: Number(session.has_active_run ?? 0) === 1,
       activities,
-      toolEvents: archivedTools.length >= settledObservations ? archivedTools : observedTools,
+      toolEvents: richest.events,
+      ...(auditRun ? { auditRun } : {}),
     };
   }
 

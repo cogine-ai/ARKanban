@@ -107,6 +107,93 @@ function sessionWireRow(session: (typeof sessions)[number]): Record<string, unkn
   return wire;
 }
 
+/**
+ * The Gateway's own audit trail, newest first.
+ *
+ * Two things about it drive the collector's paging and are easy to get wrong in a
+ * fixture. `sequence` descends and is the cursor, so a page is "the rows below
+ * this number" rather than an offset into a list. And `occurredAt` ties inside a
+ * pair — a tool call that starts and finishes within the same millisecond is
+ * normal — so the sequence is the only total order available.
+ *
+ * Every row says `metadata_only`, as every observed row does. That is the
+ * contract this table is stored under: no conversation text arrives here.
+ */
+const auditTrail = (() => {
+  const events: Array<Record<string, unknown>> = [];
+  const toolNames = ["read", "exec", "web_search", "edit"];
+  let sequence = 4_000;
+  // Ascending while building, so a run's end follows its tool calls, then
+  // reversed once — the wire order is newest first.
+  for (const [index, session] of sessions.slice(0, 44).entries()) {
+    const runId = session.activeRunIds[0] ?? `demo-task-run-${index + 1}`;
+    const startedAt = session.startedAt;
+    for (let call = 0; call < 2 + (index % 3); call += 1) {
+      const toolName = toolNames[(index + call) % toolNames.length]!;
+      const toolCallId = `call-${index + 1}-${call + 1}`;
+      const at = startedAt + call * 4_000;
+      // Failures cluster on a few agents so the grades differ across the roster
+      // rather than every session scoring the same.
+      const failed = index % 5 === 0 && call === 1;
+      const actor = { type: "agent", id: session.agentId };
+      events.push({
+        eventId: `audit-${sequence}`,
+        sequence: (sequence += 1),
+        occurredAt: at,
+        kind: "tool_action",
+        action: "tool.action.started",
+        status: "started",
+        actor,
+        agentId: session.agentId,
+        sessionKey: session.key,
+        sessionId: session.sessionId,
+        runId,
+        toolCallId,
+        toolName,
+        redaction: "metadata_only",
+      });
+      events.push({
+        eventId: `audit-${sequence}`,
+        // A settled call shares its start's millisecond, which is exactly the
+        // tie the sequence has to break.
+        sequence: (sequence += 1),
+        occurredAt: at,
+        kind: "tool_action",
+        action: "tool.action.finished",
+        status: failed ? "failed" : "succeeded",
+        ...(failed ? { errorCode: "tool_exec_failed" } : {}),
+        actor,
+        agentId: session.agentId,
+        sessionKey: session.key,
+        sessionId: session.sessionId,
+        runId,
+        toolCallId,
+        toolName,
+        redaction: "metadata_only",
+      });
+    }
+    // Only the runs that ended have a verdict; a live session's run has not
+    // finished, and inventing an ending for it would grade it as complete.
+    if (!session.hasActiveRun) {
+      events.push({
+        eventId: `audit-${sequence}`,
+        sequence: (sequence += 1),
+        occurredAt: session.lastActivityAt,
+        kind: "agent_run",
+        action: "agent.run.finished",
+        status: index % 7 === 0 ? "failed" : index % 11 === 0 ? "cancelled" : "succeeded",
+        actor: { type: "operator", id: "demo-operator" },
+        agentId: session.agentId,
+        sessionKey: session.key,
+        sessionId: session.sessionId,
+        runId,
+        redaction: "metadata_only",
+      });
+    }
+  }
+  return events.reverse();
+})();
+
 // Transcript bodies deliberately mix scripts, languages and an injection payload:
 // the archive stores untrusted input, and the reader must render all of it as
 // text. The CJK lines are what exercise the trigram index and its LIKE fallback.
@@ -492,6 +579,33 @@ server.on("connection", (socket) => {
           ],
         },
       });
+    } else if (request.method === "audit.list") {
+      // Keyset paging on a descending sequence: the cursor is a sequence number
+      // and a page is the rows strictly below it. `nextCursor` appears only while
+      // older rows remain, which is the collector's signal that a backwards walk
+      // has reached the end of the trail.
+      const params = request.params as { cursor?: string; limit?: number; kind?: string } | undefined;
+      const cursor = params?.cursor === undefined ? undefined : Number(params.cursor);
+      // Clamped rather than refused, as the real handler does: `Math.min(limit ??
+      // 100, 500)`. A collector asking for more than the ceiling gets a smaller
+      // page, not an error — so the page limit is not a way to break collection.
+      const limit = Math.min(Math.max(Number(params?.limit ?? 100), 1), 500);
+      const matching = auditTrail.filter(
+        (event) =>
+          (cursor === undefined || Number(event.sequence) < cursor) &&
+          (params?.kind === undefined || event.kind === params.kind),
+      );
+      const page = matching.slice(0, limit);
+      const remaining = matching.length > page.length;
+      send(socket, {
+        type: "res",
+        id: request.id,
+        ok: true,
+        payload: {
+          events: page,
+          ...(remaining ? { nextCursor: String(page[page.length - 1]!.sequence) } : {}),
+        },
+      });
     } else if (request.method === "cron.status") {
       send(socket, { type: "res", id: request.id, ok: true, payload: { enabled: true, jobs: cronJobs.length, nextWakeAtMs: cronJobs[0]?.state.nextRunAtMs } });
     } else if (request.method === "cron.list") {
@@ -523,6 +637,26 @@ function broadcast(event: string, payload: unknown): void {
  */
 let tick = 0;
 
+/**
+ * Adds a row to the top of the audit trail as the live loop acts.
+ *
+ * A static trail would be fully collected within a round and the tail read would
+ * have nothing left to do, so the incremental path — read down until a known
+ * sequence, stop — would never run against this mock.
+ */
+let auditSequence = Number(auditTrail[0]?.sequence ?? 0);
+
+function recordAudit(event: Record<string, unknown>): void {
+  auditSequence += 1;
+  auditTrail.unshift({
+    eventId: `audit-${auditSequence}`,
+    sequence: auditSequence,
+    occurredAt: Date.now(),
+    redaction: "metadata_only",
+    ...event,
+  });
+}
+
 const eventTimer = setInterval(() => {
   const session = liveSessions[tick % liveSessions.length]!;
   // Between an end and its restart there is no run to attribute tool calls to.
@@ -539,8 +673,16 @@ const eventTimer = setInterval(() => {
     ts: Date.now(),
   };
   const toolCallId = `demo-tool-${frameSequence}`;
+  const auditBase = {
+    actor: { type: "agent", id: session.agentId },
+    agentId: session.agentId,
+    sessionKey: session.key,
+    sessionId: session.sessionId,
+    runId: session.activeRunIds[0],
+  };
 
   broadcast("session.tool", { ...base, seq: frameSequence, data: { phase: "start", name: toolName, toolCallId } });
+  recordAudit({ ...auditBase, kind: "tool_action", action: "tool.action.started", status: "started", toolCallId, toolName });
 
   // Every fifth call fails, and every fifteenth fails twice in a row, so both a
   // one-off failure and a retry loop appear in the archive.
@@ -559,12 +701,30 @@ const eventTimer = setInterval(() => {
         ? { phase: "error", name: toolName, toolCallId, error: "mock tool failure" }
         : { phase: "end", name: toolName, toolCallId },
     });
+    recordAudit({
+      ...auditBase,
+      kind: "tool_action",
+      action: "tool.action.finished",
+      status: fails ? "failed" : "succeeded",
+      ...(fails ? { errorCode: "tool_exec_failed" } : {}),
+      toolCallId,
+      toolName,
+    });
     if (tick % 15 === 0) {
       broadcast("session.tool", {
         ...base,
         ts: Date.now(),
         seq: frameSequence,
         data: { phase: "error", name: toolName, toolCallId: `${toolCallId}-retry`, error: "mock retry failure" },
+      });
+      recordAudit({
+        ...auditBase,
+        kind: "tool_action",
+        action: "tool.action.finished",
+        status: "failed",
+        errorCode: "tool_exec_failed",
+        toolCallId: `${toolCallId}-retry`,
+        toolName,
       });
     }
     // Ordered after the tool settles, the way a real run ends: its last tool
@@ -598,6 +758,16 @@ function endRun(session: (typeof liveSessions)[number], failing: boolean): void 
     hasActiveRun: false,
     ts: Date.now(),
     ...(failing ? { lastRunError: "mock run failure" } : {}),
+  });
+  recordAudit({
+    actor: { type: "operator", id: "demo-operator" },
+    kind: "agent_run",
+    action: "agent.run.finished",
+    status: failing ? "failed" : "succeeded",
+    agentId: session.agentId,
+    sessionKey: session.key,
+    sessionId: session.sessionId,
+    runId: endedRunId,
   });
 
   // Restarted under a fresh run id, so the board keeps moving and the archive

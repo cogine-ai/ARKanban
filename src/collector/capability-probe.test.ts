@@ -72,6 +72,7 @@ describe("CapabilityRegistry", () => {
     const registry = new CapabilityRegistry();
     await registry.probeAll(async () => ({}));
     expect(Object.keys(registry.snapshot()).sort()).toEqual([
+      "audit.list",
       "chat.history",
       "sessions.usage",
       "sessions.usage.timeseries",

@@ -37,6 +37,7 @@ import type {
   UsageTotals,
 } from "../contracts.js";
 import { agentIdFromSessionKey, type ActivityWrite } from "../activity/projector.js";
+import { AuditStore } from "./audit-store.js";
 import { applyMigrations, type MigrationResult } from "./migrations.js";
 import { encodeCursor, type KeysetCursor, type SessionSort } from "./keyset-cursor.js";
 import { GRADE_SEVERITY, SignalStore } from "./signal-store.js";
@@ -578,6 +579,8 @@ export class CollectorRepository {
   /** The only permitted write path for session transcripts. */
   readonly transcripts: TranscriptArchive;
   readonly usage: UsageStore;
+  /** Gateway-stated run and tool verdicts; metadata only, never conversation text. */
+  readonly audit: AuditStore;
   readonly signals: SignalStore;
   /**
    * False when this filesystem would not hold the database to its owner, so the
@@ -612,7 +615,8 @@ export class CollectorRepository {
     this.migration = applyMigrations(this.db, databasePath);
     this.transcripts = new TranscriptArchive(this.db);
     this.usage = new UsageStore(this.db);
-    this.signals = new SignalStore(this.db);
+    this.audit = new AuditStore(this.db);
+    this.signals = new SignalStore(this.db, this.audit);
     this.db.prepare("INSERT OR REPLACE INTO meta(key, value) VALUES ('epoch', ?)").run(this.epoch);
     this.db.prepare("INSERT OR REPLACE INTO meta(key, value) VALUES ('revision', '0')").run();
 

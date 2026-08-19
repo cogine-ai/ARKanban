@@ -55,10 +55,12 @@ import { inferAgents, projectAgent, projectSession } from "../activity/session-p
 import { CapabilityRegistry, type CapabilityState } from "./capability-probe.js";
 import {
   classifyUsageFailure,
+  type CostSpan,
   USAGE_SYNC_MS,
   UsageSynchronizer,
   type UsageSyncOutcome,
 } from "./usage-sync.js";
+import type { AgentCostEntry } from "../activity/usage-projector.js";
 import {
   ACTIVE_WINDOW_MS,
   classifyHistoryFailure,
@@ -184,7 +186,6 @@ export class CollectorRuntime {
   private readonly agentFields = new FieldInventory("agents.list");
   private readonly messageFields = new FieldInventory("chat.history");
   private readonly usageFields = new FieldInventory("sessions.usage");
-  private readonly costFields = new FieldInventory("usage.cost");
   private readonly transcripts: TranscriptSynchronizer;
   private readonly usage: UsageSynchronizer;
   private transcriptStatus: TranscriptSyncOutcome | undefined;
@@ -228,12 +229,12 @@ export class CollectorRuntime {
       maxBytes: config.storage.transcriptMaxBytes,
       enabled: config.storage.transcriptSync === "enabled",
       inventory: this.messageFields,
+      onArchived: (sessionKeys) => this.rescoreArchived(sessionKeys),
     });
     this.usage = new UsageSynchronizer({
       store: this.repository.usage,
       request: async (method, params) => this.gateway.request(method, params),
       inventory: this.usageFields,
-      costInventory: this.costFields,
     });
   }
 
@@ -362,7 +363,6 @@ export class CollectorRuntime {
       this.sessionFields.reset();
       this.agentFields.reset();
       this.usageFields.reset();
-      this.costFields.reset();
       // Prices are held in memory against a specific Gateway's pricing table,
       // so they do not survive a reconnect either.
       this.usage.resetCost();
@@ -638,6 +638,38 @@ export class CollectorRuntime {
   }
 
   /**
+   * Rescores the sessions a transcript round added messages to.
+   *
+   * Done here rather than left to the periodic pass because a backfill page is
+   * evidence arriving for a session that has not moved: the staleness check reads
+   * `last_activity_at`, so a page of last week's tool failures would sit in the
+   * archive unscored until something else happened in that session. The set is
+   * bounded by the round's request budget, and scoring one session is a couple of
+   * indexed reads.
+   */
+  private rescoreArchived(sessionKeys: readonly string[]): void {
+    if (this.stopped) return;
+    const now = Date.now();
+    let rescored = 0;
+    for (const sessionKey of sessionKeys) {
+      // A key can be archived before its session row exists, in which case there
+      // is nothing to score against yet and the periodic pass picks it up later.
+      if (this.repository.signals.recompute(sessionKey, now)) rescored += 1;
+    }
+    // Same frame the periodic pass emits: a grade changed, and the list is sorted
+    // and filtered by it.
+    if (rescored > 0) {
+      this.emitChange({
+        epoch: this.repository.epoch,
+        revision: this.repository.revision,
+        topics: ["sessions"],
+        ids: [],
+        reasons: ["signals_recomputed"],
+      });
+    }
+  }
+
+  /**
    * Whether `chat.history` can be called.
    *
    * A probe that actually made the call wins over the advertisement, in both
@@ -707,7 +739,6 @@ export class CollectorRuntime {
         now: Date.now(),
         connected: this.gateway.isConnected,
         usageState: this.capabilities.stateOf("sessions.usage"),
-        costState: this.capabilities.stateOf("usage.cost"),
       });
     } catch (error) {
       this.usageStatus = {
@@ -794,9 +825,14 @@ export class CollectorRuntime {
     return this.signalStatus;
   }
 
-  /** Gateway-priced cost per agent, absent when `usage.cost` never answered. */
-  getAgentCost(window: AgentRollupWindow, agentId: string): number | undefined {
+  /** Gateway-priced cost per agent, absent when the ranged read never answered. */
+  getAgentCost(window: AgentRollupWindow, agentId: string): AgentCostEntry | undefined {
     return this.usage.costFor(window, agentId);
+  }
+
+  /** The calendar span the Gateway priced a window over, as it reported it. */
+  getAgentCostSpan(window: AgentRollupWindow): CostSpan | undefined {
+    return this.usage.costSpan(window);
   }
 
   /**
@@ -823,7 +859,6 @@ export class CollectorRuntime {
       this.agentFields.report(),
       this.messageFields.report(),
       this.usageFields.report(),
-      this.costFields.report(),
     ];
   }
 

@@ -493,7 +493,12 @@ describe("usage HTTP API", () => {
     expect(agents.find((agent) => agent.id === "quiet")?.cost.windows["24h"].sessionCount).toBe(0);
   });
 
-  it("takes the Gateway's amount without inheriting a completeness it cannot have", async () => {
+  /**
+   * The unpriced model names only ever come from the per-session reads, because a
+   * ranged reply counts what it could not price without naming it. Keeping the
+   * names while the range decides completeness is the most either source can say.
+   */
+  it("takes the ranged reply's own verdict on whether the amount is a floor", async () => {
     const { app, runtime } = await serverWithUsage();
     runtime.repository.usage.record([
       {
@@ -508,9 +513,7 @@ describe("usage HTTP API", () => {
         unpricedModels: ["local-llm"],
       },
     ]);
-    // Stands in for a `usage.cost` reply, which prices a range but says nothing
-    // about the models it failed to price.
-    Object.defineProperty(runtime, "getAgentCost", { value: () => 50_000 });
+    Object.defineProperty(runtime, "getAgentCost", { value: () => ({ costMicroUsd: 50_000, hasCost: false }) });
 
     const response = await app.inject({ method: "GET", url: "/api/v1/agents" });
     const builder = (response.json().agents as AgentOverview[]).find((agent) => agent.id === "builder");
@@ -524,14 +527,45 @@ describe("usage HTTP API", () => {
   });
 
   /**
-   * The two windows are priced by separate `usage.cost` calls. A single label for
-   * the pair put the Gateway's name on a window it never answered for, whenever
-   * the other window did.
+   * A stored reading being a floor says nothing about the span on screen: the two
+   * cover different spans, and the amount shown is the ranged one. Carrying the
+   * per-session verdict over marked a fully priced range as incomplete.
+   */
+  it("calls a fully priced range complete even when a stored reading was a floor", async () => {
+    const { app, runtime } = await serverWithUsage();
+    runtime.repository.usage.record([
+      {
+        sessionKey: "agent:builder:cheap",
+        observedAt: NOW + 1,
+        inputTokens: 100,
+        outputTokens: 20,
+        cacheReadTokens: 0,
+        cacheWriteTokens: 0,
+        hasCost: false,
+        models: ["local-llm"],
+        unpricedModels: ["local-llm"],
+      },
+    ]);
+    Object.defineProperty(runtime, "getAgentCost", { value: () => ({ costMicroUsd: 50_000, hasCost: true }) });
+
+    const response = await app.inject({ method: "GET", url: "/api/v1/agents" });
+    const builder = (response.json().agents as AgentOverview[]).find((agent) => agent.id === "builder");
+
+    expect(builder?.cost.windows["24h"]).toMatchObject({ costMicroUsd: 50_000, hasCost: true });
+  });
+
+  /**
+   * The two windows are separate requests. A single label for the pair put the
+   * Gateway's name on a window it never answered for, whenever the other window
+   * did — and the span is published per window for the same reason.
    */
   it("names the pricing source per window when only one was priced", async () => {
     const { app, runtime } = await serverWithUsage();
     Object.defineProperty(runtime, "getAgentCost", {
-      value: (window: AgentRollupWindow) => (window === "7d" ? 50_000 : undefined),
+      value: (window: AgentRollupWindow) => (window === "7d" ? { costMicroUsd: 50_000, hasCost: true } : undefined),
+    });
+    Object.defineProperty(runtime, "getAgentCostSpan", {
+      value: (window: AgentRollupWindow) => (window === "7d" ? { from: "2026-08-12", to: "2026-08-18" } : undefined),
     });
 
     const response = await app.inject({ method: "GET", url: "/api/v1/agents" });
@@ -539,6 +573,9 @@ describe("usage HTTP API", () => {
 
     expect(builder?.cost.source).toEqual({ "24h": "snapshots", "7d": "gateway" });
     expect(builder?.cost.windows["7d"]).toMatchObject({ costMicroUsd: 50_000 });
+    // The card labels a Gateway-priced window from this, because the Gateway
+    // prices calendar days and the window key does not say so.
+    expect(builder?.cost.priced).toEqual({ "7d": { from: "2026-08-12", to: "2026-08-18" } });
   });
 
   it("summarises a range by agent and model", async () => {

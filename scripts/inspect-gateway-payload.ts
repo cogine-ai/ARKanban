@@ -16,8 +16,8 @@
  *   openclaw gateway call sessions.list --json --params '{"limit":20}' \
  *     | npx tsx scripts/inspect-gateway-payload.ts sessions
  *
- *   openclaw gateway call chat.history --json --params '{"sessionKey":"…","offset":0}' \
- *     | npx tsx scripts/inspect-gateway-payload.ts history
+ *   openclaw gateway call chat.history --json --params '{"sessionKey":"…","limit":30}' \
+ *     | npx tsx scripts/inspect-gateway-payload.ts history 30
  *
  *   openclaw gateway call sessions.usage --json --params '{"key":"…","range":"all"}' \
  *     | npx tsx scripts/inspect-gateway-payload.ts usage
@@ -27,6 +27,7 @@
  */
 
 import { projectHistoryPage } from "../src/activity/message-projector.js";
+import { HISTORY_PAGE_LIMIT } from "../src/collector/transcript-sync.js";
 import { projectSession } from "../src/activity/session-projector.js";
 import { projectUsagePage } from "../src/activity/usage-projector.js";
 import { FieldInventory } from "../src/collector/field-inventory.js";
@@ -41,6 +42,21 @@ if (!MODES.includes(requested as Mode)) {
 }
 const mode = requested as Mode;
 const now = Date.now();
+
+/**
+ * The `limit` the call was made with, because 2026.7.1-2 reports no paging at all
+ * and the projector derives `hasMore` from whether the page came back full. Pass
+ * the same number here that the call used, or the paging verdict this prints is
+ * about a request nobody made.
+ */
+const limitArgument = (process.argv[3] ?? "").trim();
+// Whole positive integers only. `parseInt` reads `30x` as 30 and `-5` as -5, and
+// a negative limit makes every page look full — this script exists to report the
+// paging verdict, so it may not invent one out of a typo and say nothing.
+const requestLimit = /^[1-9]\d*$/.test(limitArgument) ? Number(limitArgument) : HISTORY_PAGE_LIMIT;
+if (limitArgument && requestLimit !== Number(limitArgument)) {
+  process.stderr.write(`ignoring limit "${limitArgument}"; using ${HISTORY_PAGE_LIMIT}\n`);
+}
 
 const MAX_DEPTH = 5;
 
@@ -88,7 +104,13 @@ if (mode === "shape") {
   process.stdout.write(`${shapeOf(payload)}\n`);
 } else if (mode === "history") {
   const inventory = new FieldInventory("chat.history");
-  const page = projectHistoryPage(payload, { sessionKey: "probe", observedAt: now, seqBase: -1, inventory });
+  const page = projectHistoryPage(payload, {
+    sessionKey: "probe",
+    observedAt: now,
+    seqBase: -1,
+    request: { limit: requestLimit, offset: 0 },
+    inventory,
+  });
   const roles = new Map<string, number>();
   for (const write of page.writes) roles.set(write.role, (roles.get(write.role) ?? 0) + 1);
   const inPayload = Array.isArray(payload.messages) ? payload.messages.length : 0;
@@ -97,6 +119,12 @@ if (mode === "shape") {
   process.stdout.write(`dropped:             ${page.dropped}\n`);
   process.stdout.write(`roles:               ${[...roles].map(([role, n]) => `${role}=${n}`).join(" ") || "none"}\n`);
   process.stdout.write(`ids present:         ${page.writes.filter((w) => w.messageId !== undefined).length}/${page.writes.length}\n`);
+  // Three states, counted separately: a stated failure, a stated success, and a
+  // turn that is not a tool result. Collapsing the last two is the mistake this
+  // line exists to catch.
+  const failed = page.writes.filter((write) => write.isError === true).length;
+  const worked = page.writes.filter((write) => write.isError === false).length;
+  process.stdout.write(`tool verdicts:       failed=${failed} ok=${worked} absent=${page.writes.length - failed - worked}\n`);
   if (page.writes.length > 0) {
     const seqs = page.writes.map((write) => write.seq);
     process.stdout.write(`seq range:           ${Math.min(...seqs)}..${Math.max(...seqs)}\n`);

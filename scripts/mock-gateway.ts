@@ -113,8 +113,11 @@ function sessionWireRow(session: (typeof sessions)[number]): Record<string, unkn
 const transcriptTurns = [
   { role: "user", content: "登录接口最近的失败率有点高，帮我看一下是不是超时导致的。" },
   { role: "assistant", content: "我先拉取最近 24 小时的 登录接口 调用日志，再按错误码分组。" },
-  { role: "tool", toolName: "query_logs", content: '{"window":"24h","group_by":"error_code","rows":1842}' },
+  // `isError` is spelled the way 2026.7.1-2 spells it, and appears both ways: a
+  // tool result that worked says so, which is what tells a grade the call settled.
+  { role: "toolResult", toolName: "query_logs", isError: false, content: '{"window":"24h","group_by":"error_code","rows":1842}' },
   { role: "assistant", content: "超时占 63%，其余是凭证错误。建议把上游超时从 2s 调到 5s。" },
+  { role: "toolResult", toolName: "deploy_canary", isError: true, content: "Error: upstream refused the canary weight change (429)" },
   { role: "user", content: "Can you also check whether the retry budget is being exhausted?" },
   { role: "assistant", content: "Retry budget peaks at 78% during the 09:00 burst; it is not exhausted." },
   { role: "user", content: "<script>alert('xss')</script> **bold** [link](javascript:void 0)" },
@@ -169,6 +172,94 @@ function mockCacheStatus(observedAt: number): Record<string, unknown> {
   return { status: "fresh", cachedFiles: 1, pendingFiles: 0, staleFiles: 0, refreshedAt: observedAt };
 }
 
+/** Everything `SessionsUsageParamsSchema` allows, and nothing else. */
+const SESSIONS_USAGE_PARAMS = new Set([
+  "key",
+  "agentId",
+  "agentScope",
+  "startDate",
+  "endDate",
+  "mode",
+  "range",
+  "groupBy",
+  "includeHistorical",
+  "utcOffset",
+  "limit",
+  "includeContextWeight",
+]);
+
+/**
+ * The calendar span a ranged request resolves to, echoed back like the real one.
+ *
+ * Day granularity is the point: `range` has no sub-day value, so the collector
+ * asks for a single day by naming it, and the reply is what the card labels the
+ * window from.
+ */
+function mockCostSpan(
+  params: { startDate?: string; endDate?: string; range?: string } | undefined,
+  observedAt: number,
+): { startDate: string; endDate: string; days: number } {
+  const label = (offsetDays: number): string =>
+    new Date(observedAt - offsetDays * 86_400_000).toISOString().slice(0, 10);
+  if (params?.startDate && params.endDate) {
+    const days = Math.max(
+      1,
+      Math.round((Date.parse(params.endDate) - Date.parse(params.startDate)) / 86_400_000) + 1,
+    );
+    return { startDate: params.startDate, endDate: params.endDate, days };
+  }
+  const days = params?.range === "30d" ? 30 : params?.range === "90d" ? 90 : params?.range === "1y" ? 365 : 7;
+  return { startDate: label(days - 1), endDate: label(0), days };
+}
+
+/** Per-agent spend over the span, which is the only place the split exists. */
+function mockAggregates(days: number): Record<string, unknown> {
+  const byAgent = new Map<string, { totalCost: number; totalTokens: number; missingCostEntries: number }>();
+  for (const session of sessions) {
+    const usage = mockUsage(session.key, session.model, now).usage as Record<string, number>;
+    const totals = byAgent.get(session.agentId) ?? { totalCost: 0, totalTokens: 0, missingCostEntries: 0 };
+    // Scaled by span so a day's spend is not the same figure as a week's, which
+    // is what makes a mislabelled window visible on this fixture.
+    const share = Math.min(1, days / 7);
+    totals.totalCost = Number((totals.totalCost + usage.totalCost! * share).toFixed(6));
+    totals.totalTokens += Math.round(usage.totalTokens! * share);
+    totals.missingCostEntries += usage.missingCostEntries!;
+    byAgent.set(session.agentId, totals);
+  }
+  return {
+    byAgent: [...byAgent.entries()]
+      .map(([agentId, totals]) => ({ agentId, totals: { ...emptyCostTotals(), ...totals } }))
+      .sort((left, right) => right.totals.totalCost - left.totals.totalCost),
+    messages: { total: 263, user: 88, assistant: 130, toolCalls: 45, toolResults: 45, errors: 3 },
+  };
+}
+
+function emptyCostTotals(): Record<string, number> {
+  return {
+    input: 0,
+    output: 0,
+    cacheRead: 0,
+    cacheWrite: 0,
+    totalTokens: 0,
+    totalCost: 0,
+    inputCost: 0,
+    outputCost: 0,
+    cacheReadCost: 0,
+    cacheWriteCost: 0,
+    missingCostEntries: 0,
+  };
+}
+
+function mockRangeTotals(days: number): Record<string, number> {
+  const totals = emptyCostTotals();
+  for (const entry of mockAggregates(days).byAgent as Array<{ totals: Record<string, number> }>) {
+    totals.totalCost = Number((totals.totalCost + entry.totals.totalCost!).toFixed(6));
+    totals.totalTokens += entry.totals.totalTokens!;
+    totals.missingCostEntries += entry.totals.missingCostEntries!;
+  }
+  return totals;
+}
+
 function transcriptLength(sessionKey: string): number {
   // Deterministic per session so repeated pulls are stable and pagination is
   // reproducible across restarts.
@@ -190,6 +281,7 @@ function mockMessage(sessionKey: string, sessionId: string | undefined, index: n
   return {
     role: turn.role,
     ...(turn.toolName ? { toolName: turn.toolName } : {}),
+    ...("isError" in turn ? { isError: turn.isError } : {}),
     ...(sessionId ? { sessionId } : {}),
     content: asBlocks ? [{ type: "text", text: turn.content }] : turn.content,
     timestamp: now - (200 - index) * 30_000,
@@ -280,18 +372,45 @@ server.on("connection", (socket) => {
         },
       });
     } else if (request.method === "sessions.usage") {
-      const params = request.params as { key?: string; sessionKey?: string; limit?: number } | undefined;
+      const params = request.params as
+        | { key?: string; sessionKey?: string; limit?: number; agentScope?: string; startDate?: string; endDate?: string; range?: string }
+        | undefined;
       const observedAt = Date.now();
-      // The real schema sets `additionalProperties: false`, so a caller sending
-      // `sessionKey` gets an error rather than a silently ignored parameter. The
-      // mock refuses it too: this is the difference between a usage loop that
-      // works and one that reports zeros forever.
-      if (params?.sessionKey !== undefined) {
+      // The real schema sets `additionalProperties: false`, so a caller sending an
+      // unknown key gets an error rather than a silently ignored parameter. The
+      // mock refuses them too: this is the difference between a usage loop that
+      // works and one that reports zeros forever. `sessionKey` is the one that
+      // actually happened — the selector is `key` — and `from`/`to`/`groupBy:
+      // "agent"` is what the cost overlay used to send to `usage.cost`.
+      const unknown = Object.keys(request.params ?? {}).filter((name) => !SESSIONS_USAGE_PARAMS.has(name));
+      if (unknown.length > 0) {
         send(socket, {
           type: "res",
           id: request.id,
           ok: false,
-          error: { code: "invalid_params", message: "unknown parameter sessionKey; the session selector is `key`" },
+          error: {
+            code: "invalid_params",
+            message: `invalid sessions.usage params: unknown ${unknown.join(", ")}${unknown.includes("sessionKey") ? "; the session selector is `key`" : ""}`,
+          },
+        });
+      } else if (params?.agentScope === "all") {
+        // The agent-scoped range: one row at most, and the per-agent split in
+        // `aggregates.byAgent` regardless — the real handler applies `limit` to the
+        // `sessions` array only and sums the aggregates over everything in range.
+        const span = mockCostSpan(params, now);
+        send(socket, {
+          type: "res",
+          id: request.id,
+          ok: true,
+          payload: {
+            updatedAt: observedAt,
+            startDate: span.startDate,
+            endDate: span.endDate,
+            sessions: sessions.slice(0, Math.max(1, Number(params?.limit ?? 50))).map((entry) => mockUsage(entry.key, entry.model, observedAt)),
+            totals: mockRangeTotals(span.days),
+            aggregates: mockAggregates(span.days),
+            cacheStatus: mockCacheStatus(observedAt),
+          },
         });
       } else if (params?.key) {
         const session = sessions.find((entry) => entry.key === params.key);
@@ -324,11 +443,11 @@ server.on("connection", (socket) => {
         });
       }
     } else if (request.method === "usage.cost") {
-      // Deliberately the real shape, which has no per-agent breakdown: dates in,
-      // `{ updatedAt, days, daily[], totals }` out. Only `sessions.usage` splits
-      // by agent, through `aggregates.byAgent`. The collector still asks this for
-      // a per-agent overlay and so gets nothing usable — a gap that is meant to
-      // be visible here rather than papered over by an obliging fixture.
+      // Still answered, because the real Gateway has the method — but nothing in
+      // the collector calls it any more. Its shape is the reason: dates in,
+      // `{ updatedAt, days, daily[], totals }` out, with every agent merged into
+      // one total. The per-agent split the cost view needs exists only in
+      // `sessions.usage`'s `aggregates.byAgent`.
       const params = request.params as { days?: number; range?: string } | undefined;
       const days = Math.min(Math.max(Number(params?.days ?? 7), 1), 30);
       const totals = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, totalCost: 0, missingCostEntries: 0 };

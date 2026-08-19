@@ -168,7 +168,55 @@ patch.totalTokens = deriveSessionTotalTokens({ usage: lastCallUsage, contextToke
 
 响应是 `{ updatedAt, days, daily[], totals }`。`agentScope: "all"` 只是把所有 agent 合并进 `totals`，不会分开。**按 agent 分解只有 `sessions.usage` 的 `aggregates.byAgent` 有。**
 
-我们现在发的 `{ from, to, groupBy: "agent" }` 三个参数在真机上都不存在，调用会直接失败——失败是诚实的，所以先留着，但 S6 的成本覆盖层需要重写成走 `aggregates.byAgent`。**这是还没做的事**，见 §4。
+原来发的 `{ from, to, groupBy: "agent" }` 三个参数在真机上都不存在，调用直接失败。成本覆盖层现在改走 `sessions.usage`，`usage.cost` 不再被调用（也从能力探测清单移除）。
+
+### 按 agent 的成本：形状与参数（从包里读出来的）
+
+```
+sessions.usage 参数（additionalProperties: false）
+  key? agentId? agentScope?:"all"
+  startDate? endDate?   YYYY-MM-DD
+  mode?:"utc"|"gateway"|"specific"   省略即 UTC
+  utcOffset?            mode="specific" 时用，形如 UTC+8 / UTC+5:30
+  range?:"7d"|"30d"|"90d"|"1y"|"all"   注意最小是 7d
+  groupBy?:"instance"|"family"  includeHistorical?  limit?(≥1)  includeContextWeight?
+
+回包
+  { updatedAt, startDate, endDate, sessions[], totals, aggregates, cacheStatus }
+  aggregates.byAgent = [{ agentId, totals: CostUsageTotals }]   按成本降序
+  CostUsageTotals = { input, output, cacheRead, cacheWrite, totalTokens,
+                      totalCost（美元）, inputCost, outputCost,
+                      cacheReadCost, cacheWriteCost, missingCostEntries }
+```
+
+四条容易踩的：
+
+1. **不发 `agentScope: "all"` 就只统计默认 agent**。handler 里是 `requestedAgentId ?? specificKeyAgentId ?? resolveDefaultAgentId(config)`，一个跨 agent 的总览必须显式声明作用域，而它又不能与 `key`/`agentId` 同时出现。
+2. **`limit` 只截断 `sessions` 数组，不影响聚合**（`if (entryIndex < limit) sessions.push(...)`，聚合循环跑遍范围内全部条目）。所以成本这次调用发 `limit: 1`：分解照样完整，回包却小。
+3. **`utcOffset` 写错不会报错**。schema 的 pattern 是 `^UTC[+-]\d{1,2}(?::[0-5]\d)?$`（`schema-BuOFpc7K.js`），而 handler 侧的 `parseUtcOffsetToMinutes` 一旦解析失败就**静默退回 `mode: "utc"`**（`usage-Suf4MGML.js`），不抛错。也就是说格式错了的后果不是调用失败，是被按 UTC 日定价、界面照样显示。`UTC+0`（宿主机在 UTC 时的输出）和 `UTC+5:30` 都在 pattern 内，已按几个时区断言过格式。
+4. **只有日历天，没有滚动窗口**。`range` 最小 `7d`，单日只能 `startDate === endDate`；`mode` 默认 UTC，`gateway` 用宿主机本地日，`specific` 用你给的偏移。我们发 `mode: "specific"` + 本机偏移，把「哪一天」钉死在采集端；回包会把 `startDate`/`endDate` 回显，界面就按这个跨度标签，不把一天的花费挂在写着 24h 的标签下。
+
+顺带：`aggregates.messages` 有 `{ total, user, assistant, toolCalls, toolResults, errors }`——这是除 `chat.history` 的 `isError` 之外，另一处 Gateway 直接给出的错误计数。
+
+### 真机复核（2026-08-18，改完之后）
+
+三次调用，全在真机上：
+
+| 调用 | 结果 |
+|---|---|
+| `{agentScope:"all", range:"7d", groupBy:"family", limit:1, mode:"specific", utcOffset:"UTC+8"}` | 接受；回显 `2026-08-12` → `2026-08-18`（7 个日历天）；`aggregates.byAgent = [{agentId:"main", totals:{...}}]` |
+| 同上但 `startDate = endDate = "2026-08-18"` | 接受；回显同一天；`byAgent` 里当天 0 token、0 成本、0 未定价 |
+| 旧参数 `{from, to, groupBy:"agent"}` | `INVALID_REQUEST: unexpected property 'from'` —— 旧的成本覆盖层从来就不可能成功 |
+
+**推翻 §2.6 的一半**：区间聚合**有** token 数。7 天窗口报 `input: 27762, output: 82, totalTokens: 27844`，而同一批会话在 `sessions` 数组里 `usage` 是 `null`、按会话读也是零。也就是说这台机器上「没有任何一处有会话累计用量」只对**按会话**那条路成立；范围聚合能给出总量。
+
+**但成本仍然没有**：`totalCost: 0` 配 `missingCostEntries: 1`（provider 是 `codex`，没有价目表）。这个组合很危险——它不是「几乎免费」，而是「一分钱都没定出价」。投影器因此多一条规则：**成本为 0 且有未定价条目时不算金额**，该窗口宁可报没有价格，也不显示 `$0.00+`——把下界标记挂在一个什么都没量到的数字上，比空着更糟。零成本只在没有任何未定价条目时才当作事实保留（例如今天确实还没干活）。
+
+### `isError` 的真机投影复核（同日）
+
+把真机一页历史喂给投影器（`openclaw gateway call chat.history --params '{"sessionKey":"…","limit":30}' | awk 'NR>1' | npx tsx scripts/inspect-gateway-payload.ts history 30`）：6 条消息全部投影、无丢弃，工具结论 `failed=1 ok=1 absent=4`，`isError` 从 `unknown` 键列表里消失。
+
+顺手修了这个脚本：`projectHistoryPage` 早先加了必填的 `request`（分页要靠它反推），脚本没跟上，任何 `history` 模式的调用都会先崩在 `request.limit` 上。现在把调用时用的 `limit` 作为第二个参数传进去——传错的话打印出来的分页结论说的是另一次请求。
 
 ---
 
@@ -184,11 +232,11 @@ patch.totalTokens = deriveSessionTotalTokens({ usage: lastCallUsage, contextToke
 
 ## 4. 还没做的事
 
-1. **`usage.cost` 的成本覆盖层**要改成读 `sessions.usage` 的 `aggregates.byAgent`（§2.4）。现在它每轮都拿不到可用数据，诊断端点里 `usage.cost` 的 `consumed` 是空的。注意 §2.6：真机上 `aggregates.byAgent` 的 token 也是零，所以这条修完不一定有数。
-2. **消息级 `isError` 没被读**。`chat.history` 的工具结果带 `isError`——真机那 30 条里有 13 条带这个字段、其中 3 条为 true。派生信号现在从 activities/observations 推工具失败，而这里有 Gateway 直接给的结论。（同一批消息的 `usage` 全是零，见 §2.6，别指望它。）
+1. ~~**`usage.cost` 的成本覆盖层**要改成读 `sessions.usage` 的 `aggregates.byAgent`~~ 已改，见 §2.4 末尾的形状与参数。真机复核（同节）修正了 §2.6 的适用范围：**范围聚合有 token**（7 天窗口 27,844），零 token 只对按会话读那条路成立；**但成本仍然没有**——`totalCost: 0` 配 `missingCostEntries: 1`，即一条都没定出价，按上面那条规则不报金额。所以这条修完在这台机器上看到的是 token 而不是钱：它修掉的是「每轮调用直接失败」，金额要等一个有价目表的 provider。
+2. ~~**消息级 `isError` 没被读**~~ 已接：`session_messages` 加了 `is_error`（schema v5），投影器只认布尔值——`NULL` 表示「这条不是工具结果」，和「调用成功」是两件事，混同会把每条普通消息都算成一次成功的工具调用。派生信号在归档与 observations 之间取已结算调用更多的那一份（打平归档优先）：两边描述的是同一批调用，相加等于同一次失败罚两次分；而回填到一半的归档只有最新一页，无条件优先它会把更早的失败丢掉。已换代（`superseded_by_session_id`）的那一代不计，否则跨过一次压缩的会话每条失败都会翻倍。算法版本 2 → 3，存量行自动重算。（同一批消息的 `usage` 全是零，见 §2.6，别指望它。）
 3. **`peakContextTokens` 没有数据源**，而 `sessions.list` 的 `totalTokens` 就是上下文占用量（§2.7）。要接的话得单独走一条不进成本聚合的写入路径——直接写进用量快照会让零 token 的会话进入成本视图。
 4. **audit 采集**完全没实现（§3）。
-5. **Agents 页的「系统 agent 折叠」没有数据来源**。`web/src/views/Agents.tsx` 按 `agent.kind === "system"` 分组，而名册里没有任何字段能区分内建 agent，真机上所有 agent 都会落在主列表。要么找别的信号（例如只由 cron 触发的 agent），要么去掉这个分组。
+5. ~~**Agents 页的「系统 agent 折叠」没有数据来源**~~ 已按后者处理：分组与 SYSTEM 徽号都已删除，规格第 7 节与 §9.6 同步修订。换别的信号（例如只由 cron 触发的 agent）是采集器自己编的区分，不做。`kind` 仍留在契约里，别的 Gateway 版本发这个字段时它就是诚实数据。
 
 ---
 

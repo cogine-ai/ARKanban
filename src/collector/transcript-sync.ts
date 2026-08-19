@@ -60,6 +60,19 @@ export type TranscriptSyncDeps = {
   maxBytes: number;
   enabled: boolean;
   inventory?: FieldInventory;
+  /**
+   * Called with the sessions that gained messages this round.
+   *
+   * Archived tool results are evidence for a session's grade, and a backfill page
+   * is the one way that evidence arrives without the session having moved — the
+   * staleness check reads `last_activity_at`, which a page of last week's history
+   * does not touch, so nothing would ever rescore on it.
+   *
+   * The keys are handed out rather than returned in the outcome: that type reaches
+   * the transcript disclosure endpoint, which states counts and settings and no
+   * session identities.
+   */
+  onArchived?: (sessionKeys: readonly string[]) => void;
 };
 
 function record(value: unknown): Record<string, unknown> {
@@ -138,6 +151,7 @@ export class TranscriptSynchronizer {
     let requests = 0;
     let inserted = 0;
     const touched = new Set<string>();
+    const grew = new Set<string>();
     let errorCode: string | undefined;
 
     const active = this.deps.archive.activeCandidates({
@@ -151,6 +165,7 @@ export class TranscriptSynchronizer {
       requests += result.requests;
       inserted += result.inserted;
       touched.add(candidate.sessionKey);
+      if (result.inserted > 0) grew.add(candidate.sessionKey);
       errorCode ??= result.errorCode;
     }
 
@@ -170,7 +185,20 @@ export class TranscriptSynchronizer {
         requests += result.requests;
         inserted += result.inserted;
         touched.add(candidate.sessionKey);
+        if (result.inserted > 0) grew.add(candidate.sessionKey);
         errorCode ??= result.errorCode;
+      }
+    }
+
+    // Contained on purpose: whatever the listener does with the news, failing at
+    // it is not this round failing. The pages landed, and reporting the round as
+    // broken would send the next one to fetch them again.
+    if (grew.size > 0) {
+      try {
+        this.deps.onArchived?.([...grew]);
+      } catch {
+        // The next round says so again if these sessions keep growing, and the
+        // periodic recompute pass covers them regardless.
       }
     }
 

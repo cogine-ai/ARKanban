@@ -2,6 +2,7 @@ import type { DatabaseSync } from "node:sqlite";
 import {
   SIGNAL_ALGORITHM_VERSION,
   computeSessionSignals,
+  tallyToolEvents,
   type ActivityEvidence,
   type SignalEvidence,
   type ToolEventEvidence,
@@ -178,9 +179,23 @@ export class SignalStore {
   /**
    * Loads the evidence one session's score rests on.
    *
-   * Tool events come from `observations` joined through `activities`, which is
-   * the only per-tool record the collector keeps; ordering by `occurred_at` is
-   * what makes failure streaks and retry loops readable at all.
+   * Tool outcomes have two possible sources. An archived `toolResult` message
+   * states the outcome outright in `is_error`; an observation only carries a
+   * lifecycle phase whose failure vocabulary this codebase had to guess. Both
+   * describe the same calls, so they are alternatives rather than additions —
+   * summing them would charge one failed call twice — so the one that settled
+   * more calls is the one scored, with the transcript taking a tie because its
+   * verdicts are stated rather than inferred.
+   *
+   * "Whichever saw more" rather than "the transcript whenever it has anything":
+   * an archive is built a page at a time, and a session mid-backfill holds only
+   * its newest page. Letting two archived results speak for a session whose
+   * events recorded ten would drop the older failures, the streak they formed and
+   * the retries after them — and the grade would improve as the archive grew,
+   * which is the opposite of what collecting more evidence should do.
+   *
+   * Ordering by `occurred_at` / `created_at` is what makes failure streaks and
+   * retry loops readable at all.
    */
   evidenceFor(sessionKey: string): SignalEvidence | undefined {
     const session = this.db
@@ -210,6 +225,23 @@ export class SignalStore {
       `)
       .all(sessionKey, sessionKey) as Row[];
 
+    /**
+     * Superseded generations are left out. Compaction re-sends the surviving turns
+     * under a fresh `sessionId`, so a tool result that outlived a compaction is
+     * held twice, and counting both would double every failure a long session
+     * carried across one.
+     */
+    const transcriptRows = this.db
+      .prepare(`
+        SELECT tool_name, is_error, created_at
+        FROM session_messages
+        WHERE session_key = ?
+          AND is_error IS NOT NULL
+          AND superseded_by_session_id IS NULL
+        ORDER BY created_at ASC, seq ASC, id ASC
+      `)
+      .all(sessionKey) as Row[];
+
     const activities: ActivityEvidence[] = activityRows.map((row) => {
       const endedAt = asNumber(row.ended_at);
       return {
@@ -221,7 +253,7 @@ export class SignalStore {
       };
     });
 
-    const toolEvents: ToolEventEvidence[] = toolRows.map((row) => {
+    const observedTools: ToolEventEvidence[] = toolRows.map((row) => {
       const toolName = typeof row.tool_name === "string" ? row.tool_name : undefined;
       const status = typeof row.status === "string" ? row.status : undefined;
       return {
@@ -232,12 +264,27 @@ export class SignalStore {
       };
     });
 
+    const archivedTools: ToolEventEvidence[] = transcriptRows.map((row) => {
+      const toolName = typeof row.tool_name === "string" ? row.tool_name : undefined;
+      return {
+        ...(toolName ? { toolName } : {}),
+        kind: "transcript.toolResult",
+        failed: Number(row.is_error) === 1,
+        occurredAt: Number(row.created_at ?? 0),
+      };
+    });
+
+    // Every archived row is a settled call by construction: it is there because
+    // the Gateway stated an outcome for it. Observations have to be counted,
+    // since a `start` with no recorded end settles nothing.
+    const settledObservations = tallyToolEvents(observedTools).settled;
+
     return {
       sessionKey: String(session.session_key),
       lastActivityAt: Number(session.last_activity_at ?? 0),
       hasActiveRun: Number(session.has_active_run ?? 0) === 1,
       activities,
-      toolEvents,
+      toolEvents: archivedTools.length >= settledObservations ? archivedTools : observedTools,
     };
   }
 

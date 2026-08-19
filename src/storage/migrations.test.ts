@@ -68,6 +68,30 @@ describe("schema migrations", () => {
     expect(db.prepare("SELECT value FROM meta WHERE key = 'revision'").get()).toMatchObject({ value: "7" });
   });
 
+  /**
+   * The flag was never stored before version 5, so there is nothing to backfill
+   * from and the rows that predate it have to read as "unknown" rather than as
+   * tool calls that went fine.
+   */
+  it("adds the tool-error flag to an existing archive without claiming its old rows succeeded", () => {
+    const databasePath = path.join(workspace(), "upgrade.sqlite");
+    const db = new DatabaseSync(databasePath);
+    cleanups.push(() => db.close());
+    const previous = MIGRATIONS.filter((entry) => entry.version < 5);
+    for (const migration of previous) migration.up(db);
+    db.prepare("INSERT OR REPLACE INTO meta(key, value) VALUES ('schema_version', ?)").run(String(previous.length));
+    db.exec(`
+      INSERT INTO session_messages (
+        session_key, session_id, seq, role, content, content_bytes, created_at, observed_at
+      ) VALUES ('agent:builder:one', 'gen-1', 0, 'tool', 'output', 6, 1000, 1000)
+    `);
+
+    applyMigrations(db, databasePath);
+
+    const row = db.prepare("SELECT is_error FROM session_messages WHERE seq = 0").get() as { is_error: unknown };
+    expect(row.is_error).toBeNull();
+  });
+
   it("writes a 0600 backup before upgrading a database that already holds data", () => {
     const databasePath = path.join(workspace(), "legacy.sqlite");
     legacyDatabase(databasePath);

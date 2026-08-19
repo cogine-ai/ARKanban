@@ -92,13 +92,18 @@ function turn(seq: number): Record<string, unknown> {
 function synchronizer(
   repo: CollectorRepository,
   request: HistoryRequest,
-  overrides: { maxBytes?: number; enabled?: boolean } = {},
+  overrides: {
+    maxBytes?: number;
+    enabled?: boolean;
+    onArchived?: (sessionKeys: readonly string[]) => void;
+  } = {},
 ): TranscriptSynchronizer {
   return new TranscriptSynchronizer({
     archive: repo.transcripts,
     request,
     maxBytes: overrides.maxBytes ?? 64 * 1024 * 1024,
     enabled: overrides.enabled ?? true,
+    ...(overrides.onArchived ? { onArchived: overrides.onArchived } : {}),
   });
 }
 
@@ -155,6 +160,43 @@ describe("transcript sync progress", () => {
 
     const second = await sync.runOnce(healthy);
     expect(second.inserted).toBe(0);
+  });
+
+  /**
+   * Archived tool results are evidence for a session's grade, and the sessions a
+   * round added to are the only way anything downstream can hear about it: a
+   * backfill page does not move `last_activity_at`, so a staleness check on the
+   * session row alone would never rescore on it.
+   */
+  it("names the sessions a round added to, and stays quiet about the ones it only re-read", async () => {
+    const repo = repository();
+    seedSession(repo, "agent:builder:one");
+    const archived: string[][] = [];
+    const { request } = gateway({ "agent:builder:one": [turn(0), turn(1)] });
+    const sync = synchronizer(repo, request, { onArchived: (keys) => archived.push([...keys]) });
+
+    await sync.runOnce(healthy);
+    expect(archived).toEqual([["agent:builder:one"]]);
+
+    // Nothing new landed on the replay, so there is nothing to rescore.
+    await sync.runOnce(healthy);
+    expect(archived).toHaveLength(1);
+  });
+
+  it("keeps the round's pages when the listener throws", async () => {
+    const repo = repository();
+    seedSession(repo, "agent:builder:one");
+    const { request } = gateway({ "agent:builder:one": [turn(0)] });
+    const sync = synchronizer(repo, request, {
+      onArchived: () => {
+        throw new Error("rescore failed");
+      },
+    });
+
+    const outcome = await sync.runOnce(healthy);
+
+    expect(outcome.inserted).toBe(1);
+    expect(outcome.errorCode).toBeUndefined();
   });
 
   /**

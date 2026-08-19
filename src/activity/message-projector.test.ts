@@ -91,6 +91,67 @@ describe("history page projection", () => {
   });
 
   /**
+   * The shape a live Gateway returns for a tool result: `isError` sits on the
+   * message beside `toolName`, and it is set either way — a `false` is the Gateway
+   * saying the call worked, which is worth as much to a grade as a failure is.
+   */
+  it("keeps the Gateway's verdict on a tool call, both ways", () => {
+    const page = projectHistoryPage(
+      {
+        messages: [
+          {
+            role: "toolResult",
+            toolName: "exec",
+            isError: true,
+            content: "exit status 1",
+            timestamp: OBSERVED_AT - 2_000,
+            __openclaw: { id: "m1", seq: 1 },
+          },
+          {
+            role: "toolResult",
+            toolName: "exec",
+            isError: false,
+            content: "ok",
+            timestamp: OBSERVED_AT - 1_000,
+            __openclaw: { id: "m2", seq: 2 },
+          },
+        ],
+      },
+      base,
+    );
+
+    expect(page.writes[0]).toMatchObject({ role: "tool", toolName: "exec", isError: true });
+    expect(page.writes[1]).toMatchObject({ role: "tool", isError: false });
+  });
+
+  /**
+   * Absent is a third state, and the one nearly every message is in. Storing it as
+   * `false` would enter every ordinary turn into the tool tally as a call that
+   * succeeded, which is how a session with no tools at all ends up confidently
+   * graded.
+   */
+  it("leaves the verdict off a message that carries none, or carries a non-boolean", () => {
+    const page = projectHistoryPage(
+      {
+        messages: [
+          { role: "user", content: "hello", timestamp: OBSERVED_AT - 3_000, __openclaw: { id: "m1", seq: 1 } },
+          {
+            role: "toolResult",
+            isError: "true",
+            content: "stringly typed",
+            timestamp: OBSERVED_AT - 2_000,
+            __openclaw: { id: "m2", seq: 2 },
+          },
+        ],
+      },
+      base,
+    );
+
+    expect(page.writes[0]).not.toHaveProperty("isError");
+    expect(page.writes[1]).not.toHaveProperty("isError");
+  });
+
+  /**
    * The block shapes a live Gateway returned: a `toolCall` has no text field at
    * all, and dropping it removed the assistant's turn from the archive entirely,
    * leaving a tool result that appeared to arrive unprompted.

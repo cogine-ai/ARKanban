@@ -5,6 +5,7 @@ import fastifyStatic from "@fastify/static";
 import Fastify, { LogController, type FastifyError, type FastifyInstance } from "fastify";
 import type {
   AgentOverview,
+  AgentRollupWindow,
   CollectorChange,
   CollectorStatus,
   SessionSignalGrade,
@@ -162,26 +163,35 @@ function parseSeq(raw: string | undefined): number | undefined | null {
 /**
  * Overlays the Gateway's ranged pricing onto an agent card.
  *
- * `usage.cost` prices a whole range at once, so it is the better figure than
- * one summed from per-session readings taken at different moments. Only the
- * amount is replaced: whether the total is complete is decided by the models
- * `sessions.usage` could not price, and a ranged total cannot have priced a
- * model that the per-session read already reported as unpriced.
+ * A ranged read prices a whole span at once, so it is the better figure than one
+ * summed from per-session readings taken at different moments — and on a harness
+ * that records nothing per session it is the only figure there is. The span comes
+ * back with it: the Gateway prices calendar days, so what the card shows under
+ * the short window is a day's spend and has to say so.
  */
 function withGatewayCost(runtime: CollectorRuntime, agent: AgentOverview): AgentOverview {
   const windows = { ...agent.cost.windows };
   const source = { ...agent.cost.source };
+  const priced: Partial<Record<AgentRollupWindow, { from: string; to: string }>> = {};
   let overlaid = false;
   for (const window of ["24h", "7d"] as const) {
-    const priced = runtime.getAgentCost(window, agent.id);
-    if (priced === undefined) continue;
-    windows[window] = { ...windows[window], costMicroUsd: priced };
+    const entry = runtime.getAgentCost(window, agent.id);
+    if (entry === undefined) continue;
+    // `hasCost` comes from the same reply as the amount: the aggregate counts the
+    // entries it could not price, which is the only thing that decides whether the
+    // total is complete. Keeping the per-session verdict here would have called a
+    // fully priced range a floor on the strength of one unpriced session reading.
+    windows[window] = { ...windows[window], costMicroUsd: entry.costMicroUsd, hasCost: entry.hasCost };
     // Recorded per window: the windows are separate requests, and one of them
     // failing must not let the other's label speak for it.
     source[window] = "gateway";
+    const span = runtime.getAgentCostSpan(window);
+    if (span) priced[window] = span;
     overlaid = true;
   }
-  return overlaid ? { ...agent, cost: { ...agent.cost, source, windows } } : agent;
+  return overlaid
+    ? { ...agent, cost: { ...agent.cost, source, windows, ...(Object.keys(priced).length > 0 ? { priced } : {}) } }
+    : agent;
 }
 
 function settledRange(value: string | undefined): SettledRange | undefined {

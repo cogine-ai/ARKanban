@@ -75,7 +75,6 @@ describe("CapabilityRegistry", () => {
       "chat.history",
       "sessions.usage",
       "sessions.usage.timeseries",
-      "usage.cost",
     ]);
   });
 

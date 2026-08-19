@@ -66,6 +66,27 @@ describe("TranscriptArchive", () => {
     expect(repo.transcripts.listMessages("agent:builder:one")).toHaveLength(2);
   });
 
+  /**
+   * Three states survive the round trip, not two. `false` is the Gateway saying a
+   * tool call worked; absent is a turn that was never a tool call. Collapsing them
+   * would enter every message in the archive into the tool tally.
+   */
+  it("round-trips a stated tool outcome and the absence of one", () => {
+    const repo = repository();
+    seedSession(repo, "agent:builder:one");
+    repo.transcripts.append([
+      message({ seq: 0, content: "failed", role: "tool", toolName: "exec", isError: true }),
+      message({ seq: 1, content: "worked", role: "tool", toolName: "exec", isError: false }),
+      message({ seq: 2, content: "just talking" }),
+    ]);
+
+    const stored = repo.transcripts.listMessages("agent:builder:one");
+
+    expect(stored[0]?.isError).toBe(true);
+    expect(stored[1]?.isError).toBe(false);
+    expect(stored[2]).not.toHaveProperty("isError");
+  });
+
   it("keeps both generations when a session's transcript is rebuilt under a new sessionId", () => {
     const repo = repository();
     seedSession(repo, "agent:builder:one");

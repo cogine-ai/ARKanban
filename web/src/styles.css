@@ -293,7 +293,6 @@ button { color: inherit; }
 
 .agent-grid { display: grid; grid-template-columns: repeat(auto-fill,minmax(288px,1fr)); gap: 11px; }
 .agent-card { padding: 14px; display: flex; flex-direction: column; gap: 11px; border: 1px solid var(--line); border-radius: 14px; background: #fff; }
-.agent-card[data-kind="system"] { background: #fcfcfd; }
 .agent-card-head { display: grid; grid-template-columns: minmax(0,1fr) auto; align-items: center; gap: 10px; }
 .agent-card-head .agent-avatar { width: 34px; height: 34px; }
 .agent-identity { min-width: 0; display: block; }
@@ -301,7 +300,6 @@ button { color: inherit; }
 .agent-identity small { display: block; margin-top: 2px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--secondary); font-size: 9px; }
 .agent-badges { display: flex; gap: 4px; }
 .agent-badge { padding: 2px 6px; border-radius: 6px; font-size: 7px; font-weight: 740; letter-spacing: .06em; }
-.agent-badge.system { background: rgba(118,118,128,.12); color: var(--secondary); }
 .agent-badge.inferred { background: rgba(191,116,20,.1); color: #8a520a; }
 .agent-section { display: grid; gap: 5px; }
 .agent-section .eyebrow { margin-bottom: 0; font-size: 8px; }
@@ -325,9 +323,6 @@ button { color: inherit; }
 .agent-card-foot { margin-top: auto; padding-top: 9px; display: flex; align-items: center; justify-content: space-between; gap: 10px; border-top: 1px solid var(--line); font-size: 9px; }
 .agent-card-foot .muted { color: var(--tertiary); }
 .agent-seen { color: var(--secondary); }
-.agent-system-group { margin-top: 18px; display: grid; gap: 11px; }
-.agent-system-toggle { justify-self: start; padding: 0; border: 0; background: none; color: var(--secondary); font-size: 10px; font-weight: 620; cursor: pointer; }
-.agent-system-toggle:hover { color: var(--ink); }
 .agent-sessions-link { color: var(--secondary); font-size: 9px; text-decoration: none; }
 .agent-sessions-link:hover { color: var(--accent, #007aff); text-decoration: underline; }
 
@@ -404,6 +399,7 @@ button { color: inherit; }
 .transcript-tool { padding: 1px 5px; border-radius: 5px; background: rgba(118,118,128,.14); color: var(--secondary); font-weight: 640; }
 .transcript-superseded { padding: 1px 5px; border-radius: 5px; background: rgba(191,116,20,.12); color: #8a520a; font-weight: 640; }
 .transcript-divergent { padding: 1px 5px; border-radius: 5px; background: rgba(191,50,50,.1); color: #9a2b2b; font-weight: 640; }
+.transcript-failed { padding: 1px 5px; border-radius: 5px; background: rgba(215,38,61,.14); color: #a51226; font-weight: 700; text-transform: uppercase; letter-spacing: .05em; }
 /* Message text is untrusted input: pre-wrap preserves its shape without letting
    it become markup. */
 .transcript-body { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; font-size: 10px; line-height: 1.5; }

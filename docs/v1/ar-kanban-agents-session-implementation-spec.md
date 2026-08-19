@@ -165,7 +165,9 @@ export type SessionSignals = {
 
 实现补充（S7）：
 
-- 评分只读本机已存的 `activities` 与 `observations`，不回查 Gateway，因此离线可算、可重算。权重表见 `SIGNAL_PENALTIES`，每一类都带上限，避免单个病态会话把分数拉到任意负值——那会让 F 这个桶失去意义。
+- 评分只读本机已存的 `activities`、`observations` 与归档消息，不回查 Gateway，因此离线可算、可重算。权重表见 `SIGNAL_PENALTIES`，每一类都带上限，避免单个病态会话把分数拉到任意负值——那会让 F 这个桶失去意义。
+- 工具结论有两个来源，二选一而非相加。归档里的 `toolResult` 消息带 Gateway 直接给的 `is_error`；observation 只有生命周期阶段，其失败词表还是我们从文档里猜的。两者描述的是同一批调用，相加等于同一次失败罚两次分，所以**取已结算调用更多的那一份**，打平时归档优先（结论是它直接说的，不是推的）。不是「有归档就用归档」：归档是一页一页攒起来的，回填到一半的会话手里只有最新一页，让那两条结论代表一个事件流里有十条的会话，等于把更早的失败、它们组成的连败和之后的重试全部丢掉——而且分数会随着归档变全而变好，与「证据越多越准」正好相反。已被换代标记的那一代不计：压缩会把存活下来的轮次以新 `sessionId` 重发一遍，两代都算的话，跨过一次压缩的会话每条失败都会翻倍。
+- 回填页会带来「会话本身没动，证据却到了」的情况：陈旧判定看的是 `last_activity_at`，而上周历史的一页不会碰它。因此 transcript 同步每轮回报本轮真正新增了消息的会话，运行时就地重算这几个会话，不等定时批次。
 - 给分门槛：必须存在**已分类的终态结论**或**至少一次已结算的工具调用**，否则返回 `unscored`。「有东西结束了」不是结论：会话级终态事件经常不带任何 outcome，把它当成功会仅凭「运行停了」就发出干净的分数。
 - 判定用哪一行终态时，**最新的已分类结论优先于更新的未分类行**。`unknown` 不携带信息，而它经常就是最新的一行：运行结束后才到的事件会开出一个新的 attempt，下一轮快照发现 Gateway 不再广告它，就把它关成 `unknown`。直接取最新行会让这类记账盖掉 Gateway 真正给过的结论。
 - 与之配套，`sessions.changed` 的终态 `status` 现在按别名表映射成 outcome，其中包含 `succeeded`（`done` / `completed` / `finished` …）。此前只分类失败、其余一律 `unknown`，结果是所有健康会话都拿不到结论，读起来与「无从判断的会话」完全一样。
@@ -181,7 +183,7 @@ export type SessionSignals = {
 | `sessions.list` | 8s（复用现有） | 现有 reconcile 循环 | limit 500 |
 | `sessions.describe` | 按需 | 打开 Session 详情、或该会话首次转 terminal | 单条 |
 | `sessions.usage` | 60s | 只覆盖候选集，见 3.3 | 见 3.3 |
-| `usage.cost` | 300s | Agents 总览的成本卡 | 按范围 |
+| `sessions.usage`（`agentScope: "all"`） | 300s | Agents 总览的成本卡 | 一次一个日历跨度 |
 | `audit.activity.list`（`kind: "message"`） | 300s，后台 | 增量游标 | limit 500 |
 | `chat.history` | 30s（活跃会话增量）+ 空闲期回填 | 见第 7 节 | 游标 |
 
@@ -226,11 +228,13 @@ sessions.list 分页
 - coverage 由本轮结果决定：全部请求失败才是 `error`，只要有一个成功就按 `demand > limit ? "snapshot" : "live"` 取值。单个会话抖动不应该把整张成本卡涂成故障。
 - §2.2 的 `SessionCoverage.usage` 联合类型原本没有 `snapshot`，与本节要求矛盾，已按本节补齐。
 - 快照是**累计读数**而非增量，因此任何聚合都取每个会话的最新一行，绝不对多行求和。
-- `usage.cost` 按 300s 独立节奏刷新，结果只驻内存：它是对某个区间的交叉校验，落库会造出第二份可能与快照冲突的成本口径。重连即失效。
+- 按 agent 的成本按 300s 独立节奏刷新，结果只驻内存：它是对某个区间的交叉校验，落库会造出第二份可能与快照冲突的成本口径。重连即失效。
+- 它走的是**同一个方法的另一种问法**：`sessions.usage` 加 `agentScope: "all"`，读 `aggregates.byAgent`。原设计用 `usage.cost`，真机校准（见校准记录 §2.4）证明那个方法给不出按 agent 的分解——它接受 agent 作用域，但只把所有 agent 合并进 `totals`。`limit` 只截断回包里的 `sessions` 数组、不影响聚合，所以这次调用发 `limit: 1`：拿到分解，不搬回一堆用不上的行。
+- `usage.cost` 因此不再被调用，也从能力探测清单里移除：探一个没人读的方法，只会在 Connections 面板上多挂一个解释不了任何界面内容的能力。
 
 ### 3.4 能力探测
 
-`sessions.usage`、`sessions.usage.timeseries`、`usage.cost`、`chat.history` 都按 v1.1 修订 §4.3 处理——前三个不在 hello 的发现列表中，`chat.history` 在本机 2026.7.1-2 上会 advertise，但**不能因此只信发现列表**：§4.3 的要点是「未 advertise 不等于不可用」，而正文同步原先正是按字面反过来用的，遇到不列出 `chat.history` 的构建就每轮判 `unavailable`、一条正文都不归档，且没有任何探测或重试能走出来。现在探测结果（任一确定verdict）优先于发现列表，只有还没探测出结果时才回落到发现列表。
+`sessions.usage`、`sessions.usage.timeseries`、`chat.history` 都按 v1.1 修订 §4.3 处理——前三个不在 hello 的发现列表中，`chat.history` 在本机 2026.7.1-2 上会 advertise，但**不能因此只信发现列表**：§4.3 的要点是「未 advertise 不等于不可用」，而正文同步原先正是按字面反过来用的，遇到不列出 `chat.history` 的构建就每轮判 `unavailable`、一条正文都不归档，且没有任何探测或重试能走出来。现在探测结果（任一确定verdict）优先于发现列表，只有还没探测出结果时才回落到发现列表。
 
 ```text
 连接就绪后 → 对每个不可发现方法执行一次最小参数探测
@@ -386,6 +390,8 @@ CREATE TABLE session_messages (
   role TEXT NOT NULL,
   channel TEXT,
   tool_name TEXT,
+  -- Gateway 对这次工具调用的结论。NULL 表示这条不是工具结果，与 0（调用成功）不同。
+  is_error INTEGER,
   content TEXT NOT NULL,
   content_bytes INTEGER NOT NULL,
   superseded_by_session_id TEXT,
@@ -529,14 +535,18 @@ cost: {
   coverage: SessionUsageCoverage;
   source: Record<"24h" | "7d", "gateway" | "snapshots">;
   windows: Record<"24h" | "7d", UsageTotals>;
+  /** 只出现在由 Gateway 定价的窗口上：它实际覆盖的日历跨度。 */
+  priced?: Partial<Record<"24h" | "7d", { from: string; to: string }>>;
 }
 ```
 
-`source` 必须暴露，因为同一笔花费有两个来源：`usage.cost` 按区间一次定价，`sessions.usage` 按会话逐个定价。卡片优先用前者（一次定价整个区间，比把不同时刻的读数相加更准），`/api/v1/usage/summary` 只报后者。两者不一致时，`source` 是唯一能解释差异的线索。
+`source` 必须暴露，因为同一笔花费有两个来源：一次区间定价（`sessions.usage` 的 `aggregates.byAgent`），与按会话逐个定价的快照。卡片优先用前者（一次定价整个区间，比把不同时刻的读数相加更准；在自己不记账的 harness 上它还是唯一有数的那个），`/api/v1/usage/summary` 只报后者。两者不一致时，`source` 是唯一能解释差异的线索。
 
-`source` 与成本 coverage 都**按窗口**记录，因为 24h 与 7d 是两次独立的 `usage.cost` 请求、会各自失败。整卡一个标签的写法有两处失真：一是任一窗口成功就把「由 Gateway 定价」盖在另一个它根本没答的窗口上；二是原实现把两个窗口的结果先攒成一份再整体替换，于是失败的那个窗口以**空 map** 落地——已知价格被静默清空——同时凭另一个窗口的成功把 coverage 报成 `live`，正是这条成本链路本身要防的「没人定价却显示成已定价」。现在每个窗口只被自己那次成功的应答替换，失败的窗口保留上次已知价格并单独降级为 `error`。
+`source` 与成本 coverage 都**按窗口**记录，因为 24h 与 7d 是两次独立请求、会各自失败。整卡一个标签的写法有两处失真：一是任一窗口成功就把「由 Gateway 定价」盖在另一个它根本没答的窗口上；二是原实现把两个窗口的结果先攒成一份再整体替换，于是失败的那个窗口以**空 map** 落地——已知价格被静默清空——同时凭另一个窗口的成功把 coverage 报成 `live`，正是这条成本链路本身要防的「没人定价却显示成已定价」。现在每个窗口只被自己那次成功的应答替换，失败的窗口保留上次已知价格并单独降级为 `error`。
 
-但覆盖只替换金额，不替换 `hasCost`。区间定价不可能定出 `sessions.usage` 自己都报为未定价的模型，把 `hasCost` 一并设成 true 会让一个下界读起来像完整值——这正是 §2.3 禁止的那种塌缩。
+覆盖同时替换金额与 `hasCost`，因为两者来自同一次应答：聚合自己带着 `missingCostEntries`，那是唯一能判断屏幕上这个金额完整与否的东西。原来的写法保留按会话读数的 `hasCost`，于是一个区间明明全部定价、却因为某个会话的快照曾是下界而被标成下界。未定价的**模型名**仍只能来自按会话读数——区间应答只报数量、不报是谁——所以名字留着，完整性由区间说。
+
+金额覆盖的窗口还要带上**实际定价的日历跨度**（`cost.priced`）。Gateway 只按日历天定价：`range` 最小是 `7d`，单日必须用 `startDate`/`endDate` 点名，不存在「最近 24 小时」这种问法。因此 24h 那一列在被 Gateway 定价时展示的是**某一天**的花费，卡片就按应答回来的跨度改标签（今天即 `today`），详情页页脚把两个跨度写全。把一天的金额挂在写着 24h 的标签下，正是这条链路要防的那种「标签与含义不符」。发请求时带 `mode: "specific"` 与本机 UTC 偏移，这样「哪一天的午夜」由我们钉死，不取决于 Gateway 宿主机的时区。
 
 ### 5.2 会话列表分页
 
@@ -658,7 +668,7 @@ web/src/state/use-paged-query.ts      （新增，供会话列表使用）
 每个 Agent 一张卡，四段信息：
 
 ```text
-身份    displayName · runtime · model · kind 标记（system 类需明确区分）
+身份    displayName · runtime · model
 此刻    活跃会话数 · 活跃 run 数 · 当前 attention 数
 近期    24h 与 7d 的完成数、成功率、平均时长
 未来    未来 1 小时的 cron 预测数（直接复用现有 UpcomingScheduleSnapshot）
@@ -667,7 +677,7 @@ web/src/state/use-paged-query.ts      （新增，供会话列表使用）
 
 「未来」这一段是本产品相对 AgentsView 的差异点：AgentsView 没有 Gateway 的调度视角，拿不到这个数。数据已经在 `ActivitySnapshot.schedule` 里算好了，直接按 `agentId` 分组即可。
 
-卡片排序默认按「当前活跃 → 最近活动时间」。`kind: "system"` 的 Agent 默认折叠，与 OpenClaw 客户端对 system roster 的处理保持一致。
+卡片排序默认按「当前活跃 → 最近活动时间」，**一个列表，不分区**。本规格早先要求把 `kind: "system"` 的 Agent 折叠起来（与 OpenClaw 客户端对 system roster 的处理一致），真机校准推翻了这条：`agents.list` 在 2026.7.1-2 上根本不发 `kind`，名册里也没有任何字段能区分内建 agent，于是每个 agent 都投影成 `unknown`，那个折叠区永远不会出现。换别的信号推断（例如「只由 cron 触发的算系统」）是这个采集器自己编出来的区分，不是从 Gateway 读到的事实，因此不做。`kind` 仍留在契约与 API 里：别的 Gateway 版本若真发这个字段，它是诚实数据，只是界面不再据此分区。
 
 Agent 详情页（`/agents/:agentId`）在卡片之上多出的那一层是**结局分布**：卡片给的是成功率，而成功率分不清「失败」「被取消」「超时」和「压根没有结论」。这四种情况要采取的行动完全不同，压成一个百分比就看不出来了。分布以按比例的色条呈现，未分类的一段与失败段并列可见——`unknown` 占了半数的 Agent，问题往往出在观测面而不是它本身。其余分段（此刻、成本、归属 cron、近期会话）复用总览卡的口径与组件，避免同一个数在两处算法不同。
 
@@ -711,7 +721,8 @@ Agent 详情页（`/agents/:agentId`）在卡片之上多出的那一层是**结
   - `offset` **从最新一条往回数**，且**确实生效**（同一会话 `{limit:1}` 与 `{limit:1,offset:1}` 返回不同页）；越界 offset 返回空数组。上面的 tail / backfill 分工成立。
   - 该构建**完全不返回分页字段**。`chat.history` 的响应只有 `{ sessionKey, sessionId, messages, defaults, sessionInfo, thinkingLevel }`，无论历史多长都没有 `hasMore`、`nextOffset`、`totalMessages`。因此 `projectHistoryPage` 不能只信响应：满页（`messages.length >= limit`）即视为还有更旧的，下一个 offset 由 `offset + 本页条数` 自行推算；短页即历史到底。别名保留，会答的构建仍然优先采信。
   - 若按字面只信响应，后果是每个会话在一次 tail 读后就被判 `complete`：超过一页（200 条）的会话只存下最新一页，却对外声明「已完整归档」，同时回填拿不到 offset，永远重读同一页。这条已修，回归测试见 `message-projector.test.ts`「keeps walking a full page the Gateway said nothing about」。
-- 消息字段同批核对：真机的频道字段是 `sourceChannel`（不是 `channel`），`sessionId` 只在**页面顶层**、消息行内没有——后者改为从页面读取，因为它正是判断 transcript 是否换代的依据，比会话表里存的那个更新。实测两个真实会话 6/6、2/2 全部成功投影，无丢弃，角色 / messageId / 时间戳全部命中。仍未被任何别名认领的键：`api`、`idempotencyKey`、`isError`、`model`、`provider`、`stopReason`、`toolCallId`、`usage`、`sender*`——前者多为逐条用量与工具错误标记（可作为后续信号来源），`sender*` 是刻意不入库的身份信息。
+- 消息字段同批核对：真机的频道字段是 `sourceChannel`（不是 `channel`），`sessionId` 只在**页面顶层**、消息行内没有——后者改为从页面读取，因为它正是判断 transcript 是否换代的依据，比会话表里存的那个更新。实测两个真实会话 6/6、2/2 全部成功投影，无丢弃，角色 / messageId / 时间戳全部命中。`isError` 随后已接入（见下条）。仍未被任何别名认领的键：`api`、`idempotencyKey`、`model`、`provider`、`stopReason`、`toolCallId`、`usage`、`sender*`——前几项多为逐条用量与调用元数据，`sender*` 是刻意不入库的身份信息。
+- 工具结果的 `isError` 入库为 `session_messages.is_error`（schema v5），只接受布尔值：`NULL` 表示这条不是工具结果，与「调用成功」是两件事，混同会让每条普通消息都变成一次成功的工具调用，把没用过工具的会话也评成高置信度。真机 30 条里 13 条带这个字段，其中 3 条为 true。
 - 容量判定不在写路径上做。`usage()` 依赖 `dbstat`，会遍历全部页——按定时器去问，等于只要 collector 在跑就每隔几分钟在同步路径上走一遍整个库。改为：启动时测一次，驱逐搬动了大量数据后测一次，每轮 prune 之后（由 `markUsageStale()` 通知）测一次；三者都是罕见或本来就在做重活的时机。其间用本轮写入量递增估算。
 - 估算必须换算到页字节口径。预算比的是 `dbstat` 的页字节（含索引与 FTS 影子表），而一轮只知道自己写了多少 UTF-8 内容字节，两者相加是把两种量当同一种：估算实际以真实增速的约三分之一爬升，越线时早已超出。因此按上次测量得到的 `storedBytes / contentBytes` 比率放大后再累加（下限 1，空库不会算出「文本比自身还小」）。
 - 只累加**真正落库**的字节。`append()` 因此回报 `insertedBytes`。tail 读每轮都重取最新一页，而 `withoutKnown` 只在 Gateway 给了 messageId 时才滤得掉；否则重复行由幂等键在插入处丢弃、库根本没长，把这些写入也记进估算，等于让一个早已不再变化的会话稳步爬向上限，最后为了腾出根本不需要的空间去驱逐别人的正文。
@@ -823,7 +834,7 @@ openclaw-collector purge-transcripts --config <path>
 - 四个既有 View 的路径与旧行为等价。
 - 会话列表的筛选与排序可通过 URL 完整复原。
 - 会话列表在用户滚动期间不因 SSE 自动重排。
-- `kind: "system"` 的 Agent 默认折叠。
+- Agents 页只有一个名册列表：名册不提供任何能区分内建 agent 的字段，所以不存在 system 折叠区，也不用别的信号去猜。
 - 用量不可用时显示 coverage 状态，而不是显示 0。
 - 检索输入连打不产生每键一次请求：防抖后只发一次，被取代的在途请求被 abort，且取消不显示为错误。
 - 换一个查询词后，上一个词的命中行与命中数不再出现在结果块里。

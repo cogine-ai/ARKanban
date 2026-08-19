@@ -349,11 +349,34 @@ const dropUnusedMessageStats: Migration = {
   },
 };
 
+/**
+ * Version 5 stores the Gateway's own verdict on a tool call.
+ *
+ * A `role: "toolResult"` message carries `isError`, and 2026.7.1-2 sets it both
+ * ways. Until now the only tool-failure evidence was inferred from event
+ * observations, while the archive was throwing away the one place the Gateway
+ * states the outcome outright. `NULL` is a third value and has to stay one: it
+ * means the turn is not a tool result, which is not the same as a call that
+ * succeeded.
+ *
+ * Rows archived before this migration keep `NULL`. There is nothing to backfill
+ * from — the flag was never stored — and re-reading history to fill it in would
+ * be a full-archive walk for evidence the next sync collects anyway.
+ */
+const messageToolError: Migration = {
+  version: 5,
+  name: "message-tool-error",
+  up(db) {
+    db.exec("ALTER TABLE session_messages ADD COLUMN is_error INTEGER");
+  },
+};
+
 export const MIGRATIONS: readonly Migration[] = [
   baseline,
   agentsSessionSurface,
   usageRollupIncrements,
   dropUnusedMessageStats,
+  messageToolError,
 ];
 
 export const TARGET_SCHEMA_VERSION = MIGRATIONS.reduce(

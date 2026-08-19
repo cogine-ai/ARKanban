@@ -226,6 +226,66 @@ describe("projectUsagePage", () => {
 });
 
 describe("projectCostReport", () => {
+  /**
+   * The shape 2026.7.1-2 returns: the split is under `aggregates.byAgent`, the
+   * amount is a dollar figure one level further down in `totals`, and the span the
+   * Gateway resolved comes back with it.
+   */
+  it("reads the per-agent aggregate of a ranged reply", () => {
+    const report = projectCostReport({
+      updatedAt: 1_800_000_000_000,
+      startDate: "2026-08-18",
+      endDate: "2026-08-18",
+      sessions: [],
+      totals: { totalCost: 0.037, missingCostEntries: 0 },
+      aggregates: {
+        byAgent: [
+          { agentId: "builder", totals: { totalCost: 0.03, totalTokens: 900, missingCostEntries: 0 } },
+          { agentId: "runner", totals: { totalCost: 0.007, totalTokens: 120, missingCostEntries: 1 } },
+        ],
+        messages: { total: 27, toolCalls: 17, errors: 3 },
+      },
+    });
+
+    expect(report.byAgent.get("builder")).toEqual({ costMicroUsd: 30_000, hasCost: true });
+    // The Gateway counted an entry it could not price, so this amount is a floor.
+    expect(report.byAgent.get("runner")).toEqual({ costMicroUsd: 7_000, hasCost: false });
+    expect(report.totalMicroUsd).toBe(37_000);
+    expect(report.pricedFrom).toBe("2026-08-18");
+    expect(report.pricedTo).toBe("2026-08-18");
+  });
+
+  /**
+   * What 2026.7.1-2 answered for a week holding 27,844 tokens: the aggregate has
+   * the counts, `totalCost` is zero, and one entry went unpriced because the codex
+   * harness has no price table. Reported as an amount it renders "$0.00+", which
+   * puts a floor marker on a figure that measures nothing.
+   */
+  it("reports no amount when nothing in the span could be priced", () => {
+    const report = projectCostReport({
+      startDate: "2026-08-12",
+      endDate: "2026-08-18",
+      aggregates: {
+        byAgent: [{ agentId: "main", totals: { totalTokens: 27_844, totalCost: 0, missingCostEntries: 1 } }],
+      },
+    });
+
+    expect(report.byAgent.has("main")).toBe(false);
+    // The span still came back, so the window knows what it asked about.
+    expect(report.pricedFrom).toBe("2026-08-12");
+  });
+
+  /** A day with no work priced to zero is a fact, and reads as one. */
+  it("keeps a zero that nothing was left unpriced against", () => {
+    const report = projectCostReport({
+      startDate: "2026-08-18",
+      endDate: "2026-08-18",
+      aggregates: { byAgent: [{ agentId: "main", totals: { totalTokens: 0, totalCost: 0, missingCostEntries: 0 } }] },
+    });
+
+    expect(report.byAgent.get("main")).toEqual({ costMicroUsd: 0, hasCost: true });
+  });
+
   it("reads per-agent cost from a list", () => {
     const report = projectCostReport({
       agents: [
@@ -233,14 +293,14 @@ describe("projectCostReport", () => {
         { agentId: "runner", costUsd: 0.002 },
       ],
     });
-    expect(report.byAgent.get("builder")).toBe(1_000);
-    expect(report.byAgent.get("runner")).toBe(2_000);
+    expect(report.byAgent.get("builder")).toEqual({ costMicroUsd: 1_000, hasCost: true });
+    expect(report.byAgent.get("runner")).toEqual({ costMicroUsd: 2_000, hasCost: true });
     expect(report.totalMicroUsd).toBe(3_000);
   });
 
   it("reads per-agent cost from a keyed map", () => {
     const report = projectCostReport({ byAgent: { builder: { costUsd: 0.5 } } });
-    expect(report.byAgent.get("builder")).toBe(500_000);
+    expect(report.byAgent.get("builder")).toEqual({ costMicroUsd: 500_000, hasCost: true });
   });
 
   it("prefers a reported total over the sum of its parts", () => {

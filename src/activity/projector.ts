@@ -12,7 +12,7 @@ import type {
 export type RawTaskSummary = Record<string, unknown>;
 export type RawSessionRow = Record<string, unknown>;
 
-export type ActivityWrite = ActivityItem & {
+export type ActivityWrite = Omit<ActivityItem, "hostId"> & {
   sourceKey: string;
   taskId?: string;
   runRef?: string;

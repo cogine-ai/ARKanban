@@ -1,15 +1,40 @@
+import { hostname as osHostname } from "node:os";
 import { readFileSync } from "node:fs";
 import path from "node:path";
+import type { CollectorRole } from "./contracts.js";
+import { isValidHostId } from "./host/ids.js";
+import { loadSecrets, secretsPathFor } from "./settings/secrets.js";
+
+export type HubNodeConfig = {
+  id: string;
+  url: string;
+  tokenEnv: string;
+  label?: string;
+};
 
 export type CollectorConfig = {
+  host: {
+    id: string;
+    label: string;
+  };
+  role: CollectorRole;
   gateway: {
     name: string;
     url: string;
     tokenEnv: string;
   };
   server: {
-    host: "127.0.0.1" | "::1";
+    host: string;
     port: number;
+    /** Env var holding the shared secret required when binding off loopback. */
+    tokenEnv?: string;
+  };
+  hub: {
+    nodes: HubNodeConfig[];
+  };
+  localSources: {
+    /** Observe standalone `claude` / `codex` CLI processes on this machine. */
+    standaloneCli: "enabled" | "disabled";
   };
   storage: {
     path: string;
@@ -29,19 +54,30 @@ export type CollectorConfig = {
   };
 };
 
-export type ResolvedCollectorConfig = CollectorConfig & {
+export type ResolvedCollectorConfig = Omit<CollectorConfig, "gateway" | "server" | "hub" | "storage"> & {
   gateway: CollectorConfig["gateway"] & { token: string };
+  server: CollectorConfig["server"] & { token?: string };
+  hub: {
+    nodes: Array<HubNodeConfig & { token: string }>;
+  };
   storage: CollectorConfig["storage"] & { path: string };
   configPath: string;
 };
 
 const DEFAULTS: CollectorConfig = {
+  host: {
+    id: "local",
+    label: "local",
+  },
+  role: "node",
   gateway: {
     name: "gateway-local",
     url: "ws://127.0.0.1:18789",
     tokenEnv: "OPENCLAW_GATEWAY_TOKEN",
   },
   server: { host: "127.0.0.1", port: 47123 },
+  hub: { nodes: [] },
+  localSources: { standaloneCli: "enabled" },
   storage: {
     path: "./data/collector.sqlite",
     terminalRetentionDays: 30,
@@ -81,6 +117,17 @@ function numberValue(value: unknown, fallback: number, label: string, min: numbe
   return value as number;
 }
 
+function optionalString(value: unknown, label: string): string | undefined {
+  if (value === undefined) return undefined;
+  if (typeof value !== "string" || value.trim().length === 0) throw new Error(`${label} must be a non-empty string`);
+  return value.trim();
+}
+
+export function isLoopbackHost(host: string): boolean {
+  const normalized = host.trim().toLowerCase();
+  return normalized === "127.0.0.1" || normalized === "::1" || normalized === "localhost";
+}
+
 export type LoadConfigOptions = {
   /**
    * Skips the Gateway token requirement for commands that never connect.
@@ -90,28 +137,68 @@ export type LoadConfigOptions = {
   requireToken?: boolean;
 };
 
+function defaultHostId(): string {
+  const raw = osHostname().trim().toLowerCase().replace(/[^a-z0-9._-]+/g, "-").replace(/^-+|-+$/g, "");
+  if (raw && isValidHostId(raw)) return raw.slice(0, 64);
+  return "local";
+}
+
 export function loadConfig(
   configPath: string,
   env: NodeJS.ProcessEnv = process.env,
   options: LoadConfigOptions = {},
 ): ResolvedCollectorConfig {
   const absoluteConfigPath = path.resolve(configPath);
+  const secrets = loadSecrets(secretsPathFor(absoluteConfigPath));
   const parsed = JSON.parse(readFileSync(absoluteConfigPath, "utf8")) as unknown;
   const root = asRecord(parsed, "config");
+  const hostBlock = asRecord(root.host ?? {}, "host");
   const gateway = asRecord(root.gateway ?? {}, "gateway");
   const server = asRecord(root.server ?? {}, "server");
+  const hubBlock = asRecord(root.hub ?? {}, "hub");
+  const localSources = asRecord(root.localSources ?? {}, "localSources");
   const storage = asRecord(root.storage ?? {}, "storage");
   const reconcile = asRecord(root.reconcile ?? {}, "reconcile");
   const ui = asRecord(root.ui ?? {}, "ui");
 
+  const roleRaw = stringValue(root.role, DEFAULTS.role, "role");
+  if (roleRaw !== "node" && roleRaw !== "hub" && roleRaw !== "both") {
+    throw new Error('role must be "node", "hub", or "both"');
+  }
+  const role: CollectorRole = roleRaw;
+
+  const hostId = stringValue(hostBlock.id, defaultHostId(), "host.id");
+  if (!isValidHostId(hostId)) {
+    throw new Error("host.id must be 1-64 chars of [A-Za-z0-9._-] starting with alphanumeric");
+  }
+  const hostLabel = stringValue(hostBlock.label, stringValue(gateway.name, hostId, "gateway.name"), "host.label");
+
+  const collectsLocally = role === "node" || role === "both";
+  const isHub = role === "hub" || role === "both";
+
   const tokenEnv = stringValue(gateway.tokenEnv, DEFAULTS.gateway.tokenEnv, "gateway.tokenEnv");
-  const token = env[tokenEnv]?.trim();
-  if (!token && options.requireToken !== false) {
-    throw new Error(`Gateway token is missing. Set ${tokenEnv} before starting Collector.`);
+  // Env wins for systemd-style deploys; the Settings UI writes the secrets file.
+  const token = env[tokenEnv]?.trim() || secrets.gatewayToken?.trim();
+  const requireGatewayToken = options.requireToken !== false && collectsLocally;
+  if (!token && requireGatewayToken) {
+    throw new Error(
+      `Gateway token is missing. Set ${tokenEnv}, or enter it under Settings (stored in ${path.basename(secretsPathFor(absoluteConfigPath))}).`,
+    );
   }
 
-  const host = stringValue(server.host, DEFAULTS.server.host, "server.host");
-  if (host !== "127.0.0.1" && host !== "::1") throw new Error("server.host must be loopback (127.0.0.1 or ::1)");
+  const listenHost = stringValue(server.host, DEFAULTS.server.host, "server.host");
+  const serverTokenEnv =
+    optionalString(server.tokenEnv, "server.tokenEnv") ??
+    (secrets.serverToken || !isLoopbackHost(listenHost) ? "COLLECTOR_NODE_TOKEN" : undefined);
+  const serverToken =
+    (serverTokenEnv ? env[serverTokenEnv]?.trim() : undefined) || secrets.serverToken?.trim() || undefined;
+  if (!isLoopbackHost(listenHost)) {
+    if (!serverToken) {
+      throw new Error(
+        `Server token is missing. Set ${serverTokenEnv ?? "COLLECTOR_NODE_TOKEN"}, or generate a pairing offer under Settings.`,
+      );
+    }
+  }
 
   // Checked here rather than at the first connection attempt, because a typo
   // otherwise surfaced as an invalid-URL stack from the line that prints the
@@ -175,7 +262,65 @@ export function loadConfig(
     throw new Error('storage.transcriptSync must be "enabled" or "disabled"');
   }
 
+  const standaloneCli = stringValue(
+    localSources.standaloneCli,
+    DEFAULTS.localSources.standaloneCli,
+    "localSources.standaloneCli",
+  );
+  if (standaloneCli !== "enabled" && standaloneCli !== "disabled") {
+    throw new Error('localSources.standaloneCli must be "enabled" or "disabled"');
+  }
+
+  const rawNodes = hubBlock.nodes;
+  const nodesInput = rawNodes === undefined ? [] : rawNodes;
+  if (!Array.isArray(nodesInput)) throw new Error("hub.nodes must be an array");
+  if (isHub && nodesInput.length === 0 && role === "hub") {
+    throw new Error("hub.nodes must list at least one remote collector when role is hub");
+  }
+
+  const nodes: Array<HubNodeConfig & { token: string }> = nodesInput.map((entry, index) => {
+    const node = asRecord(entry, `hub.nodes[${index}]`);
+    const id = stringValue(node.id, "", `hub.nodes[${index}].id`);
+    if (!isValidHostId(id)) {
+      throw new Error(`hub.nodes[${index}].id must be a valid host id`);
+    }
+    const url = stringValue(node.url, "", `hub.nodes[${index}].url`);
+    let parsedUrl: URL;
+    try {
+      parsedUrl = new URL(url);
+    } catch {
+      throw new Error(`hub.nodes[${index}].url is not a URL: ${url}`);
+    }
+    if (parsedUrl.protocol !== "http:" && parsedUrl.protocol !== "https:") {
+      throw new Error(`hub.nodes[${index}].url must be http:// or https://`);
+    }
+    const nodeTokenEnv = stringValue(node.tokenEnv, "COLLECTOR_NODE_TOKEN", `hub.nodes[${index}].tokenEnv`);
+    const nodeToken = env[nodeTokenEnv]?.trim() || secrets.nodeTokens?.[id]?.trim() || "";
+    if (options.requireToken !== false && !nodeToken) {
+      throw new Error(
+        `Hub node token is missing. Set ${nodeTokenEnv} for hub.nodes[${index}] (${id}), or pair the node under Settings.`,
+      );
+    }
+    return {
+      id,
+      url: parsedUrl.toString().replace(/\/$/, ""),
+      tokenEnv: nodeTokenEnv,
+      token: nodeToken,
+      ...(optionalString(node.label, `hub.nodes[${index}].label`)
+        ? { label: optionalString(node.label, `hub.nodes[${index}].label`) }
+        : {}),
+    };
+  });
+
+  const seenNodeIds = new Set<string>();
+  for (const node of nodes) {
+    if (seenNodeIds.has(node.id)) throw new Error(`hub.nodes has duplicate id ${node.id}`);
+    seenNodeIds.add(node.id);
+  }
+
   return {
+    host: { id: hostId, label: hostLabel },
+    role,
     gateway: {
       name: stringValue(gateway.name, DEFAULTS.gateway.name, "gateway.name"),
       url: gatewayUrl,
@@ -183,9 +328,13 @@ export function loadConfig(
       token: token ?? "",
     },
     server: {
-      host,
+      host: listenHost,
       port: numberValue(server.port, DEFAULTS.server.port, "server.port", 1, 65_535),
+      ...(serverTokenEnv ? { tokenEnv: serverTokenEnv } : {}),
+      ...(serverToken ? { token: serverToken } : {}),
     },
+    hub: { nodes },
+    localSources: { standaloneCli },
     storage: {
       path: path.resolve(path.dirname(absoluteConfigPath), configuredStoragePath),
       terminalRetentionDays,

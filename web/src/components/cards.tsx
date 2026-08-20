@@ -23,10 +23,10 @@ export function ActivityCard({
     .filter(Boolean)
     .join(" ");
   return (
-    <button className={classes} data-activity-id={item.id} onClick={onSelect} aria-pressed={selected} title={`${item.title} · ${outcomeLabel(item)}`}>
+    <button className={classes} data-activity-id={item.id} data-host-id={item.hostId} onClick={onSelect} aria-pressed={selected} title={`${item.title} · ${item.hostId} · ${outcomeLabel(item)}`}>
       <span className="status-dot" />
       <span className="activity-title">{item.title}</span>
-      <span className="activity-meta">{item.kind === "task" ? "TASK" : "ATTEMPT"} · {outcomeLabel(item)}</span>
+      <span className="activity-meta">{item.kind === "task" ? "TASK" : "ATTEMPT"} · {item.hostId} · {outcomeLabel(item)}</span>
       {item.lastToolName ? <span className="activity-tool">{item.lastToolName}</span> : null}
     </button>
   );

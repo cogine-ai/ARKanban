@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import type { FastifyInstance } from "fastify";
@@ -19,9 +19,14 @@ afterEach(async () => {
 
 function runtimeFixture(retentionDays = 30): { runtime: CollectorRuntime; config: ResolvedCollectorConfig } {
   const directory = mkdtempSync(path.join(tmpdir(), "collector-http-"));
+  const configPath = path.join(directory, "collector.config.json");
   const config: ResolvedCollectorConfig = {
+    host: { id: "local", label: "local" },
+    role: "node",
     gateway: { name: "test", url: "ws://127.0.0.1:18789", tokenEnv: "TEST_TOKEN", token: "secret" },
     server: { host: "127.0.0.1", port: 47_123 },
+    hub: { nodes: [] },
+    localSources: { standaloneCli: "disabled" },
     storage: {
       path: path.join(directory, "collector.sqlite"),
       terminalRetentionDays: retentionDays,
@@ -33,8 +38,25 @@ function runtimeFixture(retentionDays = 30): { runtime: CollectorRuntime; config
     },
     reconcile: { tasksMs: 15_000, sessionsMs: 8_000 },
     ui: { recentLimit: 200 },
-    configPath: path.join(directory, "collector.config.json"),
+    configPath,
   };
+  writeFileSync(
+    configPath,
+    JSON.stringify({
+      host: config.host,
+      role: config.role,
+      gateway: { name: config.gateway.name, url: config.gateway.url, tokenEnv: config.gateway.tokenEnv },
+      server: { host: config.server.host, port: config.server.port },
+      localSources: config.localSources,
+      storage: {
+        path: "./collector.sqlite",
+        terminalRetentionDays: retentionDays,
+        usageRetentionDays: 14,
+        sessionRetentionDays: 90,
+        transcriptSync: "enabled",
+      },
+    }),
+  );
   const runtime = new CollectorRuntime(config);
   cleanups.push(async () => {
     await runtime.stop();
@@ -787,6 +809,29 @@ describe("browser-facing guards", () => {
 
     expect(foreign.json()).toMatchObject({ error: "forbidden_origin" });
     expect(crossSite.json()).toMatchObject({ error: "forbidden_cross_site" });
+  });
+
+  it("accepts an authenticated LAN-style Host when a server token is configured", async () => {
+    const { runtime, config } = runtimeFixture();
+    config.server.host = "0.0.0.0";
+    config.server.token = "hub-secret";
+    const app = await createHttpServer(runtime, config);
+    cleanups.push(() => app.close());
+
+    const denied = await app.inject({
+      method: "GET",
+      url: "/api/v1/meta",
+      headers: { host: "192.168.1.10:47123" },
+    });
+    expect(denied.statusCode).toBe(401);
+
+    const allowed = await app.inject({
+      method: "GET",
+      url: "/api/v1/meta",
+      headers: { host: "192.168.1.10:47123", authorization: "Bearer hub-secret" },
+    });
+    expect(allowed.statusCode).toBe(200);
+    expect(allowed.json()).toMatchObject({ host: { id: "local" } });
   });
 
   it("sends a policy that permits nothing off-origin, and no referrer", async () => {

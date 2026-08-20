@@ -62,6 +62,20 @@ export type MessageSearchFilters = {
   to?: number;
 };
 
+export type PublicSecretState = { configured: boolean; hint?: string };
+
+export type PublicSettings = {
+  host: { id: string; label: string };
+  role: "node" | "hub" | "both";
+  gateway: { name: string; url: string; token: PublicSecretState };
+  server: { host: string; port: number; lanExposed: boolean; token: PublicSecretState };
+  hub: { nodes: Array<{ id: string; url: string; label?: string; token: PublicSecretState }> };
+  localSources: { standaloneCli: "enabled" | "disabled" };
+  pairing: { active?: { code: string; expiresAt: number; hostId: string; label: string } };
+  paths: { config: string; secrets: string };
+  restartRequired: boolean;
+};
+
 /**
  * Reads the error the server actually sent.
  *
@@ -72,9 +86,10 @@ export type MessageSearchFilters = {
  */
 async function readError(response: Response): Promise<string> {
   try {
-    const body = (await response.json()) as { error?: string; hint?: string; supported?: string[] };
+    const body = (await response.json()) as { error?: string; hint?: string; supported?: string[]; message?: string };
     const code = body.error?.replaceAll("_", " ");
-    const detail = body.hint ?? (body.supported ? `supported: ${body.supported.join(", ")}` : undefined);
+    const detail =
+      body.hint ?? body.message ?? (body.supported ? `supported: ${body.supported.join(", ")}` : undefined);
     if (code) return detail ? `${code} — ${detail}` : code;
   } catch {
     // Not a JSON body; the status line is all there is.
@@ -84,6 +99,16 @@ async function readError(response: Response): Promise<string> {
 
 async function getJson<T>(url: string, signal?: AbortSignal): Promise<T> {
   const response = await fetch(url, { headers: { Accept: "application/json" }, ...(signal ? { signal } : {}) });
+  if (!response.ok) throw new Error(await readError(response));
+  return (await response.json()) as T;
+}
+
+async function sendJson<T>(url: string, method: string, body?: unknown): Promise<T> {
+  const response = await fetch(url, {
+    method,
+    headers: { Accept: "application/json", "Content-Type": "application/json" },
+    ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
+  });
   if (!response.ok) throw new Error(await readError(response));
   return (await response.json()) as T;
 }
@@ -116,9 +141,10 @@ export const collectorApi = {
   status: () => getJson<CollectorStatus>("/api/v1/meta"),
   snapshot: () => getJson<ActivitySnapshot>("/api/v1/snapshot"),
   settledGroups: (range: SettledRange) => getJson<SettledGroupSnapshot>(`/api/v1/settled-groups?range=${range}`),
-  settledSeriesRuns: (seriesKey: string, range: SettledRange, rangeEnd: number) => getJson<SettledSeriesRuns>(
-    `/api/v1/settled-groups/${encodeURIComponent(seriesKey)}/runs?range=${range}&rangeEnd=${rangeEnd}`,
-  ),
+  settledSeriesRuns: (seriesKey: string, range: SettledRange, rangeEnd: number) =>
+    getJson<SettledSeriesRuns>(
+      `/api/v1/settled-groups/${encodeURIComponent(seriesKey)}/runs?range=${range}&rangeEnd=${rangeEnd}`,
+    ),
   detail: (id: string) => getJson<ActivityDetail>(`/api/v1/activities/${encodeURIComponent(id)}`),
   agents: () => getJson<{ agents: AgentOverview[] }>("/api/v1/agents"),
   agent: (agentId: string) => getJson<AgentDetail>(`/api/v1/agents/${encodeURIComponent(agentId)}`),
@@ -150,4 +176,21 @@ export const collectorApi = {
       `/api/v1/sessions/${encodeURIComponent(sessionKey)}/messages?${params.toString()}`,
     );
   },
+  settings: () => getJson<PublicSettings>("/api/v1/settings"),
+  saveSettings: (patch: unknown) => sendJson<PublicSettings>("/api/v1/settings", "PUT", patch),
+  pairingOffer: () =>
+    sendJson<{
+      code: string;
+      expiresAt: number;
+      hostId: string;
+      label: string;
+      createdToken: boolean;
+      restartRequired: boolean;
+    }>("/api/v1/pairing/offer", "POST"),
+  pairingClaim: (body: { code: string; nodeUrl: string }) =>
+    sendJson<{
+      ok: true;
+      node: { id: string; url: string; label: string };
+      settings: PublicSettings;
+    }>("/api/v1/pairing/claim", "POST", body),
 };

@@ -1,7 +1,8 @@
 #!/usr/bin/env node
 import { CollectorRuntime } from "./collector/runtime.js";
-import { loadConfig, redactEndpoint, transcriptNotice } from "./config.js";
+import { isLoopbackHost, loadConfig, redactEndpoint, transcriptNotice } from "./config.js";
 import { createHttpServer } from "./http/server.js";
+import { HubRuntime } from "./hub/runtime.js";
 import { purgeTranscripts } from "./storage/purge-transcripts.js";
 
 const COMMANDS = ["start", "check", "version", "purge-transcripts"] as const;
@@ -60,8 +61,17 @@ async function run(): Promise<void> {
     return;
   }
 
-  const runtime = new CollectorRuntime(config);
+  const collectsLocally = config.role === "node" || config.role === "both";
+  const runsHub = config.role === "hub" || config.role === "both";
+
   if (args.command === "check") {
+    if (!collectsLocally) {
+      process.stdout.write(
+        `${JSON.stringify({ ok: true, role: config.role, hubsNodes: config.hub.nodes.length }, null, 2)}\n`,
+      );
+      return;
+    }
+    const runtime = new CollectorRuntime(config);
     try {
       const hello = await runtime.checkConnection(10_000);
       const methods = new Set(hello.features.methods);
@@ -74,6 +84,7 @@ async function run(): Promise<void> {
         `${JSON.stringify(
           {
             ok: Object.values(support).every(Boolean),
+            host: config.host,
             endpoint: redactEndpoint(config.gateway.url),
             serverVersion: hello.server.version,
             protocol: hello.protocol,
@@ -91,20 +102,53 @@ async function run(): Promise<void> {
     return;
   }
 
-  const app = await createHttpServer(runtime, config);
+  // Hub-only: fan-in UI. Node / both: local collector (both also starts hub fan-in
+  // in the same process via HubRuntime listing remotes; local data stays on the
+  // node HTTP surface when role is both — use role hub on a machine that only
+  // aggregates, or open the hub host's UI).
+  const surface =
+    runsHub && !collectsLocally
+      ? new HubRuntime(config)
+      : collectsLocally
+        ? new CollectorRuntime(config)
+        : new HubRuntime(config);
+
+  // When role is both, prefer serving the local node board on this port and run
+  // a companion hub only if remotes are configured — operators open a dedicated
+  // hub process for the merged view. Local collection always wins here.
+  if (runsHub && collectsLocally && config.hub.nodes.length > 0) {
+    process.stdout.write(
+      `role=both: serving local node on this port; configure a separate hub process to fan-in remotes (${config.hub.nodes.length} listed)\n`,
+    );
+  }
+
+  const app = await createHttpServer(surface, config);
   await app.listen({ host: config.server.host, port: config.server.port });
-  runtime.start();
+  surface.start();
+
+  const bindNote = isLoopbackHost(config.server.host)
+    ? "loopback"
+    : `LAN (token via ${config.server.tokenEnv ?? "server.tokenEnv"})`;
   process.stdout.write(
-    `OpenClaw Collector listening on http://${config.server.host}:${config.server.port} (Gateway ${redactEndpoint(config.gateway.url)})\n`,
+    `OpenClaw Collector listening on http://${config.server.host}:${config.server.port} [${config.role}/${bindNote}] host=${config.host.id}\n`,
   );
-  process.stdout.write(transcriptNotice(config));
+  if (collectsLocally) {
+    process.stdout.write(`Gateway ${redactEndpoint(config.gateway.url)}\n`);
+    process.stdout.write(transcriptNotice(config));
+    if (config.localSources.standaloneCli === "enabled") {
+      process.stdout.write("Standalone CLI observation: on (claude / codex processes)\n");
+    }
+  }
+  if (surface instanceof HubRuntime) {
+    process.stdout.write(`Hub fan-in nodes: ${config.hub.nodes.map((node) => node.id).join(", ") || "(none)"}\n`);
+  }
 
   let stopping = false;
   const stop = async (signal: string): Promise<void> => {
     if (stopping) return;
     stopping = true;
     process.stdout.write(`Stopping Collector after ${signal}\n`);
-    await runtime.stop();
+    await surface.stop();
     await app.close();
   };
   process.once("SIGINT", () => void stop("SIGINT"));

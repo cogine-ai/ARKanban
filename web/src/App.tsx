@@ -14,6 +14,7 @@ import { LiveFlowView } from "./views/LiveFlow";
 import { RelationsView } from "./views/Relations";
 import { SessionDetailView } from "./views/SessionDetail";
 import { SessionsView } from "./views/Sessions";
+import { SettingsView } from "./views/Settings";
 
 const NAV_ITEMS = [
   { path: "/", key: "live", label: "Live flow" },
@@ -22,6 +23,7 @@ const NAV_ITEMS = [
   { path: "/relations", key: "relations", label: "Relations" },
   { path: "/archive", key: "archive", label: "Archive" },
   { path: "/connections", key: "connections", label: "Connections" },
+  { path: "/settings", key: "settings", label: "Settings" },
 ] as const;
 
 /**
@@ -72,6 +74,7 @@ export function App() {
   const navigateTo = useNavigate();
   const [kind, setKind] = useState<KindFilter>("all");
   const [query, setQuery] = useState("");
+  const [hostFilter, setHostFilter] = useState("all");
   const [selectedId, setSelectedId] = useState<string>();
   const [selectedSeriesKey, setSelectedSeriesKey] = useState<string>();
   const [overflow, setOverflow] = useState<{ agentId: string; groups: SettledGroupSummary[] }>();
@@ -122,7 +125,7 @@ export function App() {
             </Link>
           ))}
         </nav>
-        <button className={`gateway-button ${status?.gateway.connected ? "live" : ""}`} onClick={() => navigateTo("/connections")}><span />{status?.gateway.name ?? "Gateway"}<small>{statusLabel(status)}</small></button>
+        <button className={`gateway-button ${status?.gateway.connected ? "live" : ""}`} onClick={() => navigateTo("/connections")}><span />{status?.host?.label ?? status?.gateway.name ?? "Gateway"}<small>{statusLabel(status)}</small></button>
       </header>
 
       <LiveStreamNotice />
@@ -131,8 +134,10 @@ export function App() {
         <LiveFlowView
           kind={kind}
           query={query}
+          hostFilter={hostFilter}
           onKindChange={setKind}
           onQueryChange={setQuery}
+          onHostFilterChange={setHostFilter}
           onRangeChange={changeRange}
           selectedId={selectedId}
           selectedSeriesKey={selectedSeriesKey}
@@ -150,6 +155,7 @@ export function App() {
           {matchPath("/relations", pathname) ? <RelationsView snapshot={snapshot} onSelect={openItem} /> : null}
           {matchPath("/archive", pathname) ? <ArchiveView items={snapshot?.items ?? []} onSelect={openItem} /> : null}
           {matchPath("/connections", pathname) ? <ConnectionsView status={status} /> : null}
+          {matchPath("/settings", pathname) ? <SettingsView /> : null}
         </main>
       )}
 

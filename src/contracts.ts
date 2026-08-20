@@ -1,6 +1,7 @@
 export type ActivityKind = "task" | "attempt";
-export type ActivityOrigin = "task_ledger" | "online" | "session_segment";
+export type ActivityOrigin = "task_ledger" | "online" | "session_segment" | "standalone_cli";
 export type ActivityCatalog = "operational" | "terminal_history";
+export type CollectorRole = "node" | "hub" | "both";
 export type ActivityState = "queued" | "active" | "terminal" | "unknown";
 export type ActivityOutcome =
   | "none"
@@ -32,6 +33,8 @@ export type EvidenceState = {
 
 export type ActivityItem = {
   id: string;
+  /** Stable host partition. Same local id on two hosts is not the same Activity. */
+  hostId: string;
   kind: ActivityKind;
   origin: ActivityOrigin;
   catalog: ActivityCatalog;
@@ -121,6 +124,20 @@ export type CollectorSyncState =
   | "incompatible"
   | "error";
 
+/**
+ * One observed host in a single-node status, or one entry in a hub's fan-in set.
+ * `reachable` is about the collector node HTTP surface, not the Gateway itself.
+ */
+export type HostCoverage = {
+  id: string;
+  label: string;
+  reachable: boolean;
+  syncState: CollectorSyncState;
+  lastSeenAt?: number;
+  code?: string;
+  gatewayConnected?: boolean;
+};
+
 export type CollectorStatus = {
   apiVersion: 1;
   process: {
@@ -128,6 +145,18 @@ export type CollectorStatus = {
     startedAt: number;
     ready: boolean;
   };
+  /** This process's host identity (node, or the hub machine itself). */
+  host: {
+    id: string;
+    label: string;
+    role: CollectorRole;
+  };
+  /**
+   * Present on hub / both: every configured node including the local one when
+   * this process also collects. Absent on a plain node so single-host clients
+   * keep today's shape aside from the required `host` field.
+   */
+  hosts?: HostCoverage[];
   epoch: string;
   revision: number;
   syncState: CollectorSyncState;
@@ -165,6 +194,7 @@ export type ActivitySnapshot = {
 
 export type UpcomingSchedule = {
   id: string;
+  hostId: string;
   jobId: string;
   agentId: string;
   title: string;
@@ -188,6 +218,7 @@ export type AgentOrigin = "roster" | "observed";
 
 export type AgentSummary = {
   id: string;
+  hostId: string;
   displayName: string;
   kind: AgentKind;
   runtime?: string;
@@ -308,6 +339,7 @@ export type SessionLineage = {
 
 export type SessionSummary = {
   sessionKey: string;
+  hostId: string;
   sessionId?: string;
   agentId: string;
   label: string;
@@ -463,6 +495,7 @@ export type SettledOutcomeCounts = Record<ActivityOutcome, number>;
 
 export type SettledGroupSummary = {
   seriesKey: string;
+  hostId: string;
   groupingConfidence: SettledGroupingConfidence;
   agentId: string;
   kind: ActivityKind;
@@ -500,6 +533,7 @@ export type SettledGroupSnapshot = {
 
 export type SettledRunSummary = {
   id: string;
+  hostId: string;
   agentId: string;
   kind: ActivityKind;
   title: string;

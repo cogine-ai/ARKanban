@@ -15,8 +15,10 @@ import { useCollector } from "../state/collector-context";
 export function LiveFlowView({
   kind,
   query,
+  hostFilter,
   onKindChange,
   onQueryChange,
+  onHostFilterChange,
   onRangeChange,
   selectedId,
   selectedSeriesKey,
@@ -27,8 +29,10 @@ export function LiveFlowView({
 }: {
   kind: KindFilter;
   query: string;
+  hostFilter: string;
   onKindChange: (kind: KindFilter) => void;
   onQueryChange: (query: string) => void;
+  onHostFilterChange: (hostId: string) => void;
   onRangeChange: (range: SettledRange) => void;
   selectedId?: string;
   selectedSeriesKey?: string;
@@ -39,30 +43,51 @@ export function LiveFlowView({
 }) {
   const { status, snapshot, settled, error, range, refresh } = useCollector();
 
+  const hostOptions = useMemo(() => {
+    if (status?.hosts && status.hosts.length > 0) {
+      return status.hosts.map((host) => ({ id: host.id, label: host.label }));
+    }
+    if (status?.host) return [{ id: status.host.id, label: status.host.label }];
+    const ids = new Set((snapshot?.items ?? []).map((item) => item.hostId).filter(Boolean));
+    return [...ids].sort().map((id) => ({ id, label: id }));
+  }, [status, snapshot]);
+
   const visibleOperationalItems = useMemo(() => {
     const lowered = query.trim().toLowerCase();
     return (snapshot?.items ?? []).filter((item) => {
+      if (hostFilter !== "all" && item.hostId !== hostFilter) return false;
       if (item.state === "terminal" || item.stage === "settled") return false;
       if (kind !== "all" && item.kind !== kind) return false;
-      return !lowered || `${item.title} ${item.agentId} ${item.lastToolName ?? ""}`.toLowerCase().includes(lowered);
+      return !lowered || `${item.title} ${item.agentId} ${item.hostId} ${item.lastToolName ?? ""}`.toLowerCase().includes(lowered);
     });
-  }, [snapshot, kind, query]);
+  }, [snapshot, kind, query, hostFilter]);
 
   const visibleSchedules = useMemo(() => {
     if (kind !== "all") return [];
     const lowered = query.trim().toLowerCase();
     return (snapshot?.schedule.items ?? []).filter((schedule) => (
-      !lowered || `${schedule.title} ${schedule.agentId}`.toLowerCase().includes(lowered)
+      (hostFilter === "all" || schedule.hostId === hostFilter) &&
+      (!lowered || `${schedule.title} ${schedule.agentId} ${schedule.hostId}`.toLowerCase().includes(lowered))
     ));
-  }, [snapshot, kind, query]);
+  }, [snapshot, kind, query, hostFilter]);
 
-  const active = snapshot?.items.filter((item) => item.catalog === "operational").length ?? 0;
-  const waiting = snapshot?.items.filter((item) => item.stage === "waiting" || item.stage === "unresolved").length ?? 0;
-  const scheduled = snapshot?.schedule.items.length ?? 0;
+  const visibleSettled = useMemo(() => {
+    if (!settled || hostFilter === "all") return settled;
+    const groupsByAgent: typeof settled.groupsByAgent = {};
+    for (const [agentId, groups] of Object.entries(settled.groupsByAgent)) {
+      const filtered = groups.filter((group) => group.hostId === hostFilter);
+      if (filtered.length > 0) groupsByAgent[agentId] = filtered;
+    }
+    return { ...settled, groupsByAgent };
+  }, [settled, hostFilter]);
+
+  const active = visibleOperationalItems.length;
+  const waiting = visibleOperationalItems.filter((item) => item.stage === "waiting" || item.stage === "unresolved").length;
+  const scheduled = visibleSchedules.length;
   const agentCount = new Set([
-    ...(snapshot?.items.filter((item) => item.state !== "terminal").map((item) => item.agentId) ?? []),
-    ...(snapshot?.schedule.items.map((item) => item.agentId) ?? []),
-    ...Object.keys(settled?.groupsByAgent ?? {}),
+    ...visibleOperationalItems.map((item) => item.agentId),
+    ...visibleSchedules.map((item) => item.agentId),
+    ...Object.keys(visibleSettled?.groupsByAgent ?? {}),
   ]).size;
 
   return (
@@ -75,15 +100,27 @@ export function LiveFlowView({
             <span><b>{active}</b> operational</span>
             <span><b>{scheduled}</b> scheduled next 1h</span>
             <span className="wait"><b>{waiting}</b> waiting / unresolved</span>
-            <span><b>{settled?.totalSeries ?? "—"}</b> settled series</span>
-            <span><b>{settled?.totalRuns ?? "—"}</b> runs · {range}</span>
+            <span><b>{visibleSettled?.totalSeries ?? "—"}</b> settled series</span>
+            <span><b>{visibleSettled?.totalRuns ?? "—"}</b> runs · {range}</span>
             <span><b>{agentCount}</b> agents</span>
+            {hostOptions.length > 1 ? <span><b>{hostOptions.length}</b> hosts</span> : null}
           </div>
         </div>
         <div className="summary-actions">
-          <StatusPills status={status} snapshot={snapshot} settled={settled} />
+          <StatusPills status={status} snapshot={snapshot} settled={visibleSettled} />
           <div className="filters">
             <label className="search"><span>⌕</span><input value={query} onChange={(event) => onQueryChange(event.target.value)} placeholder="Search activity, schedule or series" aria-label="Search board" /></label>
+            {hostOptions.length > 0 ? (
+              <label className="host-filter">
+                <span className="sr-only">Host</span>
+                <select value={hostFilter} onChange={(event) => onHostFilterChange(event.target.value)} aria-label="Filter by host">
+                  <option value="all">All hosts</option>
+                  {hostOptions.map((host) => (
+                    <option key={host.id} value={host.id}>{host.label}</option>
+                  ))}
+                </select>
+              </label>
+            ) : null}
             <div className="segmented" aria-label="Activity kind"><button aria-pressed={kind === "all"} onClick={() => onKindChange("all")}>All</button><button aria-pressed={kind === "task"} onClick={() => onKindChange("task")}>Tasks</button><button aria-pressed={kind === "attempt"} onClick={() => onKindChange("attempt")}>Attempts</button></div>
             <RangeSelector value={range} onChange={onRangeChange} />
             <button className="refresh-button" onClick={() => void refresh()} aria-label="Refresh snapshots">↻</button>
@@ -98,7 +135,7 @@ export function LiveFlowView({
             items={visibleOperationalItems}
             schedules={visibleSchedules}
             scheduleState={snapshot?.schedule}
-            settled={settled}
+            settled={visibleSettled}
             range={range}
             kind={kind}
             query={query}

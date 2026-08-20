@@ -1,4 +1,5 @@
 import { existsSync } from "node:fs";
+import { timingSafeEqual } from "node:crypto";
 import type { ServerResponse } from "node:http";
 import path from "node:path";
 import fastifyStatic from "@fastify/static";
@@ -13,7 +14,7 @@ import type {
   UsageSummary,
 } from "../contracts.js";
 import type { CollectorRuntime } from "../collector/runtime.js";
-import type { ResolvedCollectorConfig } from "../config.js";
+import { isLoopbackHost, type ResolvedCollectorConfig } from "../config.js";
 import type { SessionStateFilter } from "../storage/repository.js";
 import {
   decodeCursor,
@@ -22,6 +23,10 @@ import {
   SESSION_SORTS,
 } from "../storage/keyset-cursor.js";
 import { MIN_FTS_QUERY_LENGTH } from "../storage/transcript-archive.js";
+import type { HubRuntime } from "../hub/runtime.js";
+import { parsePairableNodeUrl } from "../settings/node-url.js";
+import { createPairingOffer, redeemPairingOffer } from "../settings/pairing.js";
+import { createSettingsService, type SettingsPatch, type SettingsService } from "../settings/store.js";
 
 const SESSION_PAGE_LIMIT_DEFAULT = 50;
 const SESSION_PAGE_LIMIT_MAX = 200;
@@ -61,7 +66,10 @@ const CONTENT_SECURITY_POLICY = [
  * the operator's own browser: a hostile site can point its own hostname at
  * 127.0.0.1, and the browser will then treat this API as that site's same
  * origin — reading the session archive, which holds full conversation text.
- * Every request must therefore arrive under a loopback authority.
+ * Every unauthenticated request must therefore arrive under a loopback authority.
+ *
+ * Authenticated hub-to-node requests may use a LAN Host header: the shared
+ * secret is what admits them, not the browser same-origin model.
  *
  * The port is deliberately not compared. A browser sends the port it actually
  * connected to, so it carries no attacker-controlled signal, while pinning it
@@ -69,6 +77,26 @@ const CONTENT_SECURITY_POLICY = [
  */
 function loopbackAuthorities(configuredHost: string): ReadonlySet<string> {
   return new Set(["localhost", "127.0.0.1", "::1", configuredHost.toLowerCase()]);
+}
+
+/** The operator UI is always opened as loopback, even when the process binds off it. */
+function isOperatorLoopbackAuthority(hostHeader: string | undefined): boolean {
+  const name = authorityHost(hostHeader ?? "");
+  return name === "localhost" || name === "127.0.0.1" || name === "::1";
+}
+
+function tokensEqual(expected: string, provided: string): boolean {
+  const left = Buffer.from(expected);
+  const right = Buffer.from(provided);
+  if (left.length !== right.length) return false;
+  return timingSafeEqual(left, right);
+}
+
+function requestToken(authorization: string | undefined, collectorToken: string | undefined): string | undefined {
+  const bearer = authorization?.match(/^Bearer\s+(.+)$/i)?.[1]?.trim();
+  if (bearer) return bearer;
+  const header = collectorToken?.trim();
+  return header || undefined;
 }
 
 /** Extracts the host from an authority, tolerating `[::1]:port` and a bare IPv6 literal. */
@@ -205,9 +233,16 @@ function settledRangeEnd(value: string | undefined): number | undefined {
   return parsed !== undefined && parsed > 0 ? parsed : undefined;
 }
 
+function isHubRuntime(runtime: HttpSurface): runtime is HubRuntime {
+  return "kind" in runtime && runtime.kind === "hub";
+}
+
+export type HttpSurface = CollectorRuntime | HubRuntime;
+
 export async function createHttpServer(
-  runtime: CollectorRuntime,
+  runtime: HttpSurface,
   config: ResolvedCollectorConfig,
+  settings: SettingsService = createSettingsService(config),
 ): Promise<FastifyInstance> {
   const app = Fastify({
     logger: { level: process.env.LOG_LEVEL ?? "info" },
@@ -220,7 +255,28 @@ export async function createHttpServer(
     forceCloseConnections: true,
   });
 
+  // pairing/offer is a body-less POST. The UI used to send application/json with
+  // an empty body, which Fastify's default parser rejects as EMPTY_JSON_BODY.
+  app.removeContentTypeParser("application/json");
+  app.addContentTypeParser("application/json", { parseAs: "string" }, (_request, body, done) => {
+    const text = typeof body === "string" ? body : Buffer.isBuffer(body) ? body.toString("utf8") : "";
+    if (text.trim() === "") {
+      done(null, {});
+      return;
+    }
+    try {
+      done(null, JSON.parse(text) as unknown);
+    } catch (error) {
+      const err = error instanceof Error ? error : new Error(String(error));
+      (err as Error & { statusCode?: number }).statusCode = 400;
+      done(err, undefined);
+    }
+  });
+
   const allowedHosts = loopbackAuthorities(config.server.host);
+  const lanExposed = !isLoopbackHost(config.server.host);
+  const requiredToken = config.server.token;
+
   app.addHook("onRequest", async (request, reply) => {
     reply.headers({
       "content-security-policy": CONTENT_SECURITY_POLICY,
@@ -231,6 +287,30 @@ export async function createHttpServer(
       "cross-origin-opener-policy": "same-origin",
       "cross-origin-resource-policy": "same-origin",
     });
+
+    const provided = requestToken(
+      singleHeader(request.headers.authorization),
+      singleHeader(request.headers["x-collector-token"]),
+    );
+    const authenticated = Boolean(requiredToken && provided && tokensEqual(requiredToken, provided));
+    const pathOnly = request.url.split("?")[0] ?? request.url;
+    // Only a LAN-exposed node needs to accept a hub that does not yet hold the
+    // shared secret. Loopback keeps Host / Origin checks so DNS rebinding cannot
+    // redeem a pairing code through the operator's browser.
+    const pairingRedeem = lanExposed && request.method === "POST" && pathOnly === "/api/v1/pairing/redeem";
+    const operatorLoopback = isOperatorLoopbackAuthority(singleHeader(request.headers.host));
+
+    if (lanExposed && !authenticated && !pairingRedeem && !operatorLoopback) {
+      return reply.code(401).send({ error: "unauthorized" });
+    }
+    if (requiredToken && provided && !authenticated) {
+      return reply.code(401).send({ error: "unauthorized" });
+    }
+
+    // Hub clients authenticate. The operator UI is still a loopback page even
+    // when this process is bound off loopback, so those requests keep Host /
+    // Origin checks instead of being rejected for a missing LAN token.
+    if (authenticated || pairingRedeem) return undefined;
 
     const host = singleHeader(request.headers.host);
     if (!host || !allowedHosts.has(authorityHost(host) ?? "")) {
@@ -271,6 +351,102 @@ export async function createHttpServer(
   });
   app.get("/api/v1/meta", async () => runtime.getStatus());
   app.get("/api/v1/snapshot", async () => runtime.getSnapshot());
+
+  app.get("/api/v1/settings", async () => settings.getPublicSettings());
+  app.put<{ Body: SettingsPatch }>("/api/v1/settings", async (request, reply) => {
+    try {
+      return settings.applyPatch(request.body ?? {});
+    } catch (error) {
+      return reply.code(400).send({ error: error instanceof Error ? error.message : "invalid_settings" });
+    }
+  });
+
+  /**
+   * Node side: mint a short-lived pairing code that a hub can redeem once.
+   * Ensures a LAN shared secret exists so the hub can keep calling afterwards.
+   */
+  app.post("/api/v1/pairing/offer", async () => {
+    const ensured = settings.ensureServerToken();
+    const publicSettings = settings.getPublicSettings();
+    const offer = createPairingOffer({
+      hostId: publicSettings.host.id,
+      label: publicSettings.host.label,
+      token: ensured.token,
+    });
+    return {
+      code: offer.code,
+      expiresAt: offer.expiresAt,
+      hostId: offer.hostId,
+      label: offer.label,
+      createdToken: ensured.created,
+      restartRequired: publicSettings.restartRequired,
+      hint: "On the hub, open Settings → Pair node, enter this code and this machine's http://IP:port.",
+    };
+  });
+
+  /** Node side: one-time exchange. The pairing code is the admission ticket. */
+  app.post<{ Body: { code?: string } }>("/api/v1/pairing/redeem", async (request, reply) => {
+    const code = request.body?.code;
+    if (!code || typeof code !== "string") return reply.code(400).send({ error: "missing_code" });
+    const redeemed = redeemPairingOffer(code);
+    if (!redeemed) return reply.code(404).send({ error: "pairing_code_invalid" });
+    return redeemed;
+  });
+
+  /**
+   * Hub side: redeem a remote node's pairing code and persist the node.
+   * Body: { code, nodeUrl }
+   */
+  app.post<{ Body: { code?: string; nodeUrl?: string } }>("/api/v1/pairing/claim", async (request, reply) => {
+    const code = request.body?.code;
+    const nodeUrl = request.body?.nodeUrl;
+    if (!code || typeof code !== "string") return reply.code(400).send({ error: "missing_code" });
+    if (!nodeUrl || typeof nodeUrl !== "string") return reply.code(400).send({ error: "missing_node_url" });
+    let base: URL;
+    try {
+      base = parsePairableNodeUrl(nodeUrl);
+    } catch {
+      return reply.code(400).send({ error: "invalid_node_url" });
+    }
+    const redeemUrl = new URL("/api/v1/pairing/redeem", base).toString();
+    let remote: { hostId: string; label: string; token: string };
+    try {
+      const response = await fetch(redeemUrl, {
+        method: "POST",
+        headers: { "content-type": "application/json", accept: "application/json" },
+        body: JSON.stringify({ code }),
+        redirect: "error",
+        signal: AbortSignal.timeout(8_000),
+      });
+      if (!response.ok) {
+        request.log.warn({ status: response.status }, "pairing redeem failed");
+        return reply.code(502).send({ error: "pairing_redeem_failed" });
+      }
+      remote = (await response.json()) as { hostId: string; label: string; token: string };
+    } catch (error) {
+      request.log.warn({ err: error }, "pairing redeem unreachable");
+      return reply.code(502).send({ error: "pairing_unreachable" });
+    }
+    if (!remote.hostId || !remote.token) {
+      return reply.code(502).send({ error: "pairing_redeem_malformed" });
+    }
+    try {
+      const saved = settings.addHubNode({
+        id: remote.hostId,
+        url: base.toString().replace(/\/$/, ""),
+        label: remote.label || remote.hostId,
+        token: remote.token,
+      });
+      return {
+        ok: true,
+        node: { id: remote.hostId, url: base.toString().replace(/\/$/, ""), label: remote.label },
+        settings: saved,
+      };
+    } catch (error) {
+      return reply.code(400).send({ error: error instanceof Error ? error.message : "pairing_save_failed" });
+    }
+  });
+
   /**
    * Reports how the session and agent projectors matched the connected Gateway:
    * `unknown` keys were returned but consumed by nothing, `missing` aliases were
@@ -301,21 +477,32 @@ export async function createHttpServer(
     if (!range) return reply.code(400).send({ error: "invalid_settled_range", allowed: ["24h", "7d", "30d"] });
     const rangeEnd = settledRangeEnd(request.query.rangeEnd);
     if (rangeEnd === undefined) return reply.code(400).send({ error: "invalid_range_end" });
-    const detail = runtime.getSettledSeriesRuns(request.params.seriesKey, range, rangeEnd);
+    const detail = await Promise.resolve(runtime.getSettledSeriesRuns(request.params.seriesKey, range, rangeEnd));
     if (!detail) return reply.code(404).send({ error: "settled_series_not_found" });
     return detail;
   });
   app.get<{ Params: { id: string } }>("/api/v1/activities/:id", async (request, reply) => {
-    const detail = runtime.getDetail(request.params.id);
+    const detail = await Promise.resolve(runtime.getDetail(request.params.id));
     if (!detail) return reply.code(404).send({ error: "activity_not_found" });
     return detail;
   });
 
-  app.get("/api/v1/agents", async () => ({
-    agents: runtime.repository.listAgentOverviews().map((agent) => withGatewayCost(runtime, agent)),
-  }));
+  app.get("/api/v1/agents", async () => {
+    if (isHubRuntime(runtime)) {
+      return { agents: await runtime.listAgents() };
+    }
+    return {
+      agents: runtime.repository.listAgentOverviews().map((agent) => withGatewayCost(runtime, agent)),
+    };
+  });
 
   app.get<{ Params: { id: string } }>("/api/v1/agents/:id", async (request, reply) => {
+    if (isHubRuntime(runtime)) {
+      const agents = await runtime.listAgents();
+      const found = agents.find((agent) => agent.id === request.params.id);
+      if (!found) return reply.code(404).send({ error: "agent_not_found" });
+      return { agent: found, sessions: { items: [] } };
+    }
     const found = runtime.repository.getAgentOverview(request.params.id);
     if (!found) return reply.code(404).send({ error: "agent_not_found" });
     const agent = withGatewayCost(runtime, found);

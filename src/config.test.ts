@@ -62,3 +62,55 @@ describe("endpoint redaction", () => {
     expect(redactEndpoint("not a url")).toBe("<unparseable endpoint>");
   });
 });
+
+describe("server bind and multi-host config", () => {
+  it("rejects a non-loopback bind without a server token env", () => {
+    const directory = mkdtempSync(path.join(tmpdir(), "collector-config-"));
+    cleanups.push(() => rmSync(directory, { recursive: true, force: true }));
+    const configPath = path.join(directory, "collector.config.json");
+    writeFileSync(
+      configPath,
+      JSON.stringify({
+        gateway: { url: "ws://127.0.0.1:8787" },
+        server: { host: "0.0.0.0", port: 47123 },
+        storage: { path: path.join(directory, "c.sqlite") },
+      }),
+    );
+    expect(() => loadConfig(configPath, env)).toThrow(/Server token is missing|server\.tokenEnv/);
+  });
+
+  it("requires the server token when binding off loopback", () => {
+    const directory = mkdtempSync(path.join(tmpdir(), "collector-config-"));
+    cleanups.push(() => rmSync(directory, { recursive: true, force: true }));
+    const configPath = path.join(directory, "collector.config.json");
+    writeFileSync(
+      configPath,
+      JSON.stringify({
+        host: { id: "desk-1" },
+        gateway: { url: "ws://127.0.0.1:8787" },
+        server: { host: "0.0.0.0", port: 47123, tokenEnv: "COLLECTOR_TOKEN" },
+        storage: { path: path.join(directory, "c.sqlite") },
+      }),
+    );
+    expect(() => loadConfig(configPath, env)).toThrow(/Server token is missing/);
+    const loaded = loadConfig(configPath, { ...env, COLLECTOR_TOKEN: "secret" });
+    expect(loaded.server.host).toBe("0.0.0.0");
+    expect(loaded.server.token).toBe("secret");
+    expect(loaded.host.id).toBe("desk-1");
+  });
+
+  it("requires hub nodes when role is hub", () => {
+    const directory = mkdtempSync(path.join(tmpdir(), "collector-config-"));
+    cleanups.push(() => rmSync(directory, { recursive: true, force: true }));
+    const configPath = path.join(directory, "collector.config.json");
+    writeFileSync(
+      configPath,
+      JSON.stringify({
+        role: "hub",
+        gateway: { url: "ws://127.0.0.1:8787" },
+        storage: { path: path.join(directory, "c.sqlite") },
+      }),
+    );
+    expect(() => loadConfig(configPath, env)).toThrow(/hub\.nodes/);
+  });
+});

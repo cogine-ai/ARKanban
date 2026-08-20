@@ -33,6 +33,7 @@ describe("upcoming schedule selection", () => {
       items: [
         {
           id: "cron:due",
+          hostId: "local",
           jobId: "due",
           agentId: "main",
           title: "Due now",
@@ -42,6 +43,7 @@ describe("upcoming schedule selection", () => {
         },
         {
           id: "cron:boundary",
+          hostId: "local",
           jobId: "boundary",
           agentId: "pm-awb",
           title: "At one hour",
@@ -67,6 +69,7 @@ describe("upcoming schedule selection", () => {
       items: [
         {
           id: "cron:explicit",
+          hostId: "local",
           jobId: "explicit",
           agentId: "pm-awb",
           title: "Explicit agent",

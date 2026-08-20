@@ -52,7 +52,7 @@ export type RepositoryChange = {
   reasons: string[];
 };
 
-export type StoredActivity = ActivityItem & {
+export type StoredActivity = Omit<ActivityItem, "hostId"> & {
   sourceKey: string;
   taskId?: string;
   runRef?: string;
@@ -243,6 +243,7 @@ function aggregateSettledGroups(
   stored: StoredActivity[],
   rangeStart: number,
   rangeEnd: number,
+  hostId: string,
 ): { groupsByAgent: Record<string, SettledGroupSummary[]>; outcomeCounts: SettledOutcomeCounts; totalSeries: number } {
   const outcomeCounts = emptyOutcomeCounts();
   const grouped = new Map<string, StoredActivity[]>();
@@ -262,6 +263,7 @@ function aggregateSettledGroups(
     const runCount = runs.length;
     return {
       seriesKey,
+      hostId,
       groupingConfidence: "display_exact",
       agentId: latest.agentId,
       kind: latest.kind,
@@ -367,9 +369,9 @@ function rowToStored(row: ActivityRow): StoredActivity {
   };
 }
 
-function publicItem(item: StoredActivity): ActivityItem {
+function publicItem(item: StoredActivity, hostId: string): ActivityItem {
   const { sourceKey: _sourceKey, taskId: _taskId, runRef: _runRef, sessionKey: _sessionKey, parentTaskId: _parentTaskId, ...view } = item;
-  return view;
+  return { ...view, hostId };
 }
 
 const DEFAULT_SESSION_COVERAGE: SessionCoverage = {
@@ -426,9 +428,10 @@ function sessionFingerprint(write: SessionWrite): string {
   ]);
 }
 
-function rowToAgent(row: ActivityRow): AgentSummary {
+function rowToAgent(row: ActivityRow, hostId: string): AgentSummary {
   return {
     id: String(row.id),
+    hostId,
     displayName: String(row.display_name),
     kind: row.kind as AgentSummary["kind"],
     ...(asString(row.runtime) ? { runtime: asString(row.runtime) } : {}),
@@ -439,10 +442,11 @@ function rowToAgent(row: ActivityRow): AgentSummary {
   };
 }
 
-function rowToSessionSummary(row: ActivityRow): SessionSummary {
+function rowToSessionSummary(row: ActivityRow, hostId: string): SessionSummary {
   const signals = rowToSignalsBrief(row);
   return {
     sessionKey: String(row.session_key),
+    hostId,
     ...(asString(row.session_id) ? { sessionId: asString(row.session_id) } : {}),
     agentId: String(row.agent_id),
     label: String(row.label),
@@ -462,9 +466,9 @@ function rowToSessionSummary(row: ActivityRow): SessionSummary {
   };
 }
 
-function rowToSessionRecord(row: ActivityRow): SessionRecord {
+function rowToSessionRecord(row: ActivityRow, hostId: string): SessionRecord {
   return {
-    ...rowToSessionSummary(row),
+    ...rowToSessionSummary(row, hostId),
     lineage: {
       ...(asString(row.parent_session_key) ? { parentSessionKey: asString(row.parent_session_key) } : {}),
       ...(asString(row.previous_session_id) ? { previousSessionId: asString(row.previous_session_id) } : {}),
@@ -588,6 +592,8 @@ export class CollectorRepository {
    * instead of implying a protection that is not in place.
    */
   readonly filePermissionsEnforced: boolean;
+  /** Partition stamped onto every public Activity / Session / Agent view. */
+  readonly hostId: string;
   private readonly db: DatabaseSync;
   private readonly listeners = new Set<(change: RepositoryChange) => void>();
   private readonly findFingerprint: StatementSync;
@@ -595,7 +601,8 @@ export class CollectorRepository {
   private readonly insertObservation: StatementSync;
   private currentRevision = 0;
 
-  constructor(databasePath: string) {
+  constructor(databasePath: string, hostId = "local") {
+    this.hostId = hostId;
     mkdirSync(dirname(databasePath), { recursive: true, mode: 0o700 });
     this.db = new DatabaseSync(databasePath);
     this.db.exec("PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL; PRAGMA busy_timeout = 3000;");
@@ -908,7 +915,7 @@ export class CollectorRepository {
     lanes: LaneSummary[];
   } {
     const stored = this.list(recentTerminalLimit);
-    const items = stored.map(publicItem);
+    const items = stored.map((item) => publicItem(item, this.hostId));
     const byAgent = new Map<string, ActivityItem[]>();
     for (const item of items) {
       const lane = byAgent.get(item.agentId) ?? [];
@@ -934,7 +941,7 @@ export class CollectorRepository {
   settledGroups(range: SettledRange, rangeEnd = Date.now(), complete = true): SettledGroupSnapshot {
     const rangeStart = rangeEnd - settledRangeDuration(range);
     const stored = this.listSettledInRange(rangeStart, rangeEnd);
-    const aggregation = aggregateSettledGroups(stored, rangeStart, rangeEnd);
+    const aggregation = aggregateSettledGroups(stored, rangeStart, rangeEnd, this.hostId);
     return {
       apiVersion: 1,
       epoch: this.epoch,
@@ -959,7 +966,7 @@ export class CollectorRepository {
   ): SettledSeriesRuns | undefined {
     const rangeStart = rangeEnd - settledRangeDuration(range);
     const stored = this.listSettledInRange(rangeStart, rangeEnd);
-    const aggregation = aggregateSettledGroups(stored, rangeStart, rangeEnd);
+    const aggregation = aggregateSettledGroups(stored, rangeStart, rangeEnd, this.hostId);
     const group = Object.values(aggregation.groupsByAgent).flat().find((candidate) => candidate.seriesKey === seriesKey);
     if (!group) return undefined;
     const runs = stored
@@ -967,6 +974,7 @@ export class CollectorRepository {
       .sort((left, right) => terminalAt(right) - terminalAt(left) || right.updatedAt - left.updatedAt || left.id.localeCompare(right.id, "en"))
       .map((item) => ({
         id: item.id,
+        hostId: this.hostId,
         agentId: item.agentId,
         kind: item.kind,
         title: item.title,
@@ -1009,7 +1017,7 @@ export class CollectorRepository {
     return {
       epoch: this.epoch,
       revision: this.currentRevision,
-      item: publicItem(item),
+      item: publicItem(item, this.hostId),
       identity: {
         ...(item.taskId ? { taskId: item.taskId } : {}),
         ...(item.runRef ? { runRef: item.runRef } : {}),
@@ -1018,7 +1026,7 @@ export class CollectorRepository {
         ...(item.parentTaskId ? { parentTaskId: item.parentTaskId } : {}),
       },
       relations,
-      related: all.filter((candidate) => relatedIds.has(candidate.id)).map(publicItem),
+      related: all.filter((candidate) => relatedIds.has(candidate.id)).map((candidate) => publicItem(candidate, this.hostId)),
       timeline,
     };
   }
@@ -1074,7 +1082,7 @@ export class CollectorRepository {
     const rows = this.db
       .prepare("SELECT * FROM agents ORDER BY COALESCE(last_activity_at, first_observed_at) DESC, id ASC")
       .all() as ActivityRow[];
-    return rows.map(rowToAgent);
+    return rows.map((row) => rowToAgent(row, this.hostId));
   }
 
   /**
@@ -1180,7 +1188,7 @@ export class CollectorRepository {
         FROM sessions s WHERE s.session_key = ?
       `)
       .get(sessionKey) as ActivityRow | undefined;
-    return row ? this.withUsageCoverage(rowToSessionRecord(row), row) : undefined;
+    return row ? this.withUsageCoverage(rowToSessionRecord(row, this.hostId), row) : undefined;
   }
 
   listSessions(query: SessionListQuery = {}): SessionSummary[] {
@@ -1202,7 +1210,7 @@ export class CollectorRepository {
         LIMIT ?
       `)
       .all(...parameters) as ActivityRow[];
-    return rows.map(rowToSessionSummary);
+    return rows.map((row) => rowToSessionSummary(row, this.hostId));
   }
 
   /**
@@ -1309,7 +1317,7 @@ export class CollectorRepository {
 
     const hasMore = rows.length > query.limit;
     const page = hasMore ? rows.slice(0, query.limit) : rows;
-    const items = page.map((row) => this.withUsageCoverage(rowToSessionSummary(row), row));
+    const items = page.map((row) => this.withUsageCoverage(rowToSessionSummary(row, this.hostId), row));
     const last = page.at(-1);
     if (!hasMore || !last) return { items };
 
@@ -1361,7 +1369,7 @@ export class CollectorRepository {
     return rows.map((row) => {
       const id = String(row.id);
       return {
-        ...rowToAgent(row),
+        ...rowToAgent(row, this.hostId),
         sessionCount: Number(row.session_count ?? 0),
         activeSessionCount: Number(row.active_count ?? 0),
         archivedSessionCount: Number(row.archived_count ?? 0),
@@ -1519,7 +1527,7 @@ export class CollectorRepository {
         LIMIT ?
       `)
       .all(sessionKey, sessionKey, limit) as ActivityRow[];
-    return rows.map((row) => publicItem(rowToStored(row)));
+    return rows.map((row) => publicItem(rowToStored(row), this.hostId));
   }
 
   /**

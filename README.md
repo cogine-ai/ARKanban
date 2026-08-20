@@ -29,6 +29,49 @@ Collector listens on loopback. To view it from another computer, forward the por
 ssh -N -L 47123:127.0.0.1:47123 user@gateway-host
 ```
 
+## Multi-host (node + hub)
+
+Each machine runs a **node** that still talks only to its local OpenClaw Gateway. One machine (or a dedicated host) runs a **hub** that fans in node HTTP/SSE into a single board. Gateway tokens never leave their host.
+
+### In-app Settings (preferred)
+
+Open **Settings** in the UI:
+
+1. Enter this machine's **Gateway token** (stored in `collector.config.secrets.json`, shown only as `••••last4`).
+2. On each **node**: set listen host to `0.0.0.0` if hubs on the LAN must reach it, then **生成配对码**.
+3. On the **hub**: paste the code + `http://node-ip:47123` under **认领节点**.
+4. Restart the collector when Settings says restart is required.
+
+### Manual config file
+
+**Node** (LAN bind requires a shared secret):
+
+```json
+{
+  "host": { "id": "desk-a", "label": "Desk A" },
+  "role": "node",
+  "server": { "host": "0.0.0.0", "port": 47123, "tokenEnv": "COLLECTOR_NODE_TOKEN" },
+  "localSources": { "standaloneCli": "enabled" }
+}
+```
+
+**Hub**:
+
+```json
+{
+  "host": { "id": "hub", "label": "Hub" },
+  "role": "hub",
+  "hub": {
+    "nodes": [
+      { "id": "desk-a", "url": "http://192.168.1.10:47123", "tokenEnv": "COLLECTOR_NODE_TOKEN" },
+      { "id": "desk-b", "url": "http://192.168.1.11:47123", "tokenEnv": "COLLECTOR_NODE_TOKEN" }
+    ]
+  }
+}
+```
+
+Standalone `claude` / `codex` CLI processes on each node are observed locally and appear on the board with `origin: standalone_cli` (OpenClaw-backed harnesses remain Gateway-visible as before).
+
 ## Development
 
 ```bash

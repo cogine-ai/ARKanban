@@ -37,7 +37,7 @@ export function scheduleAgentIds(jobs: Array<Record<string, unknown>>, defaultAg
 
 export function selectUpcomingSchedules(
   jobs: Array<Record<string, unknown>>,
-  options: { now: number; defaultAgentId?: string },
+  options: { now: number; defaultAgentId?: string; hostId?: string },
 ): { items: UpcomingSchedule[]; omittedAgentCount: number } {
   const items: UpcomingSchedule[] = [];
   let omittedAgentCount = 0;
@@ -60,6 +60,7 @@ export function selectUpcomingSchedules(
     const timezone = stringValue(schedule.tz);
     items.push({
       id: `cron:${jobId}`,
+      hostId: options.hostId ?? "local",
       jobId,
       agentId,
       title: stringValue(job.name) ?? "Scheduled job",

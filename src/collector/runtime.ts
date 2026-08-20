@@ -75,6 +75,7 @@ import {
   type AuditSyncOutcome,
 } from "./audit-sync.js";
 import { FieldInventory, type FieldInventoryReport } from "./field-inventory.js";
+import { StandaloneCliSynchronizer } from "./standalone-cli.js";
 
 const REQUIRED_METHODS = ["tasks.list", "sessions.list", "sessions.subscribe"] as const;
 const SCHEDULE_RECONCILE_MS = 60_000;
@@ -198,6 +199,7 @@ export class CollectorRuntime {
   private readonly transcripts: TranscriptSynchronizer;
   private readonly usage: UsageSynchronizer;
   private readonly audit: AuditSynchronizer;
+  private readonly standaloneCli: StandaloneCliSynchronizer;
   private transcriptStatus: TranscriptSyncOutcome | undefined;
   private usageStatus: UsageSyncOutcome | undefined;
   private auditStatus: AuditSyncOutcome | undefined;
@@ -223,7 +225,8 @@ export class CollectorRuntime {
   private stopped = true;
 
   constructor(readonly config: ResolvedCollectorConfig) {
-    this.repository = new CollectorRepository(config.storage.path);
+    const hostId = config.host?.id ?? "local";
+    this.repository = new CollectorRepository(config.storage.path, hostId);
     this.repository.subscribe((change) => {
       this.emitChange(change);
     });
@@ -253,6 +256,9 @@ export class CollectorRuntime {
       inventory: this.auditFields,
       onRecorded: (sessionKeys) => this.rescoreEvidence(sessionKeys),
     });
+    this.standaloneCli = new StandaloneCliSynchronizer(this.repository, {
+      enabled: (config.localSources?.standaloneCli ?? "disabled") === "enabled",
+    });
   }
 
   start(): void {
@@ -269,11 +275,13 @@ export class CollectorRuntime {
     this.usageTimer = setInterval(() => void this.syncUsage(), USAGE_SYNC_MS);
     this.auditTimer = setInterval(() => void this.syncAudit(), AUDIT_SYNC_MS);
     this.signalTimer = setInterval(() => this.recomputeSignals(), SIGNAL_RECOMPUTE_MS);
+    this.standaloneCli.start();
     this.gateway.start();
   }
 
   async stop(): Promise<void> {
     this.stopped = true;
+    this.standaloneCli.stop();
     if (this.taskTimer) clearInterval(this.taskTimer);
     if (this.sessionTimer) clearInterval(this.sessionTimer);
     if (this.scheduleTimer) clearInterval(this.scheduleTimer);
@@ -305,6 +313,11 @@ export class CollectorRuntime {
         version: "0.1.0",
         startedAt: this.startedAt,
         ready: this.syncState === "live" || this.syncState === "reconciling",
+      },
+      host: {
+        id: this.config.host?.id ?? "local",
+        label: this.config.host?.label ?? this.config.gateway.name,
+        role: this.config.role ?? "node",
       },
       epoch: this.repository.epoch,
       revision: this.repository.revision,
@@ -967,7 +980,11 @@ export class CollectorRuntime {
       }
 
       const now = Date.now();
-      const selected = selectUpcomingSchedules(jobs, { now, ...(this.defaultAgentId ? { defaultAgentId: this.defaultAgentId } : {}) });
+      const selected = selectUpcomingSchedules(jobs, {
+        now,
+        hostId: this.config.host?.id ?? "local",
+        ...(this.defaultAgentId ? { defaultAgentId: this.defaultAgentId } : {}),
+      });
       // A cron job proves its agent exists even when the roster call omits it,
       // and without this its schedule would render against no Agent card.
       this.repository.upsertAgents(inferAgents(scheduleAgentIds(jobs, this.defaultAgentId), now));

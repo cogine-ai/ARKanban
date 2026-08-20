@@ -24,6 +24,7 @@ import {
 } from "../storage/keyset-cursor.js";
 import { MIN_FTS_QUERY_LENGTH } from "../storage/transcript-archive.js";
 import type { HubRuntime } from "../hub/runtime.js";
+import { parsePairableNodeUrl } from "../settings/node-url.js";
 import { createPairingOffer, redeemPairingOffer } from "../settings/pairing.js";
 import { createSettingsService, type SettingsPatch, type SettingsService } from "../settings/store.js";
 
@@ -269,9 +270,10 @@ export async function createHttpServer(
     );
     const authenticated = Boolean(requiredToken && provided && tokensEqual(requiredToken, provided));
     const pathOnly = request.url.split("?")[0] ?? request.url;
-    // Pairing redeem is admitted by the one-time code itself: the hub does not
-    // yet hold this node's shared secret.
-    const pairingRedeem = request.method === "POST" && pathOnly === "/api/v1/pairing/redeem";
+    // Only a LAN-exposed node needs to accept a hub that does not yet hold the
+    // shared secret. Loopback keeps Host / Origin checks so DNS rebinding cannot
+    // redeem a pairing code through the operator's browser.
+    const pairingRedeem = lanExposed && request.method === "POST" && pathOnly === "/api/v1/pairing/redeem";
 
     if (lanExposed && !authenticated && !pairingRedeem) {
       return reply.code(401).send({ error: "unauthorized" });
@@ -376,11 +378,8 @@ export async function createHttpServer(
     if (!nodeUrl || typeof nodeUrl !== "string") return reply.code(400).send({ error: "missing_node_url" });
     let base: URL;
     try {
-      base = new URL(nodeUrl);
+      base = parsePairableNodeUrl(nodeUrl);
     } catch {
-      return reply.code(400).send({ error: "invalid_node_url" });
-    }
-    if (base.protocol !== "http:" && base.protocol !== "https:") {
       return reply.code(400).send({ error: "invalid_node_url" });
     }
     const redeemUrl = new URL("/api/v1/pairing/redeem", base).toString();
@@ -393,14 +392,13 @@ export async function createHttpServer(
         signal: AbortSignal.timeout(8_000),
       });
       if (!response.ok) {
-        return reply.code(502).send({ error: "pairing_redeem_failed", status: response.status });
+        request.log.warn({ status: response.status }, "pairing redeem failed");
+        return reply.code(502).send({ error: "pairing_redeem_failed" });
       }
       remote = (await response.json()) as { hostId: string; label: string; token: string };
     } catch (error) {
-      return reply.code(502).send({
-        error: "pairing_unreachable",
-        message: error instanceof Error ? error.message : String(error),
-      });
+      request.log.warn({ err: error }, "pairing redeem unreachable");
+      return reply.code(502).send({ error: "pairing_unreachable" });
     }
     if (!remote.hostId || !remote.token) {
       return reply.code(502).send({ error: "pairing_redeem_malformed" });

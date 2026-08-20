@@ -102,10 +102,8 @@ async function run(): Promise<void> {
     return;
   }
 
-  // Hub-only: fan-in UI. Node / both: local collector (both also starts hub fan-in
-  // in the same process via HubRuntime listing remotes; local data stays on the
-  // node HTTP surface when role is both — use role hub on a machine that only
-  // aggregates, or open the hub host's UI).
+  // Hub-only: fan-in UI. Node and both: local collector on this port.
+  // both does not start HubRuntime — a second process with role=hub fans in remotes.
   const surface =
     runsHub && !collectsLocally
       ? new HubRuntime(config)
@@ -113,9 +111,8 @@ async function run(): Promise<void> {
         ? new CollectorRuntime(config)
         : new HubRuntime(config);
 
-  // When role is both, prefer serving the local node board on this port and run
-  // a companion hub only if remotes are configured — operators open a dedicated
-  // hub process for the merged view. Local collection always wins here.
+  // role=both still occupies this port with the local node board. Operators
+  // open a dedicated hub process for the merged view.
   if (runsHub && collectsLocally && config.hub.nodes.length > 0) {
     process.stdout.write(
       `role=both: serving local node on this port; configure a separate hub process to fan-in remotes (${config.hub.nodes.length} listed)\n`,

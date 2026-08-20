@@ -74,11 +74,26 @@ export function LiveFlowView({
   const visibleSettled = useMemo(() => {
     if (!settled || hostFilter === "all") return settled;
     const groupsByAgent: typeof settled.groupsByAgent = {};
+    const outcomeCounts = { ...settled.outcomeCounts };
+    for (const key of Object.keys(outcomeCounts) as Array<keyof typeof outcomeCounts>) outcomeCounts[key] = 0;
+    let totalSeries = 0;
+    let totalRuns = 0;
     for (const [agentId, groups] of Object.entries(settled.groupsByAgent)) {
       const filtered = groups.filter((group) => group.hostId === hostFilter);
-      if (filtered.length > 0) groupsByAgent[agentId] = filtered;
+      if (filtered.length === 0) continue;
+      groupsByAgent[agentId] = filtered;
+      totalSeries += filtered.length;
+      for (const group of filtered) {
+        totalRuns += group.runCount;
+        outcomeCounts.succeeded += group.succeededCount;
+        outcomeCounts.failed += group.failedCount;
+        outcomeCounts.timed_out += group.timedOutCount;
+        outcomeCounts.cancelled += group.cancelledCount;
+        outcomeCounts.blocked += group.blockedCount;
+        outcomeCounts.unknown += group.unknownCount;
+      }
     }
-    return { ...settled, groupsByAgent };
+    return { ...settled, groupsByAgent, totalSeries, totalRuns, outcomeCounts };
   }, [settled, hostFilter]);
 
   const active = visibleOperationalItems.length;

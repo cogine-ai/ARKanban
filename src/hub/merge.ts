@@ -142,7 +142,6 @@ export function mergeStatus(
       ...bundles.filter((bundle) => !bundle.reachable).map((bundle) => `host_unreachable:${bundle.hostId}`),
     ]),
   ];
-  const primary = liveStatuses[0];
   return {
     apiVersion: 1,
     process: {
@@ -156,13 +155,13 @@ export function mergeStatus(
     revision: liveStatuses.reduce((sum, status) => sum + status.revision, 0),
     syncState,
     syncReasons: reasons,
-    gateway: primary?.gateway ?? {
+    gateway: {
       name: hubHost.label,
       endpoint: "hub://fan-in",
       connected: hosts.some((host) => host.gatewayConnected),
       grantedScopes: [],
     },
-    sources: primary?.sources.map((source) => ({ ...source })) ?? [],
+    sources: [],
   };
 }
 
@@ -313,7 +312,7 @@ export function mergeSettledGroups(
   let rangeStart = rangeEnd;
 
   for (const bundle of bundles) {
-    if (!bundle.settled) {
+    if (!bundle.reachable || !bundle.settled || bundle.settled.range !== range) {
       complete = false;
       continue;
     }

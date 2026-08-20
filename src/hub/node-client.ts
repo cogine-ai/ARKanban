@@ -111,7 +111,12 @@ export class NodeClient {
       let buffer = "";
       while (!signal.aborted) {
         const { done, value } = await reader.read();
-        if (done) break;
+        if (done) {
+          if (!signal.aborted) {
+            handlers.onError(new Error(`node_${this.id}_sse_closed`));
+          }
+          break;
+        }
         buffer += decoder.decode(value, { stream: true });
         const chunks = buffer.split("\n\n");
         buffer = chunks.pop() ?? "";

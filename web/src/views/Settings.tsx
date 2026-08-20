@@ -132,7 +132,12 @@ export function SettingsView() {
       const result = await collectorApi.pairingClaim({ code: pairCode.trim(), nodeUrl: pairNodeUrl.trim() });
       setSettings(result.settings);
       setPairCode("");
-      setMessage(`已配对节点 ${result.node.id}。请重启 Collector（hub）以开始 fan-in。`);
+      setRole(result.settings.role);
+      setMessage(
+        result.settings.role === "hub"
+          ? `已配对节点 ${result.node.id}。请重启 Collector 以开始 fan-in。`
+          : `已配对节点 ${result.node.id}。本机当前是 ${result.settings.role}，重启后仍只服务本机看板。请把角色改为 hub 并重启，或在一台 hub 上认领。`,
+      );
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     }
@@ -175,7 +180,7 @@ export function SettingsView() {
             <select value={role} onChange={(event) => setRole(event.target.value as "node" | "hub" | "both")}>
               <option value="node">node — 采集本机 Gateway</option>
               <option value="hub">hub — 汇聚远程 node</option>
-              <option value="both">both — 本机采集 + 可配对远程</option>
+              <option value="both">both — 本机采集（多机看板请用独立 hub 进程）</option>
             </select>
           </label>
         </article>

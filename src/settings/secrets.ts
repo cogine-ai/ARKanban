@@ -1,4 +1,5 @@
-import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { randomBytes } from "node:crypto";
+import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import path from "node:path";
 
 /**
@@ -48,18 +49,29 @@ export function loadSecrets(secretsPath: string): CollectorSecrets {
 }
 
 export function saveSecrets(secretsPath: string, secrets: CollectorSecrets): void {
-  mkdirSync(path.dirname(secretsPath), { recursive: true, mode: 0o700 });
+  const directory = path.dirname(secretsPath);
+  mkdirSync(directory, { recursive: true, mode: 0o700 });
   const payload: CollectorSecrets = {};
   if (secrets.gatewayToken) payload.gatewayToken = secrets.gatewayToken;
   if (secrets.serverToken) payload.serverToken = secrets.serverToken;
   if (secrets.nodeTokens && Object.keys(secrets.nodeTokens).length > 0) {
     payload.nodeTokens = { ...secrets.nodeTokens };
   }
-  writeFileSync(secretsPath, `${JSON.stringify(payload, null, 2)}\n`, { mode: 0o600 });
+  const tempPath = path.join(
+    directory,
+    `.${path.basename(secretsPath)}.${process.pid}.${randomBytes(4).toString("hex")}.tmp`,
+  );
+  writeFileSync(tempPath, `${JSON.stringify(payload, null, 2)}\n`, { mode: 0o600 });
+  try {
+    chmodSync(tempPath, 0o600);
+  } catch {
+    // Some volumes refuse chmod; the file still exists for this user.
+  }
+  renameSync(tempPath, secretsPath);
   try {
     chmodSync(secretsPath, 0o600);
   } catch {
-    // Some volumes refuse chmod; the file still exists for this user.
+    // Same as above: the atomic replace already landed.
   }
 }
 

@@ -25,10 +25,16 @@ const CLI_POLL_MS = 5_000;
  * only covers processes whose basename is `claude` or `codex` so the board can
  * show operator work that never entered the Gateway.
  */
+type KnownCliProcess = {
+  firstSeen: number;
+  lastSeen: number;
+};
+
 export class StandaloneCliSynchronizer {
   private timer?: ReturnType<typeof setInterval>;
-  private readonly known = new Map<string, number>();
+  private readonly known = new Map<string, KnownCliProcess>();
   private stopped = true;
+  private shutdown = false;
 
   constructor(
     private readonly repository: CollectorRepository,
@@ -47,40 +53,53 @@ export class StandaloneCliSynchronizer {
 
   stop(): void {
     this.stopped = true;
+    this.shutdown = true;
     if (this.timer) clearInterval(this.timer);
   }
 
   async sync(now = Date.now()): Promise<number> {
     if (!this.options.enabled) return 0;
-    const processes = await (this.options.listProcesses ?? listStandaloneCliProcesses)();
-    const seen = new Set<string>();
-    const writes: ActivityWrite[] = [];
+    try {
+      const processes = await (this.options.listProcesses ?? listStandaloneCliProcesses)();
+      if (this.shutdown) return 0;
+      const seen = new Set<string>();
+      const writes: ActivityWrite[] = [];
 
-    for (const process of processes) {
-      const sourceKey = `standalone_cli:${process.kind}:${process.pid}`;
-      seen.add(sourceKey);
-      this.known.set(sourceKey, now);
-      writes.push(cliProcessToActivity(process, now));
+      for (const process of processes) {
+        const sourceKey = `standalone_cli:${process.kind}:${process.pid}`;
+        seen.add(sourceKey);
+        const previous = this.known.get(sourceKey);
+        const firstSeen = previous?.firstSeen ?? now;
+        this.known.set(sourceKey, { firstSeen, lastSeen: now });
+        writes.push(cliProcessToActivity(process, firstSeen, now));
+      }
+
+      for (const [sourceKey, known] of this.known) {
+        if (seen.has(sourceKey)) continue;
+        if (now - known.lastSeen < CLI_POLL_MS * 2) continue;
+        const kind = sourceKey.includes(":claude:") ? "claude" : "codex";
+        const pid = Number(sourceKey.split(":").at(-1) ?? 0);
+        writes.push(terminalCliActivity(kind, pid, known.firstSeen, now));
+        this.known.delete(sourceKey);
+      }
+
+      if (writes.length === 0 || this.shutdown) return 0;
+      const change = this.repository.upsertMany(writes, ["standalone_cli_sync"]);
+      return change?.ids.length ?? 0;
+    } catch {
+      // A fire-and-forget poll must not become an unhandled rejection, and must
+      // not touch the repository after stop() has closed it.
+      return 0;
     }
-
-    for (const [sourceKey, lastSeen] of this.known) {
-      if (seen.has(sourceKey)) continue;
-      if (now - lastSeen < CLI_POLL_MS * 2) continue;
-      const kind = sourceKey.includes(":claude:") ? "claude" : "codex";
-      const pid = Number(sourceKey.split(":").at(-1) ?? 0);
-      writes.push(terminalCliActivity(kind, pid, lastSeen, now));
-      this.known.delete(sourceKey);
-    }
-
-    if (writes.length === 0) return 0;
-    const change = this.repository.upsertMany(writes, ["standalone_cli_sync"]);
-    return change?.ids.length ?? 0;
   }
 }
 
-export function cliProcessToActivity(process: ObservedCliProcess, now: number): ActivityWrite {
+export function cliProcessToActivity(
+  process: ObservedCliProcess,
+  startedAt: number,
+  now = startedAt,
+): ActivityWrite {
   const id = stableCliActivityId(process.kind, process.pid);
-  const title = summarizeCliTitle(process);
   return {
     id,
     kind: "attempt",
@@ -96,8 +115,8 @@ export function cliProcessToActivity(process: ObservedCliProcess, now: number): 
     attention: "none",
     stage: stageFor("active", "model", "none"),
     freshness: "live",
-    title,
-    startedAt: now,
+    title: summarizeCliTitle(process),
+    startedAt,
     updatedAt: now,
     lastObservedAt: now,
     evidence: [{ source: "session", health: "live", observedAt: now, code: "standalone_cli" }],
@@ -153,10 +172,7 @@ export function stableCliActivityId(kind: StandaloneCliKind, pid: number): strin
 }
 
 function summarizeCliTitle(process: ObservedCliProcess): string {
-  const args = process.args.trim();
-  if (!args) return `${process.kind} CLI #${process.pid}`;
-  const clipped = args.length > 80 ? `${args.slice(0, 77)}…` : args;
-  return `${process.kind}: ${clipped}`;
+  return `${process.kind} CLI #${process.pid}`;
 }
 
 export async function listStandaloneCliProcesses(): Promise<ObservedCliProcess[]> {

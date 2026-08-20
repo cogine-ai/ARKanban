@@ -35,6 +35,8 @@ type StatusListener = (status: CollectorStatus) => void;
 type ChangeListener = (change: RepositoryChange) => void;
 
 const REFRESH_MS = 5_000;
+const SSE_RETRY_MIN_MS = 1_000;
+const SSE_RETRY_MAX_MS = 30_000;
 
 /**
  * Fan-in surface for multi-host boards.
@@ -54,9 +56,12 @@ export class HubRuntime {
   private readonly startedAt = Date.now();
   private readonly statusListeners = new Set<StatusListener>();
   private readonly changeListeners = new Set<ChangeListener>();
-  private readonly unsubscribers: Array<() => void> = [];
+  private readonly sseUnsubscribers = new Map<string, () => void>();
+  private readonly sseRetryTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  private readonly sseRetryMs = new Map<string, number>();
   private bundles = new Map<string, NodeSnapshotBundle>();
   private refreshTimer?: ReturnType<typeof setInterval>;
+  private lastSettledRange: SettledRange = "7d";
   private revision = 0;
   private stopped = true;
 
@@ -87,43 +92,16 @@ export class HubRuntime {
     this.stopped = false;
     void this.refreshAll("start");
     this.refreshTimer = setInterval(() => void this.refreshAll("interval"), REFRESH_MS);
-    for (const client of this.clients) {
-      const unsubscribe = client.subscribeEvents({
-        onStatus: (status) => {
-          const previous = this.bundles.get(client.id);
-          this.bundles.set(client.id, {
-            hostId: client.id,
-            label: client.label,
-            reachable: true,
-            status,
-            snapshot: previous?.snapshot,
-            settled: previous?.settled,
-            lastSeenAt: Date.now(),
-          });
-          this.emitStatus();
-        },
-        onInvalidate: () => {
-          void this.refreshNode(client, "sse_invalidate");
-        },
-        onError: (error) => {
-          this.bundles.set(client.id, {
-            hostId: client.id,
-            label: client.label,
-            reachable: false,
-            code: error.message,
-            lastSeenAt: Date.now(),
-          });
-          this.emitStatus();
-        },
-      });
-      this.unsubscribers.push(unsubscribe);
-    }
+    for (const client of this.clients) this.attachEvents(client);
   }
 
   async stop(): Promise<void> {
     this.stopped = true;
     if (this.refreshTimer) clearInterval(this.refreshTimer);
-    for (const unsubscribe of this.unsubscribers.splice(0)) unsubscribe();
+    for (const timer of this.sseRetryTimers.values()) clearTimeout(timer);
+    this.sseRetryTimers.clear();
+    for (const unsubscribe of this.sseUnsubscribers.values()) unsubscribe();
+    this.sseUnsubscribers.clear();
   }
 
   subscribeStatus(listener: StatusListener): () => void {
@@ -149,7 +127,13 @@ export class HubRuntime {
     return { ...snapshot, epoch: `hub:${this.config.host.id}`, revision: this.revision };
   }
 
-  getSettledGroups(range: SettledRange, rangeEnd = Date.now()): SettledGroupSnapshot {
+  async getSettledGroups(range: SettledRange, rangeEnd = Date.now()): Promise<SettledGroupSnapshot> {
+    this.lastSettledRange = range;
+    const cached = [...this.bundles.values()];
+    const fresh = cached.every((bundle) => !bundle.reachable || bundle.settled?.range === range);
+    if (!fresh) {
+      await Promise.all(this.clients.map((client) => this.refreshSettled(client, range, rangeEnd)));
+    }
     return mergeSettledGroups(range, rangeEnd, [...this.bundles.values()]);
   }
 
@@ -253,7 +237,7 @@ export class HubRuntime {
       const [status, snapshot, settled] = await Promise.all([
         client.getStatus(),
         client.getSnapshot(),
-        client.getSettledGroups("7d", Date.now()),
+        client.getSettledGroups(this.lastSettledRange, Date.now()),
       ]);
       this.bundles.set(client.id, {
         hostId: client.id,
@@ -276,6 +260,76 @@ export class HubRuntime {
         lastSeenAt: Date.now(),
       });
       this.emitStatus();
+    }
+  }
+
+  private attachEvents(client: NodeClient): void {
+    this.sseUnsubscribers.get(client.id)?.();
+    const unsubscribe = client.subscribeEvents({
+      onStatus: (status) => {
+        this.sseRetryMs.delete(client.id);
+        const previous = this.bundles.get(client.id);
+        this.bundles.set(client.id, {
+          hostId: client.id,
+          label: client.label,
+          reachable: true,
+          status,
+          snapshot: previous?.snapshot,
+          settled: previous?.settled,
+          lastSeenAt: Date.now(),
+        });
+        this.emitStatus();
+      },
+      onInvalidate: () => {
+        void this.refreshNode(client, "sse_invalidate");
+      },
+      onError: (error) => {
+        this.bundles.set(client.id, {
+          hostId: client.id,
+          label: client.label,
+          reachable: false,
+          code: error.message,
+          lastSeenAt: Date.now(),
+        });
+        this.emitStatus();
+        this.scheduleSseReconnect(client);
+      },
+    });
+    this.sseUnsubscribers.set(client.id, unsubscribe);
+  }
+
+  private scheduleSseReconnect(client: NodeClient): void {
+    if (this.stopped || this.sseRetryTimers.has(client.id)) return;
+    const delay = this.sseRetryMs.get(client.id) ?? SSE_RETRY_MIN_MS;
+    this.sseRetryMs.set(client.id, Math.min(delay * 2, SSE_RETRY_MAX_MS));
+    this.sseRetryTimers.set(
+      client.id,
+      setTimeout(() => {
+        this.sseRetryTimers.delete(client.id);
+        if (this.stopped) return;
+        this.attachEvents(client);
+      }, delay),
+    );
+  }
+
+  private async refreshSettled(client: NodeClient, range: SettledRange, rangeEnd: number): Promise<void> {
+    const previous = this.bundles.get(client.id);
+    try {
+      const settled = await client.getSettledGroups(range, rangeEnd);
+      this.bundles.set(client.id, {
+        hostId: client.id,
+        label: client.label,
+        reachable: previous?.reachable ?? true,
+        status: previous?.status,
+        snapshot: previous?.snapshot,
+        settled,
+        lastSeenAt: Date.now(),
+        ...(previous?.code ? { code: previous.code } : {}),
+      });
+    } catch {
+      if (previous?.settled && previous.settled.range !== range) {
+        this.bundles.set(client.id, { ...previous, settled: undefined });
+      }
     }
   }
 

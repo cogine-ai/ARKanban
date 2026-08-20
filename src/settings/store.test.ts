@@ -95,8 +95,19 @@ describe("settings service", () => {
     });
     expect(publicView.hub.nodes).toHaveLength(1);
     expect(publicView.hub.nodes[0]?.token.configured).toBe(true);
-    expect(publicView.role).toBe("both");
+    expect(publicView.role).toBe("node");
     expect(loadSecrets(secretsPathFor(config.configPath)).nodeTokens?.["desk-b"]).toBe("node-token");
+  });
+
+  it("does not commit an in-memory patch when later validation fails", () => {
+    const config = fixtureConfig();
+    const settings = createSettingsService(config);
+    settings.applyPatch({ host: { label: "Desk Z" } });
+    expect(() =>
+      settings.applyPatch({ host: { label: "Desk Y" }, role: "nope" as unknown as "hub" }),
+    ).toThrow("invalid_role");
+    expect(settings.getPublicSettings().host.label).toBe("Desk Z");
+    expect(JSON.parse(readFileSync(config.configPath, "utf8")).host.label).toBe("Desk Z");
   });
 
   it("persists secrets with owner-only intent", () => {

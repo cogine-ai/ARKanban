@@ -811,6 +811,49 @@ describe("browser-facing guards", () => {
     expect(crossSite.json()).toMatchObject({ error: "forbidden_cross_site" });
   });
 
+  it("keeps Host checks on loopback pairing redeem", async () => {
+    const app = await server();
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/v1/pairing/redeem",
+      headers: { host: "attacker.example:47123", "content-type": "application/json" },
+      payload: { code: "NOPE-CODE" },
+    });
+    expect(response.statusCode).toBe(403);
+    expect(response.json()).toMatchObject({ error: "forbidden_host" });
+  });
+
+  it("admits pairing redeem on a LAN bind without the shared secret", async () => {
+    const { runtime, config } = runtimeFixture();
+    config.server.host = "0.0.0.0";
+    config.server.token = "hub-secret";
+    const app = await createHttpServer(runtime, config);
+    cleanups.push(() => app.close());
+
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/v1/pairing/redeem",
+      headers: { host: "192.168.1.10:47123", "content-type": "application/json" },
+      payload: { code: "NOPE-CODE" },
+    });
+    expect(response.statusCode).toBe(404);
+    expect(response.json()).toMatchObject({ error: "pairing_code_invalid" });
+  });
+
+  it("rejects pairing claim to link-local metadata addresses", async () => {
+    const { runtime, config } = runtimeFixture();
+    const app = await createHttpServer(runtime, config);
+    cleanups.push(() => app.close());
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/v1/pairing/claim",
+      headers: { "content-type": "application/json" },
+      payload: { code: "ABCD-EFGH", nodeUrl: "http://169.254.169.254/" },
+    });
+    expect(response.statusCode).toBe(400);
+    expect(response.json()).toMatchObject({ error: "invalid_node_url" });
+  });
+
   it("accepts an authenticated LAN-style Host when a server token is configured", async () => {
     const { runtime, config } = runtimeFixture();
     config.server.host = "0.0.0.0";

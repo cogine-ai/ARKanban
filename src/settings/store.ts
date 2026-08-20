@@ -2,6 +2,7 @@ import { readFileSync, writeFileSync } from "node:fs";
 import type { CollectorRole } from "../contracts.js";
 import { isValidHostId } from "../host/ids.js";
 import { isLoopbackHost, type ResolvedCollectorConfig } from "../config.js";
+import { parsePairableNodeUrl } from "./node-url.js";
 import { generateSharedToken, peekPairingOffer } from "./pairing.js";
 import { loadSecrets, maskSecret, saveSecrets, secretsPathFor, type CollectorSecrets } from "./secrets.js";
 
@@ -160,15 +161,8 @@ export function createSettingsService(config: ResolvedCollectorConfig): Settings
 
   const addHubNode = (node: { id: string; url: string; label?: string; token: string }): PublicSettings => {
     if (!isValidHostId(node.id)) throw new Error("invalid_host_id");
-    let parsed: URL;
-    try {
-      parsed = new URL(node.url);
-    } catch {
-      throw new Error("invalid_node_url");
-    }
-    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") throw new Error("invalid_node_url");
+    const parsed = parsePairableNodeUrl(node.url);
 
-    setNodeToken(node.id, node.token);
     const root = readRawConfig(configPath);
     const hub = (root.hub && typeof root.hub === "object" ? root.hub : {}) as Record<string, unknown>;
     const nodes = Array.isArray(hub.nodes) ? [...hub.nodes] : [];
@@ -185,8 +179,8 @@ export function createSettingsService(config: ResolvedCollectorConfig): Settings
     else nodes.push(next);
     hub.nodes = nodes;
     root.hub = hub;
-    if (config.role === "node") root.role = "both";
     writeRawConfig(configPath, root);
+    setNodeToken(node.id, node.token);
 
     const existing = config.hub.nodes.find((candidate) => candidate.id === node.id);
     if (existing) {
@@ -203,7 +197,6 @@ export function createSettingsService(config: ResolvedCollectorConfig): Settings
         ...(node.label ? { label: node.label } : {}),
       });
     }
-    if (config.role === "node") config.role = "both";
     restartRequired = true;
     return getPublicSettings();
   };
@@ -213,18 +206,26 @@ export function createSettingsService(config: ResolvedCollectorConfig): Settings
     const secrets = readSecrets();
     let secretsChanged = false;
     const nextSecrets: CollectorSecrets = { ...secrets, nodeTokens: { ...secrets.nodeTokens } };
+    const draft = {
+      host: { ...config.host },
+      role: config.role,
+      gateway: { ...config.gateway },
+      server: { ...config.server },
+      localSources: { ...config.localSources },
+      hubNodes: config.hub.nodes.map((node) => ({ ...node })),
+    };
 
     if (patch.host) {
       const host = (root.host && typeof root.host === "object" ? root.host : {}) as Record<string, unknown>;
       if (patch.host.id !== undefined) {
         if (!isValidHostId(patch.host.id)) throw new Error("invalid_host_id");
         host.id = patch.host.id;
-        config.host.id = patch.host.id;
+        draft.host.id = patch.host.id;
       }
       if (patch.host.label !== undefined) {
         if (!patch.host.label.trim()) throw new Error("invalid_host_label");
         host.label = patch.host.label.trim();
-        config.host.label = host.label as string;
+        draft.host.label = host.label as string;
       }
       root.host = host;
     }
@@ -232,7 +233,7 @@ export function createSettingsService(config: ResolvedCollectorConfig): Settings
     if (patch.role !== undefined) {
       if (patch.role !== "node" && patch.role !== "hub" && patch.role !== "both") throw new Error("invalid_role");
       root.role = patch.role;
-      config.role = patch.role;
+      draft.role = patch.role;
     }
 
     if (patch.gateway) {
@@ -240,7 +241,7 @@ export function createSettingsService(config: ResolvedCollectorConfig): Settings
       if (patch.gateway.name !== undefined) {
         if (!patch.gateway.name.trim()) throw new Error("invalid_gateway_name");
         gateway.name = patch.gateway.name.trim();
-        config.gateway.name = gateway.name as string;
+        draft.gateway.name = gateway.name as string;
       }
       if (patch.gateway.url !== undefined) {
         let parsed: URL;
@@ -251,15 +252,15 @@ export function createSettingsService(config: ResolvedCollectorConfig): Settings
         }
         if (parsed.protocol !== "ws:" && parsed.protocol !== "wss:") throw new Error("invalid_gateway_url");
         gateway.url = parsed.toString();
-        config.gateway.url = gateway.url as string;
+        draft.gateway.url = gateway.url as string;
       }
       if (patch.gateway.token !== undefined) {
         if (patch.gateway.token === null || patch.gateway.token === "") {
           delete nextSecrets.gatewayToken;
-          config.gateway.token = "";
+          draft.gateway.token = "";
         } else {
           nextSecrets.gatewayToken = patch.gateway.token;
-          config.gateway.token = patch.gateway.token;
+          draft.gateway.token = patch.gateway.token;
         }
         secretsChanged = true;
         gateway.tokenEnv = gateway.tokenEnv ?? "OPENCLAW_GATEWAY_TOKEN";
@@ -272,13 +273,13 @@ export function createSettingsService(config: ResolvedCollectorConfig): Settings
       if (patch.server.host !== undefined) {
         if (!patch.server.host.trim()) throw new Error("invalid_server_host");
         server.host = patch.server.host.trim();
-        config.server.host = server.host as string;
-        if (!isLoopbackHost(config.server.host)) {
+        draft.server.host = server.host as string;
+        if (!isLoopbackHost(draft.server.host)) {
           server.tokenEnv = server.tokenEnv ?? "COLLECTOR_NODE_TOKEN";
-          config.server.tokenEnv = String(server.tokenEnv);
-          if (!config.server.token && !nextSecrets.serverToken) {
+          draft.server.tokenEnv = String(server.tokenEnv);
+          if (!draft.server.token && !nextSecrets.serverToken) {
             nextSecrets.serverToken = generateSharedToken();
-            config.server.token = nextSecrets.serverToken;
+            draft.server.token = nextSecrets.serverToken;
             secretsChanged = true;
           }
         }
@@ -288,19 +289,19 @@ export function createSettingsService(config: ResolvedCollectorConfig): Settings
           throw new Error("invalid_server_port");
         }
         server.port = patch.server.port;
-        config.server.port = patch.server.port;
+        draft.server.port = patch.server.port;
       }
       if (patch.server.token !== undefined) {
         if (patch.server.token === null || patch.server.token === "") {
           delete nextSecrets.serverToken;
-          config.server.token = undefined;
+          draft.server.token = undefined;
         } else {
           nextSecrets.serverToken = patch.server.token;
-          config.server.token = patch.server.token;
+          draft.server.token = patch.server.token;
         }
         secretsChanged = true;
         server.tokenEnv = server.tokenEnv ?? "COLLECTOR_NODE_TOKEN";
-        config.server.tokenEnv = String(server.tokenEnv);
+        draft.server.tokenEnv = String(server.tokenEnv);
       }
       root.server = server;
     }
@@ -314,7 +315,7 @@ export function createSettingsService(config: ResolvedCollectorConfig): Settings
       >;
       localSources.standaloneCli = value;
       root.localSources = localSources;
-      config.localSources.standaloneCli = value;
+      draft.localSources.standaloneCli = value;
     }
 
     if (patch.hub?.nodes !== undefined) {
@@ -323,13 +324,7 @@ export function createSettingsService(config: ResolvedCollectorConfig): Settings
       const resolved = [];
       for (const node of patch.hub.nodes) {
         if (!isValidHostId(node.id)) throw new Error("invalid_host_id");
-        let parsed: URL;
-        try {
-          parsed = new URL(node.url);
-        } catch {
-          throw new Error("invalid_node_url");
-        }
-        if (parsed.protocol !== "http:" && parsed.protocol !== "https:") throw new Error("invalid_node_url");
+        const parsed = parsePairableNodeUrl(node.url);
         const tokenEnv = `COLLECTOR_NODE_TOKEN_${node.id.replace(/[^a-zA-Z0-9]/g, "_").toUpperCase()}`;
         nodes.push({
           id: node.id,
@@ -355,11 +350,18 @@ export function createSettingsService(config: ResolvedCollectorConfig): Settings
       }
       hub.nodes = nodes;
       root.hub = hub;
-      config.hub.nodes = resolved;
+      draft.hubNodes = resolved;
     }
 
     writeRawConfig(configPath, root);
     if (secretsChanged) saveSecrets(secretsPath, nextSecrets);
+    config.host.id = draft.host.id;
+    config.host.label = draft.host.label;
+    config.role = draft.role;
+    Object.assign(config.gateway, draft.gateway);
+    Object.assign(config.server, draft.server);
+    config.localSources.standaloneCli = draft.localSources.standaloneCli;
+    config.hub.nodes = draft.hubNodes;
     restartRequired = true;
     return getPublicSettings();
   };

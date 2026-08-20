@@ -13,6 +13,10 @@ describe("pairable node URLs", () => {
     expect(isBlockedPairingHost("metadata.google.internal")).toBe(true);
     expect(isBlockedPairingHost("fe80::1")).toBe(true);
     expect(() => parsePairableNodeUrl("http://169.254.169.254/")).toThrow("invalid_node_url");
+    expect(() => parsePairableNodeUrl("http://[::ffff:169.254.169.254]/")).toThrow("invalid_node_url");
+    expect(isBlockedPairingHost("::ffff:a9fe:a9fe")).toBe(true);
+    expect(isBlockedPairingHost("[::ffff:a9fe:a9fe]")).toBe(true);
+    expect(isBlockedPairingHost("::ffff:c0a8:10a")).toBe(false);
     expect(() => parsePairableNodeUrl("file:///etc/passwd")).toThrow("invalid_node_url");
   });
 });

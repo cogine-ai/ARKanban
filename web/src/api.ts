@@ -186,7 +186,7 @@ export const collectorApi = {
       label: string;
       createdToken: boolean;
       restartRequired: boolean;
-    }>("/api/v1/pairing/offer", "POST"),
+    }>("/api/v1/pairing/offer", "POST", {}),
   pairingClaim: (body: { code: string; nodeUrl: string }) =>
     sendJson<{
       ok: true;

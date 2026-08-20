@@ -79,6 +79,12 @@ function loopbackAuthorities(configuredHost: string): ReadonlySet<string> {
   return new Set(["localhost", "127.0.0.1", "::1", configuredHost.toLowerCase()]);
 }
 
+/** The operator UI is always opened as loopback, even when the process binds off it. */
+function isOperatorLoopbackAuthority(hostHeader: string | undefined): boolean {
+  const name = authorityHost(hostHeader ?? "");
+  return name === "localhost" || name === "127.0.0.1" || name === "::1";
+}
+
 function tokensEqual(expected: string, provided: string): boolean {
   const left = Buffer.from(expected);
   const right = Buffer.from(provided);
@@ -249,6 +255,24 @@ export async function createHttpServer(
     forceCloseConnections: true,
   });
 
+  // pairing/offer is a body-less POST. The UI used to send application/json with
+  // an empty body, which Fastify's default parser rejects as EMPTY_JSON_BODY.
+  app.removeContentTypeParser("application/json");
+  app.addContentTypeParser("application/json", { parseAs: "string" }, (_request, body, done) => {
+    const text = typeof body === "string" ? body : Buffer.isBuffer(body) ? body.toString("utf8") : "";
+    if (text.trim() === "") {
+      done(null, {});
+      return;
+    }
+    try {
+      done(null, JSON.parse(text) as unknown);
+    } catch (error) {
+      const err = error instanceof Error ? error : new Error(String(error));
+      (err as Error & { statusCode?: number }).statusCode = 400;
+      done(err, undefined);
+    }
+  });
+
   const allowedHosts = loopbackAuthorities(config.server.host);
   const lanExposed = !isLoopbackHost(config.server.host);
   const requiredToken = config.server.token;
@@ -274,16 +298,18 @@ export async function createHttpServer(
     // shared secret. Loopback keeps Host / Origin checks so DNS rebinding cannot
     // redeem a pairing code through the operator's browser.
     const pairingRedeem = lanExposed && request.method === "POST" && pathOnly === "/api/v1/pairing/redeem";
+    const operatorLoopback = isOperatorLoopbackAuthority(singleHeader(request.headers.host));
 
-    if (lanExposed && !authenticated && !pairingRedeem) {
+    if (lanExposed && !authenticated && !pairingRedeem && !operatorLoopback) {
       return reply.code(401).send({ error: "unauthorized" });
     }
     if (requiredToken && provided && !authenticated) {
       return reply.code(401).send({ error: "unauthorized" });
     }
 
-    // Hub clients authenticate; browser same-origin guards apply only to the
-    // unauthenticated loopback path that serves the operator's own UI.
+    // Hub clients authenticate. The operator UI is still a loopback page even
+    // when this process is bound off loopback, so those requests keep Host /
+    // Origin checks instead of being rejected for a missing LAN token.
     if (authenticated || pairingRedeem) return undefined;
 
     const host = singleHeader(request.headers.host);
@@ -389,6 +415,7 @@ export async function createHttpServer(
         method: "POST",
         headers: { "content-type": "application/json", accept: "application/json" },
         body: JSON.stringify({ code }),
+        redirect: "error",
         signal: AbortSignal.timeout(8_000),
       });
       if (!response.ok) {

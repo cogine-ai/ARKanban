@@ -840,6 +840,44 @@ describe("browser-facing guards", () => {
     expect(response.json()).toMatchObject({ error: "pairing_code_invalid" });
   });
 
+  it("accepts pairing offer with application/json and an empty body", async () => {
+    const app = await server();
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/v1/pairing/offer",
+      headers: { "content-type": "application/json" },
+      payload: "",
+    });
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toMatchObject({ hostId: "local", createdToken: expect.any(Boolean) });
+    expect(typeof response.json().code).toBe("string");
+  });
+
+  it("lets the loopback operator UI reach Settings when bound off loopback", async () => {
+    const { runtime, config } = runtimeFixture();
+    config.server.host = "0.0.0.0";
+    config.server.token = "hub-secret";
+    const app = await createHttpServer(runtime, config);
+    cleanups.push(() => app.close());
+
+    const settings = await app.inject({
+      method: "GET",
+      url: "/api/v1/settings",
+      headers: { host: "127.0.0.1:47123" },
+    });
+    expect(settings.statusCode).toBe(200);
+    expect(settings.json()).toMatchObject({ host: { id: "local" }, server: { lanExposed: true } });
+
+    const offer = await app.inject({
+      method: "POST",
+      url: "/api/v1/pairing/offer",
+      headers: { host: "127.0.0.1:47123", "content-type": "application/json" },
+      payload: "",
+    });
+    expect(offer.statusCode).toBe(200);
+    expect(typeof offer.json().code).toBe("string");
+  });
+
   it("rejects pairing claim to link-local metadata addresses", async () => {
     const { runtime, config } = runtimeFixture();
     const app = await createHttpServer(runtime, config);

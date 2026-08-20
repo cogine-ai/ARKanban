@@ -36,8 +36,19 @@ function isIpv4LinkLocal(host: string): boolean {
   return octets[0] === 169 && octets[1] === 254;
 }
 
+function isIpv4MappedLinkLocal(host: string): boolean {
+  const dotted = host.match(/^(?:(?:0:){5}|::)ffff:(\d+\.\d+\.\d+\.\d+)$/i);
+  if (dotted?.[1]) return isIpv4LinkLocal(dotted[1]);
+
+  const hex = host.match(/^(?:(?:0:){5}|::)ffff:([0-9a-f]{1,4}):([0-9a-f]{1,4})$/i);
+  if (!hex?.[1]) return false;
+  const high = Number.parseInt(hex[1], 16);
+  return ((high >> 8) & 0xff) === 169 && (high & 0xff) === 254;
+}
+
 function isIpv6LinkLocal(host: string): boolean {
   if (!host.includes(":")) return false;
+  if (isIpv4MappedLinkLocal(host)) return true;
   const first = host.split(":")[0]?.toLowerCase() ?? "";
   if (!first) return false;
   const hextet = first.padStart(4, "0");

@@ -1,0 +1,15 @@
+{
+  "data": "Actual owned demo Gateway process stopped; Collector and Hub kept running over HTTP and SSE",
+  "checks": [
+    "1440: offline history retains roster and scores, unknown current signals, no current Running or next forecast",
+    "1440: Gateway offline remains separate from live Browser updates and saved text disclosure",
+    "1440: real Hub node HTTP online with independent offline Gateway and sync state",
+    "1440: partial Hub roster flags missing Collector and does not claim running",
+    "390: offline history retains roster and scores, unknown current signals, no current Running or next forecast",
+    "390: Gateway offline remains separate from live Browser updates and saved text disclosure",
+    "390: real Hub node HTTP online with independent offline Gateway and sync state",
+    "390: partial Hub roster flags missing Collector and does not claim running"
+  ],
+  "errors": [],
+  "success": true
+}

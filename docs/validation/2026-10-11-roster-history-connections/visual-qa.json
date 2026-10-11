@@ -1,0 +1,63 @@
+{
+  "browser": "Chrome",
+  "data": "Built production bundle with real Collector API, isolated copied SQLite and demo Gateway",
+  "checks": [
+    {
+      "route": "agents",
+      "width": 1440,
+      "check": "First viewport has rendered content, no horizontal document overflow"
+    },
+    {
+      "route": "archive",
+      "width": 1440,
+      "check": "First viewport has rendered content, no horizontal document overflow"
+    },
+    {
+      "route": "connections",
+      "width": 1440,
+      "check": "First viewport has rendered content, no horizontal document overflow"
+    },
+    {
+      "route": "Hub connections",
+      "width": 1440,
+      "check": "Real reachable and unreachable nodes, no document overflow"
+    },
+    {
+      "route": "agents",
+      "width": 1280,
+      "check": "First viewport has rendered content, no horizontal document overflow"
+    },
+    {
+      "route": "archive",
+      "width": 1280,
+      "check": "First viewport has rendered content, no horizontal document overflow"
+    },
+    {
+      "route": "connections",
+      "width": 1280,
+      "check": "First viewport has rendered content, no horizontal document overflow"
+    },
+    {
+      "route": "agents",
+      "width": 390,
+      "check": "First viewport has rendered content, no horizontal document overflow"
+    },
+    {
+      "route": "archive",
+      "width": 390,
+      "check": "First viewport has rendered content, no horizontal document overflow"
+    },
+    {
+      "route": "connections",
+      "width": 390,
+      "check": "First viewport has rendered content, no horizontal document overflow"
+    },
+    {
+      "route": "Hub connections",
+      "width": 390,
+      "check": "Real reachable and unreachable nodes, no document overflow"
+    }
+  ],
+  "errors": [],
+  "success": true
+}

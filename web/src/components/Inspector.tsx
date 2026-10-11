@@ -1,6 +1,6 @@
 import * as Dialog from "@radix-ui/react-dialog";
 import { motion } from "motion/react";
-import { useEffect, useState, type ReactNode } from "react";
+import { useEffect, useRef, useState, type ReactNode } from "react";
 import type { ActivityDetail } from "../../../src/contracts";
 import { collectorApi } from "../api";
 import { formatExact, formatRelative, formatTime, outcomeLabel } from "../lib/format";
@@ -12,6 +12,7 @@ function InspectorSection({ title, children }: { title: string; children: ReactN
 export function Inspector({ id, onClose }: { id: string; onClose: () => void }) {
   const [detail, setDetail] = useState<ActivityDetail>();
   const [error, setError] = useState<string>();
+  const returnFocus = useRef<HTMLElement | null>(null);
   useEffect(() => {
     let live = true;
     setDetail(undefined);
@@ -26,7 +27,13 @@ export function Inspector({ id, onClose }: { id: string; onClose: () => void }) 
         <Dialog.Overlay asChild>
           <motion.div className="inspector-scrim" initial={{ opacity: 0 }} animate={{ opacity: 1 }} />
         </Dialog.Overlay>
-        <Dialog.Content asChild>
+        <Dialog.Content asChild
+          onOpenAutoFocus={() => { returnFocus.current = document.activeElement instanceof HTMLElement ? document.activeElement : null; }}
+          onCloseAutoFocus={(event) => {
+            event.preventDefault();
+            if (returnFocus.current?.isConnected) returnFocus.current.focus({ preventScroll: true });
+          }}
+        >
           <motion.aside className="inspector" aria-label="Activity inspector" initial={{ opacity: 0, x: 28, scale: 0.985 }} animate={{ opacity: 1, x: 0, scale: 1 }} transition={{ duration: 0.22, ease: "easeOut" }}>
             <div className="inspector-head">
               <div><span className="eyebrow">ACTIVITY INSPECTOR</span><Dialog.Title asChild><h2>{detail?.item.title ?? "Loading activity…"}</h2></Dialog.Title></div>

@@ -189,6 +189,45 @@ describe("Agents roster", () => {
     expect(container.querySelector(".agent-card")?.getAttribute("data-host-id")).toBe("remote");
   });
 
+  it("removes retained priority when the owner becomes offline or partial while keeping healthy attention and historical ordering", async () => {
+    state.agents = [
+      agent("desk::writer", { displayName: "Writer", lastSessionActivityAt: 100 }),
+      agent("desk::reviewer", { displayName: "Reviewer", lastSessionActivityAt: 300 }),
+      agent("remote::ops", { displayName: "Operations", hostId: "remote", lastSessionActivityAt: 50 }),
+    ];
+    const liveStatus = status({ host: { id: "hub", label: "Hub", role: "hub" }, sources: [], hosts: [
+      { id: "desk", label: "Desktop", reachable: true, syncState: "live", gatewayConnected: true },
+      { id: "remote", label: "Remote", reachable: true, syncState: "live", gatewayConnected: true },
+    ] });
+    state.status = liveStatus;
+    const liveSnapshot = snapshot([
+      activity("old-wait-1", { agentId: "desk::writer", attention: "waiting" }),
+      activity("old-wait-2", { agentId: "desk::writer", attention: "waiting" }),
+      activity("old-run", { agentId: "desk::reviewer" }),
+      activity("current-wait", { agentId: "remote::ops", hostId: "remote", attention: "waiting" }),
+    ]);
+    state.snapshot = liveSnapshot;
+    const order = () => [...container.querySelectorAll(".agent-card")].map((row) => row.getAttribute("data-agent-id"));
+    await mount();
+    expect(order()).toEqual(["desk::writer", "remote::ops", "desk::reviewer"]);
+
+    // The snapshot is unchanged: current owner status alone must invalidate rank.
+    state.status = { ...liveStatus, hosts: liveStatus.hosts!.map((host) => host.id === "desk" ? { ...host, reachable: false, syncState: "offline", gatewayConnected: false } : host) };
+    await mount();
+    expect(order()).toEqual(["remote::ops", "desk::reviewer", "desk::writer"]);
+    expect(container.querySelector('[data-agent-id="desk::writer"] .roster-signal')?.getAttribute("data-state")).toBe("unknown");
+
+    state.status = liveStatus;
+    await mount();
+    expect(order()).toEqual(["desk::writer", "remote::ops", "desk::reviewer"]);
+
+    // The status is unchanged: owner-qualified coverage also invalidates rank.
+    state.snapshot = { ...liveSnapshot, sync: { ...liveSnapshot.sync, reasons: ["desk:live_with_unavailable_source"] } };
+    await mount();
+    expect(order()).toEqual(["remote::ops", "desk::reviewer", "desk::writer"]);
+    expect(container.querySelector('[data-agent-id="remote::ops"] .roster-signal')?.textContent).toContain("1 need attention");
+  });
+
   it("withholds old running and planned signals when the Gateway goes offline while retaining the roster and rollups", async () => {
     const writer = agent("writer");
     writer.recent["24h"] = { ...emptyRollup, completed: 6 };

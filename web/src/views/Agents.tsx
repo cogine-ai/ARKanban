@@ -101,8 +101,16 @@ export function AgentsView() {
   const [query, setQuery] = useState("");
   const now = useScheduleNow();
   const counts = useMemo(() => liveCountsByAgent(snapshot), [snapshot]);
-  const of = (agent: AgentOverview) => countsForAgent(agent, counts, snapshot, status);
-  const sorted = useMemo(() => sortAgents(agents ?? [], counts), [agents, counts]);
+  const observableCounts = useMemo(() => {
+    const current = new Map<string, AgentLiveCounts>();
+    for (const agent of agents ?? []) {
+      const value = countsForAgent(agent, counts, snapshot, status);
+      if (value) current.set(agentIdentity(agent.hostId, agent.id), value);
+    }
+    return current;
+  }, [agents, counts, snapshot, status]);
+  const of = (agent: AgentOverview) => observableCounts.get(agentIdentity(agent.hostId, agent.id));
+  const sorted = useMemo(() => sortAgents(agents ?? [], observableCounts), [agents, observableCounts]);
   const shown = sorted.filter((agent) => matchesAgentFilter(filter, of(agent)) && matchesAgentSearch(agent, query));
   const multiHost = new Set(sorted.map((agent) => agent.hostId)).size > 1;
   const missingCollectors = (status?.hosts ?? []).filter((host) => !host.reachable).length;

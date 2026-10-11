@@ -21,8 +21,10 @@ function ConnectionIcon({ kind }: { kind: "gateway" | "collector" | "browser" | 
   </svg>;
 }
 
-function Signal({ signal, prefix }: { signal: ConnectionSignal; prefix?: string }) {
-  return <span className="connection-signal" data-tone={signal.tone}><i aria-hidden="true" />{prefix}{signal.label}</span>;
+function Signal({ signal, prefix, announce = false }: { signal?: ConnectionSignal; prefix?: string; announce?: boolean }) {
+  return <span className={signal ? "connection-signal" : "sr-only"} data-tone={signal?.tone} aria-live={announce ? "polite" : undefined} aria-atomic={announce ? true : undefined}>
+    {signal ? <><i aria-hidden="true" />{prefix}{signal.label}</> : null}
+  </span>;
 }
 
 function FlowStep({ kind, label, title, signal, children }: {
@@ -82,7 +84,7 @@ function ArchivePanel({ status, error, reload }: { status?: TranscriptArchiveSta
     <div className="connection-archive-heading">
       <span className="connection-archive-icon"><ConnectionIcon kind="archive" /></span>
       <div><h2 id="connection-archive-title">Conversation archive</h2><p className="connection-archive-disclosure">{status ? archiveDisclosure(status) : error ? "Status unavailable" : "Loading…"}</p></div>
-      {status ? <Signal signal={error ? { label: "Last known", tone: "warn" } : archiveSignal(status)} /> : null}
+      <Signal announce signal={status ? error ? { label: "Last known", tone: "warn" } : archiveSignal(status) : undefined} />
       <Link to="/settings?section=archive" className="connection-settings" aria-label="Archive settings" title="Archive settings"><ConnectionIcon kind="settings" /></Link>
     </div>
     {error ? <div className="connection-error" role="alert"><span>Archive status unavailable</span><button type="button" onClick={() => void reload()}>Retry</button></div> : null}
@@ -127,7 +129,7 @@ export function ConnectionsView({ status }: { status?: CollectorStatus }) {
     : { label: "No nodes", tone: "quiet" };
 
   return <section className="surface view-surface connections-view" aria-busy={!status && !error}>
-    <div className="view-heading"><h1>Connections</h1><div className="connection-heading-actions"><Signal signal={pageSignal} /><Link to="/settings" className="connection-settings" aria-label="Connection settings" title="Connection settings"><ConnectionIcon kind="settings" /></Link></div></div>
+    <div className="view-heading"><h1>Connections</h1><div className="connection-heading-actions"><Signal announce signal={pageSignal} /><Link to="/settings" className="connection-settings" aria-label="Connection settings" title="Connection settings"><ConnectionIcon kind="settings" /></Link></div></div>
     {status ? <>
       <div className={`connection-flow${hub ? " connection-flow-hub" : ""}`} aria-label={hub ? "Nodes to Hub to Browser" : "Gateway to Collector to Browser"} data-page-live={live.state === "open"}>
         {hub ? <div className="connection-branches" aria-label="Collector nodes">{hosts.length ? hosts.map((host) => <HostBranch key={host.id} host={host} />) : <div className="connection-no-nodes"><ConnectionIcon kind="collector" /><span>No connected nodes</span><Link to="/settings">Connect a node</Link></div>}</div> : <FlowStep kind="gateway" label="Gateway" title={status.gateway.name} signal={gatewaySignal(status.gateway.connected)} />}

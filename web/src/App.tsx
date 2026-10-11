@@ -49,8 +49,7 @@ function LiveStreamNotice() {
       {live.state === "stopped" ? (
         <>
           <span>
-            Live updates have stopped{live.lostAt ? ` — last update ${formatRelative(live.lostAt)}` : ""}. Nothing on
-            this page is refreshing.
+            Updates paused{live.lostAt ? ` · last contact ${formatRelative(live.lostAt)}` : ""}
           </span>
           <button type="button" onClick={retryLive}>
             Reconnect
@@ -60,8 +59,8 @@ function LiveStreamNotice() {
         // No countdown: `EventSource` sets its own delay, and naming a time this
         // code does not control would be inventing a schedule.
         <span>
-          Reconnecting to live updates (attempt {live.attempts})
-          {live.lostAt ? ` — last update ${formatRelative(live.lostAt)}` : ""}.
+          Reconnecting · attempt {live.attempts}
+          {live.lostAt ? ` · last contact ${formatRelative(live.lostAt)}` : ""}
         </span>
       )}
     </div>
@@ -69,7 +68,7 @@ function LiveStreamNotice() {
 }
 
 export function App() {
-  const { status, snapshot, settled, range, setRange } = useCollector();
+  const { status, snapshot, settled, range, setRange, live } = useCollector();
   const { pathname } = useLocation();
   const navigateTo = useNavigate();
   const [kind, setKind] = useState<KindFilter>("all");
@@ -152,7 +151,7 @@ export function App() {
           {agentDetail ? <AgentDetailView agentId={agentDetail.agentId!} /> : null}
           {matchPath("/sessions", pathname) ? <SessionsView /> : null}
           {sessionDetail ? <SessionDetailView sessionKey={sessionDetail.sessionKey!} /> : null}
-          {matchPath("/relations", pathname) ? <RelationsView snapshot={snapshot} onSelect={openItem} /> : null}
+          {matchPath("/relations", pathname) ? <RelationsView snapshot={snapshot} status={status} selectedId={selectedId} paused={live.state !== "open"} onSelect={openItem} /> : null}
           {matchPath("/archive", pathname) ? <ArchiveView items={snapshot?.items ?? []} onSelect={openItem} /> : null}
           {matchPath("/connections", pathname) ? <ConnectionsView status={status} /> : null}
           {matchPath("/settings", pathname) ? <SettingsView /> : null}

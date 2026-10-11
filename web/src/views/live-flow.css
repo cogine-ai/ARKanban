@@ -1,0 +1,32 @@
+.live-flow-toolbar { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 18px; padding: 24px; }
+.live-flow-title { display: flex; align-items: center; gap: 20px; }
+.live-flow-title h1 { margin: 0; font-size: 30px; line-height: 1.1; letter-spacing: -.85px; font-weight: 680; }
+.board-health { display: inline-flex; align-items: center; flex-wrap: wrap; gap: 7px; color: var(--secondary); text-decoration: none; font-size: 12px; }
+.board-health b { font-weight: 600; color: var(--ink); }
+.board-health > span:last-child { font-variant-numeric: tabular-nums; }
+.board-health-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--orange); }
+.board-health.is-live .board-health-dot { background: var(--green); }
+.board-health > span:not(.board-health-dot)::before { content: "·"; margin-right: 7px; color: var(--tertiary); }
+.live-flow-view .search { width: 250px; height: 38px; }
+.live-flow-view .search input { font-size: 13px; }
+.live-flow-view .host-filter select { height: 38px; font-size: 12px; max-width: 180px; }
+.live-flow-view .segmented button { min-height: 30px; font-size: 12px; }
+.live-flow-view .refresh-button { width: 38px; height: 38px; }
+.live-flow-view .flow-board { height: auto; min-height: 0; overflow: visible; }
+.live-flow-error { display: flex; justify-content: space-between; align-items: center; gap: 12px; padding: 10px 14px; margin-bottom: 14px; border: 1px solid rgba(191,116,20,.2); border-radius: 10px; background: #fff9ef; color: #89530f; font-size: 13px; }
+.live-flow-error button { border: 0; color: inherit; background: transparent; cursor: pointer; font-weight: 600; }
+.live-flow-view button:focus-visible, .live-flow-view select:focus-visible, .live-flow-view a:focus-visible, .live-flow-view .search:focus-within { outline: 2px solid var(--blue); outline-offset: 3px; }
+@media (max-width: 980px) {
+  .live-flow-toolbar { padding: 20px 16px; }
+  .live-flow-filters { width: 100%; }
+  .live-flow-title { width: 100%; justify-content: space-between; gap: 12px; }
+  .live-flow-view .search { flex: 1; }
+}
+@media (max-width: 620px) {
+  .live-flow-title { flex-wrap: wrap; }
+  .live-flow-title h1 { font-size: 26px; }
+  .live-flow-filters { flex-wrap: wrap; width: 100%; overflow: visible; gap: 8px; }
+  .live-flow-view .search { flex: 1 1 100%; width: 100%; min-width: 0; }
+  .live-flow-view .host-filter { flex: 1; min-width: 0; }
+  .live-flow-view .host-filter select { max-width: 100%; width: 100%; }
+}

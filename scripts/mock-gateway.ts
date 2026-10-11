@@ -38,12 +38,17 @@ const tasks = Array.from({ length: 170 }, (_, index) => {
     ...(status === "completed" || status === "failed" ? { endedAt: createdAt + 20_000 } : {}),
     ...(status === "running" ? { lastToolName: ["read", "exec", "web_search", "edit"][index % 4], progressSummary: `Observed step ${index % 7 + 1}` } : {}),
     ...(status === "completed" ? { terminalOutcome: "succeeded" } : {}),
+    // An explicit task tree exercises the parent view separately from shared runs.
+    ...(index === 22 || index === 23 ? { parentTaskId: "demo-task-21" }
+      : index === 24 ? { parentTaskId: "demo-task-23" } : {}),
   };
 });
 
 const models = ["claude-opus-4", "claude-sonnet-4", "gpt-5"];
 const categories = ["research", "delivery", "ops"];
 const sessionKinds = ["direct", "fork", "subagent"];
+const demoSessionKey = (index: number): string =>
+  `agent:${agents[(index * 7) % agents.length]}:demo-${index < 40 ? "live" : "idle"}-${index + 1}`;
 
 // The first 40 rows stay live so Live Flow keeps its previous fixture. The tail
 // is idle and archived, which only the session archive should retain — that
@@ -54,7 +59,7 @@ const sessions = Array.from({ length: 64 }, (_, index) => {
   const kind = sessionKinds[index % sessionKinds.length]!;
   const archived = index >= 52;
   return {
-    key: `agent:${agentId}:demo-${live ? "live" : "idle"}-${index + 1}`,
+    key: demoSessionKey(index),
     sessionId: `demo-session-${index + 1}`,
     // Every row reports `direct`, as `classifySessionKey` does. Fork and
     // subagent are only knowable from the lineage fields below, and a fixture
@@ -82,16 +87,18 @@ const sessions = Array.from({ length: 64 }, (_, index) => {
     totalTokensFresh: live,
     estimatedCostUsd: Number((0.004 + index * 0.0007).toFixed(6)),
     contextTokens: 200_000,
-    ...(kind === "fork" ? { forkedFromParent: `agent:${agentId}:demo-live-${Math.max(1, index - 1)}` } : {}),
+    ...(kind === "fork" ? { forkedFromParent: demoSessionKey(Math.max(0, index - 1)) } : {}),
     ...(kind === "subagent"
       ? {
-          parentSessionKey: `agent:${agentId}:demo-live-${Math.max(1, index - 2)}`,
-          spawnedBy: `agent:${agentId}:demo-live-${Math.max(1, index - 2)}`,
+          // Keep one unresolved reference for honest missing-source rendering.
+          parentSessionKey: index === 11 ? "agent:external:missing-demo-source" : demoSessionKey(Math.max(0, index - 2)),
+          spawnedBy: index === 11 ? "agent:external:missing-demo-source" : demoSessionKey(Math.max(0, index - 2)),
           spawnDepth: 1,
           subagentRole: "researcher",
         }
       : {}),
     worktree: { branch: `feature/demo-${index % 7}`, repoRoot: "/home/demo/repo" },
+    ...(index === 8 ? { previousSessionId: "demo-previous-generation-9" } : {}),
   };
 });
 

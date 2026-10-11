@@ -63,6 +63,10 @@ describe("CollectorRuntime", () => {
 
     clientSocket?.send(JSON.stringify({ type: "event", event: "agent", seq: 1, payload: { runId: "run-one", sessionKey: "agent:builder:one", agentId: "builder", seq: 1, stream: "lifecycle", ts: 3_000, data: { phase: "end", endedAt: 3_000 } } }));
     await vi.waitFor(() => expect(runtime.getSnapshot().items.find((item) => item.kind === "attempt")).toMatchObject({ state: "terminal", outcome: "unknown" }));
+
+    // Saving a new role does not replace this node's running implementation.
+    config.role = "hub";
+    expect(runtime.getStatus().host.role).toBe("node");
   });
 
   it("upgrades a snapshot placeholder when the run event arrives without creating an Unattributed duplicate", async () => {
@@ -179,6 +183,7 @@ describe("CollectorRuntime", () => {
 
     const directory = mkdtempSync(path.join(tmpdir(), "collector-runtime-schedule-"));
     const config: ResolvedCollectorConfig = {
+      host: { id: "original-node", label: "Original node" },
       gateway: { name: "test", url: `ws://127.0.0.1:${address.port}`, tokenEnv: "TEST_GATEWAY_TOKEN", token: "test-token" },
       server: { host: "127.0.0.1", port: 47_125 },
       storage: {
@@ -192,11 +197,13 @@ describe("CollectorRuntime", () => {
       configPath: path.join(directory, "config.json"),
     };
     const runtime = new CollectorRuntime(config);
+    let restartedRuntime: CollectorRuntime | undefined;
     const changeReasons: string[] = [];
     const unsubscribeChanges = runtime.subscribeChanges((change) => changeReasons.push(...change.reasons));
     cleanups.push(async () => {
       unsubscribeChanges();
       await runtime.stop();
+      await restartedRuntime?.stop();
       for (const socket of server.clients) socket.terminate();
       await new Promise<void>((resolve) => server.close(() => resolve()));
       rmSync(directory, { recursive: true, force: true });
@@ -213,11 +220,25 @@ describe("CollectorRuntime", () => {
         schedulerEnabled: true,
         windowMinutes: 60,
         dueGraceMinutes: 3,
-        items: [{ id: "cron:memory", jobId: "memory", agentId: "main", nextRunAt }],
+        items: [{ id: "cron:memory", jobId: "memory", agentId: "main", hostId: "original-node", nextRunAt }],
       },
     });
     expect(cronListLimit).toBe(200);
     expect(changeReasons).toContain("schedule_gateway_connected");
+
+    // A pending host edit cannot change the identity of a later forecast from
+    // the client and repository that are still running under the original host.
+    config.host.id = "saved-node";
+    config.host.label = "Saved node";
+    await (runtime as unknown as { syncSchedules(reason: string): Promise<void> }).syncSchedules("saved_config");
+    expect(runtime.getStatus().host).toMatchObject({ id: "original-node", label: "Original node" });
+    expect(runtime.getSnapshot().schedule.items[0].hostId).toBe("original-node");
+
+    restartedRuntime = new CollectorRuntime({ ...config, storage: { ...config.storage, path: path.join(directory, "restarted.sqlite") } });
+    restartedRuntime.start();
+    await vi.waitFor(() => expect(restartedRuntime?.getSnapshot().schedule.state).toBe("live"), { timeout: 5_000 });
+    expect(restartedRuntime.getStatus().host).toMatchObject({ id: "saved-node", label: "Saved node" });
+    expect(restartedRuntime.getSnapshot().schedule.items[0].hostId).toBe("saved-node");
   });
 
   /**

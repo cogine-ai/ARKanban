@@ -55,21 +55,21 @@ try {
   const navLabels = await page.locator(navSelector).allTextContents();
 
   const live = {
-    heading: normalise(await page.locator(".summary-copy h1").textContent()),
+    heading: normalise(await page.locator(".summary-copy h1, .live-flow-title h1").textContent()),
     metrics: (await page.locator(".summary-copy .metrics span").allTextContents()).map(normalise),
-    truthPills: (await page.locator(".truth-pill").allTextContents()).map(normalise),
-    flowHeads: (await page.locator(".flow-head").allTextContents()).map(normalise),
-    laneRows: await count(page, ".lane-row"),
-    activityCards: await count(page, ".activity-card"),
+    truthPills: (await page.locator(".truth-pill, .board-health").allTextContents()).map(normalise),
+    flowHeads: (await page.locator(".flow-head, .lfb-lane-head > span").allTextContents()).map(normalise),
+    laneRows: await count(page, ".lane-row, .lfb-lane"),
+    activityCards: await count(page, ".activity-card, .lfb-card"),
     settledCards: await count(page, ".series-group-card"),
     fleetMapRows: await count(page, ".fleet-map-row"),
-    footer: normalise(await page.locator(".flow-footer").textContent()),
+    footer: normalise(await page.locator(".flow-footer, .lfb-record-count").textContent()),
     rangeButtons: await page.locator("[aria-label='Settled time range'] button").allTextContents(),
     kindButtons: await page.locator("[aria-label='Activity kind'] button").allTextContents(),
   };
 
   const inspector: Record<string, unknown> = { opened: false };
-  const firstCard = page.locator(".flow-table [data-activity-id]").first();
+  const firstCard = page.locator(".flow-table [data-activity-id], .lfb-current [data-activity-id]").first();
   if (await firstCard.count() > 0) {
     await firstCard.click();
     await page.locator(".inspector").waitFor({ state: "visible" });
@@ -123,10 +123,22 @@ try {
 
   await gotoView("Relations");
   const relations = {
-    heading: normalise(await page.locator(".view-heading h1").textContent()),
-    eyebrow: normalise(await page.locator(".view-heading .eyebrow").textContent()),
-    chip: normalise(await page.locator(".count-chip").textContent()),
-    cards: await count(page, ".relation-cards button"),
+    heading: normalise(await page.locator(".view-heading h1, .relations-heading h1").textContent()),
+    chip: normalise(await page.locator(".count-chip, .relations-observed-count").textContent()),
+    modes: await page.locator(".relations-mode [role='tab']").allTextContents(),
+    groups: await count(page, ".relations-group"),
+    nodes: await count(page, ".relation-cards button, .relations-node"),
+  };
+
+  await gotoView("Sessions");
+  const sessions = {
+    heading: normalise(await page.locator(".sessions-heading h1").textContent()),
+    mode: await page.locator(".sessions-view").getAttribute("data-mode"),
+    modes: (await page.locator(".sessions-mode [role='tab']").allTextContents()).map(normalise),
+    filters: (await page.locator(".sessions-filters .sessions-control > span").allTextContents()).map(normalise),
+    loaded: normalise(await page.locator(".sessions-result-toolbar > span").textContent()),
+    rows: await count(page, ".sessions-view .session-row"),
+    rawKeysVisible: (await page.locator(".sessions-view .session-list").textContent())?.includes("agent:") ?? false,
   };
 
   await gotoView("Archive");
@@ -177,8 +189,8 @@ try {
     })(),
     deepLinkRendersView: await (async () => {
       await page.goto(`${baseUrl}/relations`, { waitUntil: "networkidle" });
-      await page.locator(".view-heading h1").waitFor({ state: "visible" });
-      return normalise(await page.locator(".view-heading h1").textContent());
+      await page.locator(".view-heading h1, .relations-heading h1").waitFor({ state: "visible" });
+      return normalise(await page.locator(".view-heading h1, .relations-heading h1").textContent());
     })(),
     unknownPathFallsBackToShell: await (async () => {
       await page.goto(`${baseUrl}/not-a-route`, { waitUntil: "networkidle" });
@@ -192,6 +204,7 @@ try {
     inspector,
     agents,
     relations,
+    sessions,
     archive,
     connections,
     searchSurvivesViewSwitch,

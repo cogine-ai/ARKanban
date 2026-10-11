@@ -33,8 +33,12 @@ function configFixture(): ResolvedCollectorConfig {
   const directory = mkdtempSync(path.join(tmpdir(), "collector-privacy-"));
   cleanups.push(() => rmSync(directory, { recursive: true, force: true }));
   return {
+    host: { id: "local", label: "local" },
+    role: "node",
     gateway: { name: "test", url: "ws://127.0.0.1:18789", tokenEnv: "TEST_TOKEN", token: "secret" },
     server: { host: "127.0.0.1", port: 47_123 },
+    hub: { nodes: [] },
+    localSources: { standaloneCli: "disabled" },
     storage: {
       path: path.join(directory, "collector.sqlite"),
       terminalRetentionDays: 30,
@@ -89,6 +93,7 @@ describe("local_archive boundary", () => {
 
     const urls = [
       "/api/v1/meta",
+      "/api/v1/settings",
       "/api/v1/snapshot",
       "/api/v1/diagnostics/field-coverage",
       "/api/v1/transcripts/status",

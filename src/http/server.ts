@@ -1,9 +1,9 @@
-import { existsSync } from "node:fs";
-import { timingSafeEqual } from "node:crypto";
+import { existsSync, readFileSync } from "node:fs";
+import { randomBytes, timingSafeEqual } from "node:crypto";
 import type { ServerResponse } from "node:http";
 import path from "node:path";
 import fastifyStatic from "@fastify/static";
-import Fastify, { LogController, type FastifyError, type FastifyInstance } from "fastify";
+import Fastify, { LogController, type FastifyError, type FastifyInstance, type FastifyReply } from "fastify";
 import type {
   AgentOverview,
   AgentRollupWindow,
@@ -45,9 +45,9 @@ function sseEvent(event: string, data: unknown): string {
 
 /**
  * Nothing is fetched from anywhere else, so everything but same-origin script,
- * style and XHR is denied outright. Inline styles are not permitted either:
- * React sets the `style` prop through the CSSStyleDeclaration API, which CSP
- * does not police, so the app needs no exemption to keep working.
+ * style and XHR is denied outright. HTML responses grant a fresh nonce only to
+ * trusted runtime styles such as the modal scroll lock. React's style property
+ * uses CSSStyleDeclaration, which does not need an inline-style exemption.
  */
 const CONTENT_SECURITY_POLICY = [
   "default-src 'none'",
@@ -242,7 +242,8 @@ export type HttpSurface = CollectorRuntime | HubRuntime;
 export async function createHttpServer(
   runtime: HttpSurface,
   config: ResolvedCollectorConfig,
-  settings: SettingsService = createSettingsService(config),
+  settings: SettingsService = createSettingsService(config, runtime.getStatus().process.startedAt),
+  options: { webRoot?: string } = {},
 ): Promise<FastifyInstance> {
   const app = Fastify({
     logger: { level: process.env.LOG_LEVEL ?? "info" },
@@ -365,12 +366,39 @@ export async function createHttpServer(
    * Node side: mint a short-lived pairing code that a hub can redeem once.
    * Ensures a LAN shared secret exists so the hub can keep calling afterwards.
    */
-  app.post("/api/v1/pairing/offer", async () => {
+  app.post("/api/v1/pairing/offer", async (_request, reply) => {
+    const before = settings.getPublicSettings();
+    if (before.restartRequired) {
+      return reply.code(409).send({
+        error: "pairing_restart_required",
+        hint: "Apply the saved configuration by restarting Collector, then generate a new connection code.",
+      });
+    }
+    // `both` currently serves the local Collector; it is not a combined fan-in
+    // runtime. Read the startup facts, not the role just written by Settings.
+    if (isHubRuntime(runtime) || before.runtime.role === "hub") {
+      return reply.code(409).send({
+        error: "pairing_requires_node",
+        hint: "Generate the connection code on a machine running a local Collector.",
+      });
+    }
+    if (!before.runtime.server.lanExposed) {
+      return reply.code(409).send({
+        error: "pairing_requires_lan",
+        hint: "Choose LAN access, save and restart Collector before generating a connection code.",
+      });
+    }
     const ensured = settings.ensureServerToken();
     const publicSettings = settings.getPublicSettings();
+    if (publicSettings.restartRequired) {
+      return reply.code(409).send({
+        error: "pairing_restart_required",
+        hint: "The node credential is prepared. Restart Collector before generating the one-time connection code.",
+      });
+    }
     const offer = createPairingOffer({
-      hostId: publicSettings.host.id,
-      label: publicSettings.host.label,
+      hostId: publicSettings.runtime.host.id,
+      label: publicSettings.runtime.host.label,
       token: ensured.token,
     });
     return {
@@ -786,13 +814,31 @@ export async function createHttpServer(
     });
   });
 
-  const webRoot = path.resolve(process.cwd(), "dist/web");
-  if (existsSync(webRoot)) {
+  const webRoot = options.webRoot ?? path.resolve(process.cwd(), "dist/web");
+  const webIndex = path.join(webRoot, "index.html");
+  if (existsSync(webIndex)) {
+    const indexHtml = readFileSync(webIndex, "utf8");
     await app.register(fastifyStatic, {
       root: webRoot,
       wildcard: false,
+      // Serve the entry document ourselves so every route receives matching
+      // nonce metadata and CSP; a static /index.html must not bypass it.
+      globIgnore: ["index.html"],
     });
-    app.get("/*", async (_request, reply) => reply.sendFile("index.html"));
+    const serveIndex = async (_request: unknown, reply: FastifyReply) => {
+      const nonce = randomBytes(18).toString("base64");
+      const html = indexHtml.replace(/<head(?:\s[^>]*)?>/i, (head) =>
+        `${head}<meta name="collector-style-nonce" content="${nonce}">`,
+      );
+      return reply
+        .header("content-security-policy", CONTENT_SECURITY_POLICY.replace("style-src 'self'", `style-src 'self' 'nonce-${nonce}'`))
+        .header("cache-control", "no-store")
+        .type("text/html; charset=utf-8")
+        .send(html);
+    };
+    app.get("/", serveIndex);
+    app.get("/index.html", serveIndex);
+    app.get("/*", serveIndex);
   } else {
     app.get("/", async () => ({
       name: "OpenClaw Collector",

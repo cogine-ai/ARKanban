@@ -1,0 +1,185 @@
+.settings-setup {
+  --setup-blue: #0678ed;
+  --setup-text: #222936;
+  --setup-muted: #717b8b;
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  color: var(--setup-text);
+}
+.settings-setup .view-heading { margin-bottom: 0; }
+.settings-setup .setup-sections { display: flex; width: fit-content; gap: 4px; padding: 4px; border-radius: 10px; background: #edf0f5; }
+.settings-setup .setup-sections a { min-height: 36px; display: grid; place-items: center; padding: 8px 17px; border-radius: 7px; color: #677385; text-decoration: none; font-size: 13px; font-weight: 600; }
+.settings-setup .setup-sections a[aria-current="page"] { background: #fff; color: #25354c; box-shadow: 0 1px 5px #2c3b5214; }
+.settings-setup .setup-sections a:focus-visible { outline: 3px solid #0678ed; outline-offset: 3px; }
+.settings-setup .setup-archive { display: grid; gap: 23px; width: min(100%, 750px); padding: 24px; border: 1px solid #dde3eb; border-radius: 15px; background: #fff; }
+.settings-setup .setup-archive-heading { display: flex; align-items: center; gap: 20px; }
+.settings-setup .setup-archive-icon { width: 71px; height: 71px; flex: 0 0 auto; stroke: #6b7d96; stroke-width: 2.3; stroke-linecap: round; stroke-linejoin: round; }
+.settings-setup .setup-archive-heading h2 { margin: 0 0 7px; font-size: 18px; font-weight: 650; }
+.settings-setup .setup-archive-heading span { color: var(--setup-muted); font-size: 13px; }
+.settings-setup .setup-archive-choice { display: flex; align-items: center; gap: 17px; padding: 20px 0; border-block: 1px solid #e4e8ef; }
+.settings-setup .setup-archive-choice > div { display: grid; gap: 9px; margin-right: auto; min-width: 0; }
+.settings-setup .setup-archive-choice strong { font-size: 16px; font-weight: 600; }
+.settings-setup .setup-archive-choice small { font-size: 12px; color: var(--setup-muted); }
+.settings-setup .setup-archive-draft { color: #6b7789; font-size: 13px; }
+.settings-setup .setup-archive-switch { display: flex; align-items: center; width: 48px; min-width: 48px; height: 29px; padding: 3px; border: 1px solid #c9d2de; border-radius: 20px; background: #d9dfe7; }
+.settings-setup .setup-archive-switch > span { width: 21px; height: 21px; border-radius: 50%; background: white; box-shadow: 0 1px 4px #31435a2b; }
+.settings-setup .setup-archive-switch[aria-checked="true"] { justify-content: flex-end; background: var(--setup-blue); border-color: var(--setup-blue); }
+.settings-setup .setup-archive-runtime { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; font-size: 12px; color: var(--setup-muted); }
+.settings-setup .setup-archive-runtime > span:not(.setup-state) { margin-right: 2px; }
+.settings-setup .setup-archive-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 14px; }
+.settings-setup .setup-archive-actions > :first-child { margin-right: auto; }
+.settings-setup button, .settings-setup input, .settings-setup select, .settings-setup textarea { font: inherit; }
+.settings-setup button { cursor: pointer; }
+.settings-setup button:disabled { cursor: default; opacity: .5; }
+.settings-setup :is(button, input, select, textarea, summary):focus-visible { outline: 3px solid #0678ed; outline-offset: 4px; }
+.settings-setup .setup-text-button { border: 0; padding: 8px 3px; background: none; color: var(--setup-blue); font-size: 13px; }
+.settings-setup .setup-primary { min-height: 40px; border: 1px solid transparent; border-radius: 10px; padding: 8px 17px; background: var(--setup-blue); color: white; font-size: 14px; font-weight: 640; white-space: nowrap; }
+.settings-setup .setup-primary:not(:disabled):hover { background: #005dbe; }
+.settings-setup .setup-loading { padding: 36px; text-align: center; color: var(--setup-muted); }
+.settings-setup .setup-error { padding: 14px 17px; display: grid; gap: 8px; border: 1px solid #e9bdba; border-radius: 12px; color: #8a2925; background: #fff6f4; font-size: 13px; }
+.settings-setup .setup-error details { font-size: 12px; }
+.settings-setup .setup-error code { display: block; padding-top: 8px; white-space: pre-wrap; overflow-wrap: anywhere; }
+.settings-setup .setup-intents { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 18px; }
+.settings-setup .setup-intent { position: relative; display: flex; align-items: center; gap: 26px; padding: 16px 22px; min-height: 96px; border: 1px solid #d9dfe7; border-radius: 15px; background: #fff; text-align: left; color: var(--setup-muted); }
+.settings-setup .setup-intent[aria-pressed="true"] { border-color: var(--setup-blue); background: #f4f8ff; color: var(--setup-blue); box-shadow: inset 0 0 0 1px var(--setup-blue); }
+.settings-setup .setup-intent > span:not(.setup-choice) { display: grid; gap: 8px; }
+.settings-setup .setup-intent strong { color: var(--setup-text); font-size: 17px; font-weight: 650; }
+.settings-setup .setup-intent small { color: var(--setup-muted); font-size: 12px; }
+.settings-setup .setup-choice { position: absolute; top: 17px; right: 19px; font-size: 24px; line-height: 1; }
+.settings-setup .setup-device-icon { width: 74px; height: 66px; flex: 0 0 auto; stroke: currentColor; stroke-width: 2.4; stroke-linecap: round; stroke-linejoin: round; }
+.settings-setup .setup-intent:nth-child(2) .setup-device-icon { width: 108px; }
+.settings-setup .setup-intent .setup-device-icon { height: 60px; }
+.settings-setup .setup-applied { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; min-height: 30px; font-size: 13px; color: var(--setup-muted); }
+.settings-setup .setup-applied b { color: var(--setup-text); font-weight: 550; }
+.settings-setup .setup-applied > small { font-size: 12px; }
+.settings-setup .setup-applied .setup-primary { margin-left: auto; }
+.settings-setup .setup-state { width: fit-content; display: inline-flex; align-items: center; gap: 6px; min-height: 25px; padding: 3px 9px; border-radius: 20px; background: #edf0f4; color: #5f6b7c; font-size: 11px; line-height: 1.45; }
+.settings-setup .setup-state > span { font-size: 12px; font-weight: 700; }
+.settings-setup .setup-state[data-tone="good"] { background: #e8f6eb; color: #216b39; }
+.settings-setup .setup-state[data-tone="warn"] { background: #fff1da; color: #8d570c; }
+.settings-setup .setup-state[data-tone="bad"] { background: #fdeae6; color: #9e352a; }
+.settings-setup .setup-feedback { padding: 11px 14px; border-radius: 9px; background: #f1f4f8; color: #596679; font-size: 13px; }
+.settings-setup .setup-collect { display: grid; gap: 16px; }
+.settings-setup .setup-steps { display: flex; align-items: center; max-width: 780px; width: 100%; margin: 0 auto; padding: 0; list-style: none; }
+.settings-setup .setup-steps li { display: flex; align-items: center; gap: 11px; color: var(--setup-muted); font-size: 14px; white-space: nowrap; }
+.settings-setup .setup-steps li:not(:last-child) { flex: 1; }
+.settings-setup .setup-steps li:not(:last-child)::after { content: ""; height: 1px; min-width: 20px; flex: 1; margin: 0 17px 0 6px; background: #d8dee7; }
+.settings-setup .setup-steps li > span { display: grid; place-items: center; width: 32px; height: 32px; border-radius: 50%; background: #edf0f4; border: 1px solid #d8dfe9; color: #657284; font-size: 14px; }
+.settings-setup .setup-steps li[data-done="true"] > span, .settings-setup .setup-steps li[data-current="true"] > span { color: #fff; background: var(--setup-blue); border-color: var(--setup-blue); }
+.settings-setup .setup-steps li[data-done="true"]::after { background: var(--setup-blue); }
+.settings-setup .setup-network { display: flex; align-items: center; flex-wrap: wrap; gap: 12px; font-size: 13px; }
+.settings-setup .setup-network > span:first-child { color: var(--setup-muted); }
+.settings-setup .setup-network > div { display: flex; border: 1px solid #dfe4eb; border-radius: 9px; padding: 3px; background: #eef1f5; }
+.settings-setup .setup-network button { min-height: 32px; padding: 6px 12px; border: 0; border-radius: 7px; background: transparent; color: #687484; font-size: 12px; }
+.settings-setup .setup-network button[aria-pressed="true"] { background: #fff; color: #2d3a4a; box-shadow: 0 1px 4px #24324715; }
+.settings-setup .setup-topology { display: grid; grid-template-columns: minmax(140px, 1fr) minmax(24px, .65fr) minmax(150px, 1fr) minmax(24px, .65fr) minmax(140px, 1fr); align-items: center; margin: 4px 0; }
+.settings-setup .setup-object { display: flex; flex-direction: column; align-items: center; gap: 6px; text-align: center; min-width: 0; }
+.settings-setup .setup-object > strong { width: 100%; color: #2d3542; font-size: 15px; overflow-wrap: anywhere; }
+.settings-setup .setup-object > small { color: var(--setup-muted); font-size: 12px; }
+.settings-setup .setup-object .setup-device-icon { width: 86px; height: 64px; color: #536379; }
+.settings-setup .setup-source-icon { width: 74px; height: 64px; stroke: #258b96; stroke-width: 2.7; stroke-linecap: round; }
+.settings-setup .setup-object-remote { color: #929ead; }
+.settings-setup .setup-object-remote .setup-device-icon { color: #a4adba; }
+.settings-setup .setup-wire { position: relative; height: 2px; background: #b9c1cd; margin: -40px 4px 0; }
+.settings-setup .setup-wire::after { content: ""; position: absolute; top: -3px; right: -1px; width: 8px; height: 8px; border-right: 2px solid #b9c1cd; border-top: 2px solid #b9c1cd; transform: rotate(45deg); }
+.settings-setup .setup-wire[data-online="true"] { background: #34824d; }
+.settings-setup .setup-wire[data-online="true"]::after { border-color: #34824d; }
+.settings-setup .setup-wire-candidate { height: 0; border-top: 2px dashed #adb6c3; background: transparent; }
+.settings-setup .setup-wire-candidate::after { display: none; }
+.settings-setup .setup-connection-object { display: grid; grid-template-columns: minmax(0, 1.7fr) minmax(140px, .8fr) minmax(120px, .7fr); align-items: start; gap: 22px; padding: 18px; border-radius: 14px; background: #f0f2f6; }
+.settings-setup .setup-field { min-width: 0; display: grid; gap: 7px; font-size: 13px; }
+.settings-setup .setup-field > span, .settings-setup .setup-package-fact > span { color: var(--setup-muted); font-size: 12px; }
+.settings-setup .setup-field :is(input, select, textarea) { width: 100%; min-width: 0; min-height: 38px; padding: 8px 10px; border: 1px solid #d9dfe7; border-radius: 8px; background: #fff; color: var(--setup-text); font-size: 13px; }
+.settings-setup .setup-field textarea { resize: vertical; line-height: 1.5; }
+.settings-setup .setup-field input[aria-invalid="true"], .settings-setup .setup-field textarea[aria-invalid="true"] { border-color: #c56153; }
+.settings-setup .setup-field small { color: var(--setup-muted); font-size: 11px; }
+.settings-setup .setup-field-error { color: #a0362d !important; font-size: 12px; }
+.settings-setup .setup-package-fact { display: grid; gap: 12px; min-width: 0; padding-left: 21px; border-left: 1px solid #d9dfe7; }
+.settings-setup .setup-package-fact code, .settings-setup .setup-package-fact strong { font-size: 22px; letter-spacing: -.4px; font-weight: 650; font-variant-numeric: tabular-nums; }
+.settings-setup .setup-package-fact code { overflow-wrap: anywhere; }
+.settings-setup .setup-share-actions { display: flex; align-items: center; gap: 18px; }
+.settings-setup .setup-share-actions > :first-child { margin-right: auto; }
+.settings-setup .setup-aggregate { display: grid; gap: 17px; }
+.settings-setup .setup-aggregate-heading { display: flex; align-items: center; gap: 18px; }
+.settings-setup .setup-aggregate-heading .setup-device-icon { width: 112px; color: #6685ad; }
+.settings-setup .setup-aggregate-heading h2 { margin: 0 0 7px; font-size: 17px; }
+.settings-setup .setup-preview { display: flex; align-items: center; flex-wrap: wrap; gap: 17px; padding: 18px; border: 1px solid #b9d3f3; border-radius: 14px; background: #f4f8fe; }
+.settings-setup .setup-preview .setup-device-icon { width: 56px; height: 53px; color: #6685ad; }
+.settings-setup .setup-preview > div { min-width: 0; display: grid; gap: 7px; margin-right: auto; }
+.settings-setup .setup-preview strong { font-size: 15px; }
+.settings-setup .setup-preview code { font-size: 12px; overflow-wrap: anywhere; color: #596b83; }
+.settings-setup .setup-preview > span { font-size: 14px; font-variant-numeric: tabular-nums; color: var(--setup-muted); }
+.settings-setup .setup-recovery { display: flex; flex-wrap: wrap; align-items: center; gap: 14px; }
+.settings-setup .setup-machines { display: grid; grid-template-columns: repeat(auto-fit, minmax(270px, 1fr)); gap: 12px; }
+.settings-setup .setup-machine { display: flex; align-items: flex-start; gap: 16px; padding: 18px; border: 1px solid #dde3eb; border-radius: 13px; background: #fff; }
+.settings-setup .setup-machine .setup-device-icon { width: 46px; height: 48px; color: #73839b; }
+.settings-setup .setup-machine > div { min-width: 0; display: grid; gap: 9px; }
+.settings-setup .setup-machine strong { font-size: 15px; overflow-wrap: anywhere; }
+.settings-setup .setup-machine code { font-size: 11px; color: var(--setup-muted); overflow-wrap: anywhere; }
+.settings-setup .setup-machine-states { display: flex; flex-wrap: wrap; gap: 6px; }
+.settings-setup .setup-no-machines { min-height: 150px; display: grid; justify-items: center; align-content: center; gap: 13px; border: 1px dashed #dbe0e8; border-radius: 13px; color: #7b8797; }
+.settings-setup .setup-no-machines strong { font-size: 14px; font-weight: 500; }
+.settings-setup .setup-advanced { margin-top: 4px; border-top: 1px solid #dce2eb; }
+.settings-setup .setup-advanced > summary { display: flex; align-items: center; gap: 10px; padding: 14px 0; cursor: pointer; font-size: 15px; list-style: none; }
+.settings-setup .setup-advanced > summary::-webkit-details-marker { display: none; }
+.settings-setup .setup-advanced > summary > :last-child { margin-left: auto; }
+.settings-setup .setup-advanced[open] > summary > :last-child { transform: rotate(180deg); }
+.settings-setup .setup-advanced-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 20px; }
+.settings-setup .setup-advanced fieldset { min-width: 0; display: flex; flex-direction: column; gap: 17px; border: 1px solid #dee4ec; border-radius: 12px; padding: 17px; background: #fff; }
+.settings-setup .setup-advanced legend { color: #465366; font-size: 14px; font-weight: 600; padding: 0 6px; }
+.settings-setup .setup-secret { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; min-height: 38px; font-size: 12px; }
+.settings-setup .setup-secret > button { border: 0; background: none; color: var(--setup-blue); margin-left: auto; padding: 6px; }
+.settings-setup .setup-advanced-actions { display: flex; align-items: center; flex-wrap: wrap; gap: 15px; margin-top: 18px; font-size: 12px; color: var(--setup-muted); }
+.settings-setup .setup-paths { display: grid; gap: 7px; margin: 23px 0 0; font-size: 11px; color: var(--setup-muted); }
+.settings-setup .setup-paths > div { display: grid; grid-template-columns: 70px minmax(0, 1fr); gap: 12px; }
+.settings-setup .setup-paths dd { margin: 0; overflow-wrap: anywhere; }
+/* Keep the sharing action in view on laptop-height desktops without shrinking text. */
+@media (min-width: 621px) and (max-height: 760px) {
+  .settings-setup { gap: 10px; padding: 16px; }
+  .settings-setup .setup-collect { gap: 8px; }
+  .settings-setup .setup-intent { min-height: 86px; padding-top: 10px; padding-bottom: 10px; }
+  .settings-setup .setup-intent .setup-device-icon { height: 56px; }
+  .settings-setup .setup-topology { margin: 0; }
+  .settings-setup .setup-object .setup-device-icon, .settings-setup .setup-source-icon { height: 56px; }
+  .settings-setup .setup-connection-object { padding-top: 14px; padding-bottom: 14px; }
+}
+@media (max-width: 900px) {
+  .settings-setup .setup-intent { gap: 15px; padding: 20px 16px; }
+  .settings-setup .setup-intent strong { font-size: 15px; }
+  .settings-setup .setup-intent .setup-device-icon { width: 58px; }
+  .settings-setup .setup-intent:nth-child(2) .setup-device-icon { width: 82px; }
+  .settings-setup .setup-advanced-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .settings-setup .setup-connection-object { grid-template-columns: minmax(0, 1fr) minmax(110px, .8fr); }
+  .settings-setup .setup-address { grid-column: 1 / -1; }
+  .settings-setup .setup-package-fact { padding-left: 0; border: 0; }
+  .settings-setup .setup-steps li { font-size: 12px; }
+}
+@media (max-width: 620px) {
+  .settings-setup { gap: 17px; }
+  .settings-setup .setup-archive { padding: 19px 16px; gap: 19px; }
+  .settings-setup .setup-archive-choice { gap: 12px; }
+  .settings-setup .setup-archive-choice strong { font-size: 14px; }
+  .settings-setup .setup-archive-choice small { font-size: 11px; }
+  .settings-setup .setup-intents { grid-template-columns: 1fr; gap: 10px; }
+  .settings-setup .setup-intent { min-height: 87px; padding: 15px; }
+  .settings-setup .setup-intent .setup-device-icon { height: 50px; }
+  .settings-setup .setup-topology { grid-template-columns: minmax(0, 1fr) 20px minmax(0, 1fr); row-gap: 19px; }
+  .settings-setup .setup-topology > .setup-wire-candidate, .settings-setup .setup-topology > .setup-object-remote { display: none; }
+  .settings-setup .setup-object > strong { font-size: 13px; }
+  .settings-setup .setup-object .setup-device-icon, .settings-setup .setup-source-icon { width: 66px; height: 61px; }
+  .settings-setup .setup-steps li { gap: 6px; font-size: 11px; }
+  .settings-setup .setup-steps li > span { width: 25px; height: 25px; font-size: 12px; }
+  .settings-setup .setup-steps li:not(:last-child)::after { min-width: 5px; margin: 0 7px; }
+  .settings-setup .setup-connection-object { padding: 17px; gap: 15px; }
+  .settings-setup .setup-package-fact code, .settings-setup .setup-package-fact strong { font-size: 19px; }
+  .settings-setup .setup-share-actions { gap: 12px; flex-wrap: wrap; }
+  .settings-setup .setup-share-actions > .setup-state { flex-basis: 100%; }
+  .settings-setup .setup-share-actions .setup-primary { margin-left: auto; }
+  .settings-setup .setup-advanced-grid { grid-template-columns: 1fr; }
+  .settings-setup .setup-machines { grid-template-columns: 1fr; }
+  .settings-setup .setup-preview > .setup-device-icon { display: none; }
+  .settings-setup .setup-preview > .setup-primary { margin-left: auto; }
+  .settings-setup .setup-applied .setup-primary { margin-left: 0; }
+  .settings-setup .setup-aggregate-heading .setup-device-icon { width: 82px; }
+}

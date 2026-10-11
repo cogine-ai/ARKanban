@@ -1,9 +1,9 @@
 import { readFileSync, writeFileSync } from "node:fs";
 import type { CollectorRole } from "../contracts.js";
 import { isValidHostId } from "../host/ids.js";
-import { isLoopbackHost, type ResolvedCollectorConfig } from "../config.js";
+import { isLoopbackHost, redactEndpoint, type ResolvedCollectorConfig } from "../config.js";
 import { parsePairableNodeUrl } from "./node-url.js";
-import { generateSharedToken, peekPairingOffer } from "./pairing.js";
+import { clearPairingOffers, generateSharedToken, peekPairingOffer } from "./pairing.js";
 import { loadSecrets, maskSecret, saveSecrets, secretsPathFor, type CollectorSecrets } from "./secrets.js";
 
 export type PublicSecretState = {
@@ -19,6 +19,16 @@ export type PublicHubNode = {
 };
 
 export type PublicSettings = {
+  /** Startup facts stay separate from the saved configuration awaiting restart. */
+  runtime: {
+    role: CollectorRole;
+    host: { id: string; label: string };
+    server: { host: string; port: number; lanExposed: boolean };
+    gateway: { name: string; url: string };
+    storage: { transcriptSync: "enabled" | "disabled" };
+    nodeIds: string[];
+    startedAt: number;
+  };
   host: { id: string; label: string };
   role: CollectorRole;
   gateway: {
@@ -34,6 +44,7 @@ export type PublicSettings = {
   };
   hub: { nodes: PublicHubNode[] };
   localSources: { standaloneCli: "enabled" | "disabled" };
+  storage: { transcriptSync: "enabled" | "disabled" };
   pairing: {
     active?: { code: string; expiresAt: number; hostId: string; label: string };
   };
@@ -53,6 +64,7 @@ export type SettingsPatch = {
     nodes?: Array<{ id: string; url: string; label?: string; token?: string | null }>;
   };
   localSources?: { standaloneCli?: "enabled" | "disabled" };
+  storage?: { transcriptSync?: "enabled" | "disabled" };
 };
 
 export type SettingsService = {
@@ -72,16 +84,29 @@ function writeRawConfig(configPath: string, root: Record<string, unknown>): void
   writeFileSync(configPath, `${JSON.stringify(root, null, 2)}\n`, "utf8");
 }
 
-let restartRequired = false;
-
-/** Test helper: clear the process-local restart flag between cases. */
-export function resetSettingsRestartFlag(): void {
-  restartRequired = false;
-}
-
-export function createSettingsService(config: ResolvedCollectorConfig): SettingsService {
+export function createSettingsService(config: ResolvedCollectorConfig, startedAt = Date.now()): SettingsService {
   const configPath = config.configPath;
   const secretsPath = secretsPathFor(configPath);
+  let restartRequired = false;
+  // CollectorRuntime retains this config object. Archive consent is applied
+  // only by a new process, so a saved choice must never mutate its storage.
+  let savedTranscriptSync = config.storage.transcriptSync;
+  const runtime: PublicSettings["runtime"] = {
+    role: config.role,
+    host: { ...config.host },
+    server: {
+      host: config.server.host,
+      port: config.server.port,
+      lanExposed: !isLoopbackHost(config.server.host),
+    },
+    gateway: { name: config.gateway.name, url: redactEndpoint(config.gateway.url) },
+    storage: { transcriptSync: config.storage.transcriptSync },
+    nodeIds: config.hub.nodes.map((node) => node.id),
+    startedAt,
+  };
+  // Authentication is captured when the HTTP surface starts. A newly written
+  // secret cannot admit a Hub until a fresh surface captures it on restart.
+  const serverTokenAtStart = config.server.token;
 
   const readSecrets = (): CollectorSecrets => loadSecrets(secretsPath);
 
@@ -89,6 +114,14 @@ export function createSettingsService(config: ResolvedCollectorConfig): Settings
     const secrets = readSecrets();
     const offer = peekPairingOffer();
     return {
+      runtime: {
+        ...runtime,
+        host: { ...runtime.host },
+        server: { ...runtime.server },
+        gateway: { ...runtime.gateway },
+        storage: { ...runtime.storage },
+        nodeIds: [...runtime.nodeIds],
+      },
       host: { id: config.host.id, label: config.host.label },
       role: config.role,
       gateway: {
@@ -111,6 +144,7 @@ export function createSettingsService(config: ResolvedCollectorConfig): Settings
         })),
       },
       localSources: { standaloneCli: config.localSources.standaloneCli },
+      storage: { transcriptSync: savedTranscriptSync },
       pairing: {
         ...(offer
           ? {
@@ -133,6 +167,7 @@ export function createSettingsService(config: ResolvedCollectorConfig): Settings
 
   const ensureServerToken = (): { token: string; created: boolean } => {
     const secrets = readSecrets();
+    if (!serverTokenAtStart) restartRequired = true;
     if (config.server.token) return { token: config.server.token, created: false };
     if (secrets.serverToken) {
       config.server.token = secrets.serverToken;
@@ -198,6 +233,7 @@ export function createSettingsService(config: ResolvedCollectorConfig): Settings
       });
     }
     restartRequired = true;
+    clearPairingOffers();
     return getPublicSettings();
   };
 
@@ -212,6 +248,7 @@ export function createSettingsService(config: ResolvedCollectorConfig): Settings
       gateway: { ...config.gateway },
       server: { ...config.server },
       localSources: { ...config.localSources },
+      transcriptSync: savedTranscriptSync,
       hubNodes: config.hub.nodes.map((node) => ({ ...node })),
     };
 
@@ -318,6 +355,20 @@ export function createSettingsService(config: ResolvedCollectorConfig): Settings
       draft.localSources.standaloneCli = value;
     }
 
+    if (patch.storage !== undefined) {
+      if (!patch.storage || typeof patch.storage !== "object" || Array.isArray(patch.storage)) {
+        throw new Error("invalid_transcript_sync");
+      }
+      const value = patch.storage.transcriptSync;
+      if (value !== undefined) {
+        if (value !== "enabled" && value !== "disabled") throw new Error("invalid_transcript_sync");
+        const storage = (root.storage && typeof root.storage === "object" ? root.storage : {}) as Record<string, unknown>;
+        storage.transcriptSync = value;
+        root.storage = storage;
+        draft.transcriptSync = value;
+      }
+    }
+
     if (patch.hub?.nodes !== undefined) {
       const hub = (root.hub && typeof root.hub === "object" ? root.hub : {}) as Record<string, unknown>;
       const nodes = [];
@@ -353,6 +404,8 @@ export function createSettingsService(config: ResolvedCollectorConfig): Settings
       draft.hubNodes = resolved;
     }
 
+    if (draft.role === "hub" && draft.hubNodes.length === 0) throw new Error("hub_nodes_required");
+
     writeRawConfig(configPath, root);
     if (secretsChanged) saveSecrets(secretsPath, nextSecrets);
     config.host.id = draft.host.id;
@@ -361,8 +414,10 @@ export function createSettingsService(config: ResolvedCollectorConfig): Settings
     Object.assign(config.gateway, draft.gateway);
     Object.assign(config.server, draft.server);
     config.localSources.standaloneCli = draft.localSources.standaloneCli;
+    savedTranscriptSync = draft.transcriptSync;
     config.hub.nodes = draft.hubNodes;
     restartRequired = true;
+    clearPairingOffers();
     return getPublicSettings();
   };
 

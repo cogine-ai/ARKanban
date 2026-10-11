@@ -1,0 +1,117 @@
+.live-flow-board { --lfb-line: #e3e7ed; --lfb-muted: #65718a; --lfb-ink: #202b42; --lfb-lane-budget: calc(100vh - 325px); padding: 18px; color: var(--lfb-ink); }
+.lfb-has-attention { --lfb-lane-budget: calc(100vh - 525px); }
+.lfb-has-unconfirmed { --lfb-lane-budget: calc(100vh - 380px); }
+.lfb-has-attention.lfb-has-unconfirmed { --lfb-lane-budget: calc(100vh - 580px); }
+.live-flow-board button { font: inherit; cursor: pointer; }
+.live-flow-board button:focus-visible { outline: 3px solid #408bdf; outline-offset: 3px; }
+.lfb-section-heading { display: flex; align-items: center; justify-content: space-between; gap: 16px; }
+.lfb-section-heading h2 { display: flex; align-items: center; gap: 10px; margin: 0; font-size: 16px; font-weight: 650; }
+.lfb-section-heading h2 > span:last-child { color: var(--lfb-muted); font-size: 13px; font-variant-numeric: tabular-nums; }
+.lfb-heading-symbol { width: 23px; height: 23px; flex: 0 0 auto; display: inline-grid; place-content: center; border-radius: 50%; background: #758199; color: #fff; font-size: 15px; font-weight: 750; }
+.lfb-heading-warning { background: #d89a30; }
+.live-flow-board .lfb-text-button { padding: 6px 0; border: 0; background: transparent; color: #306eb0; font-size: 13px; white-space: nowrap; }
+.lfb-attention { margin-bottom: 16px; padding: 14px; border: 1px solid #efdabc; border-radius: 13px; background: #fffcf6; }
+.lfb-attention-cards { display: grid; grid-template-columns: repeat(3, minmax(210px, 1fr)); gap: 12px; margin-top: 12px; }
+.live-flow-board .lfb-attention-cards .lfb-card { width: 100%; }
+.lfb-workspace { display: grid; grid-template-columns: minmax(0, 1fr) 220px; align-items: start; gap: 14px; }
+.lfb-current { overflow: hidden; border: 1px solid var(--lfb-line); border-radius: 12px; background: #fff; }
+.lfb-lanes { max-height: clamp(180px, var(--lfb-lane-budget), 520px); overflow-y: auto; overflow-x: hidden; scrollbar-width: thin; }
+.lfb-lane-head, .lfb-lane { display: grid; grid-template-columns: 136px minmax(0, 2fr) minmax(0, 1.12fr); }
+.lfb-lane-head { min-height: 44px; background: #f9fbfd; color: var(--lfb-muted); font-size: 12px; font-weight: 600; }
+.lfb-lane-head > span { display: flex; align-items: center; padding: 12px 14px; }
+.lfb-lane-head > span + span, .lfb-current-cell { border-left: 1px solid var(--lfb-line); }
+.lfb-lane { border-top: 1px solid var(--lfb-line); }
+.lfb-agent { display: flex; align-items: center; gap: 10px; padding: 14px 10px; min-width: 0; }
+.lfb-avatar { width: 32px; height: 32px; flex: 0 0 auto; display: grid; place-content: center; border-radius: 50%; color: #fff; font-size: 13px; font-weight: 600; }
+.lfb-agent > span:last-child { min-width: 0; }
+.lfb-agent strong { display: block; font-size: 13px; line-height: 1.4; overflow-wrap: anywhere; }
+.lfb-agent small { display: block; margin-top: 4px; color: var(--lfb-muted); font-size: 11px; overflow-wrap: anywhere; }
+.lfb-current-cell { padding: 10px; display: flex; flex-wrap: wrap; align-items: center; align-content: center; gap: 8px; min-width: 0; }
+.live-flow-board .lfb-card { width: 210px; flex: 1 0 210px; min-width: 210px; min-height: 84px; padding: 10px; display: flex; align-items: flex-start; gap: 10px; border: 1px solid #d9e3ef; border-radius: 10px; background: #fcfdff; text-align: left; color: var(--lfb-ink); box-shadow: 0 1px 2px #26385404; transition: border-color 120ms ease, box-shadow 120ms ease; }
+.live-flow-board .lfb-card:hover { border-color: #a7bfdb; box-shadow: 0 3px 8px #2638540b; }
+.live-flow-board .lfb-card[aria-pressed="true"] { outline: 2px solid #408bdf; outline-offset: 1px; }
+.live-flow-board .lfb-card-approval { background: #fffcf5; border-color: #ecd9bb; }
+.live-flow-board .lfb-card-unconfirmed { background: #f8f9fb; border-style: dashed; border-color: #bfc7d3; }
+.lfb-card-copy { flex: 1; min-width: 0; display: grid; gap: 4px; }
+.lfb-card-copy > strong { display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; overflow: hidden; font-size: 14px; font-weight: 620; line-height: 1.35; overflow-wrap: anywhere; }
+.lfb-card-meta { display: flex; flex-wrap: wrap; align-items: baseline; gap: 6px; color: var(--lfb-muted); font-size: 11px; line-height: 1.35; overflow-wrap: anywhere; }
+.lfb-kind { display: inline-flex; align-items: center; gap: 4px; }
+.lfb-kind::before { display: inline-block; width: 7px; height: 7px; border: 1px solid currentColor; border-radius: 2px; content: ""; }
+.lfb-kind-attempt::before { border-radius: 50%; }
+.lfb-card-state { font-size: 11px; line-height: 1.4; color: var(--lfb-muted); overflow-wrap: anywhere; }
+.lfb-state { width: 25px; height: 25px; flex: 0 0 auto; margin-top: 2px; display: grid; place-content: center; font-size: 18px; line-height: 1; }
+.lfb-state-running { border: 3px solid #c6daf3; border-top-color: #3687d4; border-right-color: #3687d4; border-radius: 50%; }
+.lfb-state-running[data-live="true"] { animation: lfb-observed-running 2.8s linear infinite; }
+.lfb-state-approval { border-radius: 50%; background: #dc9a28; color: #fff; font-size: 16px; font-weight: 650; }
+.lfb-state-queued { color: #71809a; font-size: 27px; }
+.lfb-state-unconfirmed { border-radius: 50%; background: #758199; color: #fff; font-size: 15px; font-weight: 650; }
+.live-flow-board .lfb-more { flex: 0 0 auto; min-width: 42px; min-height: 44px; padding: 8px; border: 1px solid var(--lfb-line); border-radius: 9px; background: #f8fafc; color: #587094; font-size: 13px; font-variant-numeric: tabular-nums; }
+.lfb-cell-empty { color: #a5afbe; font-size: 16px; }
+.lfb-current-empty { min-height: 180px; display: grid; place-content: center; justify-items: center; gap: 14px; color: var(--lfb-muted); }
+.lfb-current-empty strong { font-size: 14px; font-weight: 500; }
+.lfb-empty-symbol { width: 44px; height: 44px; display: grid; place-content: center; border: 1px dashed #c7d0dc; border-radius: 50%; color: #8896ac; font-size: 24px; }
+.lfb-loading .lfb-empty-symbol { animation: lfb-observed-running 3s linear infinite; }
+.lfb-schedules { padding: 16px 14px 12px; border: 1px solid var(--lfb-line); border-radius: 12px; background: #fdfefe; }
+.lfb-schedules .lfb-section-heading h2 { font-size: 15px; }
+.lfb-schedules .lfb-section-heading h2 > span:first-child { font-size: 25px; }
+.lfb-schedule-health { display: block; margin: 8px 0 0 34px; color: var(--lfb-muted); font-size: 11px; }
+.lfb-schedule-list { display: grid; gap: 0; margin: 17px 0 0; padding: 0; list-style: none; }
+.lfb-schedules .lfb-schedule-list { max-height: clamp(160px, calc(var(--lfb-lane-budget) - 104px), 420px); overflow-y: auto; scrollbar-width: thin; }
+.lfb-schedule-entry { position: relative; display: grid; grid-template-columns: 22px minmax(0, 1fr); gap: 10px; padding: 0 0 20px; }
+.lfb-schedule-entry::before { position: absolute; left: 10px; top: 23px; bottom: 0; border-left: 1px dashed #c8d2e1; content: ""; }
+.lfb-schedule-entry:last-child::before { bottom: 16px; }
+.lfb-schedule-clock { color: #72819a; font-size: 23px; line-height: 22px; }
+.lfb-schedule-entry time { display: block; color: #60738f; font-size: 13px; font-weight: 600; }
+.lfb-schedule-entry strong { display: block; margin-top: 4px; font-size: 14px; line-height: 1.35; font-weight: 600; overflow-wrap: anywhere; }
+.lfb-schedule-entry div > span, .lfb-schedule-entry small { display: block; margin-top: 5px; font-size: 11px; color: var(--lfb-muted); line-height: 1.4; overflow-wrap: anywhere; }
+.lfb-schedules .lfb-schedule-entry { padding-bottom: 16px; }
+.lfb-schedules .lfb-schedule-entry strong { display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; overflow: hidden; }
+.lfb-schedules .lfb-schedule-entry div > span { overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+.lfb-schedules .lfb-schedule-entry small { display: none; }
+.lfb-zone { display: block; border-top: 1px solid var(--lfb-line); padding-top: 10px; color: var(--lfb-muted); font-size: 10px; overflow-wrap: anywhere; }
+.lfb-schedule-empty { min-height: 96px; display: grid; align-content: center; color: var(--lfb-muted); font-size: 12px; }
+.lfb-schedule-more { margin: 0 0 14px; }
+.live-flow-board .lfb-schedule-toggle { display: none; width: 32px; height: 32px; border: 1px solid var(--lfb-line); border-radius: 8px; background: #fff; color: var(--lfb-muted); }
+.lfb-without-schedules { grid-template-columns: minmax(0, 1fr); }
+.live-flow-board .lfb-unconfirmed-row { width: 100%; margin-top: 14px; padding: 12px 16px; display: flex; align-items: center; gap: 11px; border: 1px solid var(--lfb-line); border-radius: 11px; background: #fafbfd; font-size: 14px; text-align: left; }
+.lfb-unconfirmed-row > span:nth-last-child(2) { color: var(--lfb-muted); font-size: 13px; }
+.lfb-chevron { margin-left: auto; color: var(--lfb-muted); font-size: 22px; }
+.lfb-history { margin-top: 14px; border: 1px solid var(--lfb-line); border-radius: 11px; background: #fff; overflow: hidden; }
+.lfb-history-heading { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; padding: 12px 14px; }
+.live-flow-board .lfb-history-toggle { display: flex; align-items: center; gap: 9px; min-height: 30px; padding: 0; border: 0; background: transparent; text-align: left; }
+.lfb-history-toggle strong { font-size: 14px; }
+.lfb-history-toggle > span:last-child { font-size: 11px; color: var(--lfb-muted); }
+.lfb-fold { color: #71809a; font-size: 24px; transition: transform 120ms ease; }
+.lfb-fold-open { transform: rotate(90deg); }
+.lfb-history-range { font-size: 12px; color: var(--lfb-muted); }
+.lfb-outcomes { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 10px; margin-left: auto; }
+.lfb-outcome { display: inline-flex; align-items: center; gap: 5px; color: #758199; font-size: 10px; white-space: nowrap; }
+.lfb-outcome b { width: 18px; height: 18px; display: inline-grid; place-content: center; border-radius: 50%; background: #eef1f5; font-size: 12px; }
+.lfb-outcome strong { color: #536680; font-size: 12px; font-weight: 600; font-variant-numeric: tabular-nums; }
+.lfb-outcome-success b { background: #e5f1e9; color: #3e8860; }
+.lfb-outcome-error b { background: #fae9e6; color: #b26153; }
+.lfb-partial { font-size: 11px; color: #986c28; }
+.lfb-history-body { border-top: 1px solid var(--lfb-line); }
+.lfb-history-lane { display: grid; grid-template-columns: 136px minmax(0, 1fr); align-items: center; border-bottom: 1px solid var(--lfb-line); }
+.lfb-history-agent { padding: 14px; font-size: 13px; overflow-wrap: anywhere; }
+.lfb-history-agent span { display: block; margin-top: 5px; color: var(--lfb-muted); font-size: 11px; }
+.live-flow-board .lfb-history .stage-cell.stage-settled { max-height: none; min-height: 94px; border-top: 0; border-left: 1px solid var(--lfb-line); padding: 12px; grid-template-columns: repeat(auto-fill, minmax(210px, 1fr)); align-content: start; background: #fff; }
+.live-flow-board .lfb-history .series-group-card { padding: 10px 12px; background: #fbfcfd; border-color: #dce2ea; color: var(--lfb-ink); box-shadow: none; }
+.live-flow-board .lfb-history .series-group-card[data-priority="P0"] { border-left: 3px solid #c68678; }
+.live-flow-board .lfb-history .series-title { font-size: 13px; }
+.live-flow-board .lfb-history .series-subline, .live-flow-board .lfb-history .series-latest, .live-flow-board .lfb-history .series-counts, .live-flow-board .lfb-history .series-confidence { font-size: 11px; }
+.lfb-history-empty { padding: 24px; color: var(--lfb-muted); font-size: 13px; }
+.lfb-record-count { padding-top: 10px; font-size: 11px; color: var(--lfb-muted); text-align: right; }
+.lfb-pagination { display: flex; align-items: center; justify-content: center; gap: 12px; padding: 10px; color: var(--lfb-muted); font-size: 12px; }
+.live-flow-board .lfb-pagination button { width: 32px; height: 32px; border: 1px solid var(--lfb-line); border-radius: 8px; background: #fff; color: #536680; font-size: 22px; }
+.live-flow-board .lfb-pagination button:disabled { opacity: .35; cursor: default; }
+.lfb-collection { max-height: min(70vh, 660px); overflow: auto; padding: 18px; }
+.lfb-collection-list { display: grid; grid-template-columns: repeat(2, minmax(210px, 1fr)); gap: 12px; }
+.lfb-collection-list .lfb-card { width: auto; }
+.lfb-collection .lfb-pagination { position: sticky; bottom: -18px; margin: 12px -18px -18px; border-top: 1px solid var(--lfb-line); background: #fff; }
+@keyframes lfb-observed-running { to { transform: rotate(360deg); } }
+@media (max-width: 1100px) { .lfb-workspace { grid-template-columns: minmax(0, 1fr); } .lfb-schedules { padding: 10px 14px; } .live-flow-board .lfb-schedule-toggle { display: block; } .lfb-schedule-body { display: none; } .lfb-schedules-expanded .lfb-schedule-body { display: block; } .lfb-schedules .lfb-schedule-list { grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 18px; } .lfb-schedules .lfb-schedule-entry::before { display: none; } .lfb-schedule-health { margin-left: 0; } .lfb-schedules .lfb-zone { margin-top: 8px; } }
+@media (min-width: 1600px) { .lfb-workspace { grid-template-columns: minmax(0, 1fr) 260px; } .lfb-lane-head, .lfb-lane { grid-template-columns: 160px minmax(0, 2fr) minmax(0, 1.12fr); } }
+@media (max-width: 900px) { .live-flow-board { padding: 12px; } .lfb-attention-cards { grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); } .lfb-lane-head { display: none; } .lfb-lane { grid-template-columns: minmax(0, 1fr); } .lfb-agent { flex-direction: row; border-bottom: 1px solid var(--lfb-line); padding: 12px; } .lfb-current-cell { border-left: 0; align-items: stretch; } .lfb-current-cell::before { width: 100%; font-size: 11px; font-weight: 600; color: var(--lfb-muted); } .lfb-running-cell::before { content: "In progress"; } .lfb-queued-cell::before { content: "Queued"; } .lfb-current-cell .lfb-card { width: auto; } .lfb-schedules .lfb-schedule-list { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+@media (max-width: 650px) { .lfb-attention { padding: 12px; } .lfb-attention-cards { grid-template-columns: minmax(0, 1fr); } .lfb-attention-cards .lfb-card { width: auto; min-width: 0; } .lfb-history-toggle { flex-wrap: wrap; } .lfb-outcomes { margin-left: 0; } .lfb-history-lane { grid-template-columns: minmax(0, 1fr); } .live-flow-board .lfb-history .stage-cell.stage-settled { border-left: 0; } .lfb-collection-list { grid-template-columns: minmax(0, 1fr); } .lfb-collection-list .lfb-card { min-width: 0; } }
+@media (prefers-reduced-motion: reduce) { .lfb-state-running[data-live="true"], .lfb-loading .lfb-empty-symbol { animation: none; } .live-flow-board .lfb-card, .lfb-fold { transition: none; } }

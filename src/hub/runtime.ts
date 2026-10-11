@@ -64,9 +64,11 @@ export class HubRuntime {
   private lastSettledRange: SettledRange = "7d";
   private revision = 0;
   private stopped = true;
+  private readonly runningHost: CollectorStatus["host"];
 
   constructor(config: ResolvedCollectorConfig) {
     this.config = config;
+    this.runningHost = { id: config.host.id, label: config.host.label, role: config.role };
     this.clients = config.hub.nodes.map(
       (node) =>
         new NodeClient({
@@ -116,7 +118,7 @@ export class HubRuntime {
 
   getStatus(): CollectorStatus {
     return mergeStatus(
-      { id: this.config.host.id, label: this.config.host.label, role: this.config.role },
+      { ...this.runningHost },
       this.startedAt,
       [...this.bundles.values()],
     );
@@ -124,7 +126,7 @@ export class HubRuntime {
 
   getSnapshot(): ActivitySnapshot {
     const snapshot = mergeSnapshots([...this.bundles.values()]);
-    return { ...snapshot, epoch: `hub:${this.config.host.id}`, revision: this.revision };
+    return { ...snapshot, epoch: `hub:${this.runningHost.id}`, revision: this.revision };
   }
 
   async getSettledGroups(range: SettledRange, rangeEnd = Date.now()): Promise<SettledGroupSnapshot> {
@@ -341,7 +343,7 @@ export class HubRuntime {
   private emitChange(topics: RepositoryChange["topics"], reasons: string[]): void {
     this.repository.revision = this.revision;
     const change: RepositoryChange = {
-      epoch: `hub:${this.config.host.id}`,
+      epoch: `hub:${this.runningHost.id}`,
       revision: this.revision,
       topics,
       ids: [],

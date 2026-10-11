@@ -38,9 +38,9 @@ Each machine runs a **node** that still talks only to its local OpenClaw Gateway
 Open **Settings** in the UI:
 
 1. Enter this machine's **Gateway token** (stored in `collector.config.secrets.json`, shown only as `••••last4`).
-2. On each **node**: set listen host to `0.0.0.0` if hubs on the LAN must reach it, then **生成配对码**.
-3. On the **hub**: paste the code + `http://node-ip:47123` under **认领节点**.
-4. Restart the collector when Settings says restart is required.
+2. On each **node**: choose **本机采集 → 局域网访问**, save, and restart Collector. After the configuration is applied, enter the node's LAN address and select **复制连接** to create a one-time connection package.
+3. On the **hub**: choose **汇总多机**, paste the package into **连接包**, inspect the candidate node, and select **连接**.
+4. Save any remaining configuration changes and restart Collector when Settings says restart is required. Settings distinguishes the saved configuration from the one currently running.
 
 ### Manual config file
 
@@ -111,7 +111,9 @@ Task ledger records and observed execution attempts are intentionally separate. 
 
 ## Conversation archive (off by default)
 
-Collector can keep the full text of every conversation from your Gateway in the local SQLite database, so sessions stay readable and searchable while the Gateway is offline. **This is off unless you turn it on**, because it changes what the database contains from operational metadata into your actual conversations:
+Collector can keep the full text of every conversation from your Gateway in the local SQLite database, so sessions stay readable and searchable while the Gateway is offline. **This is off unless you turn it on**, because it changes what the database contains from operational metadata into your actual conversations. Open **Settings → 正文归档**, enable **本地保存正文**, explicitly save, and restart Collector to apply the choice. Turning it off also takes effect after restart and preserves the text already stored; it remains searchable while the Gateway is offline. Hub aggregate mode does not acquire or combine node conversation text.
+
+The same opt-in can be set in the config file before starting Collector:
 
 ```json
 { "storage": { "transcriptSync": "enabled" } }

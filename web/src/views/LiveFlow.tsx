@@ -1,11 +1,37 @@
-import { useMemo } from "react";
+import { useEffect, useMemo, useState } from "react";
 import type { ActivityItem, SettledGroupSummary, SettledRange, UpcomingSchedule } from "../../../src/contracts";
 import { FlowBoard } from "../components/FlowBoard";
-import { RangeSelector } from "../components/RangeSelector";
-import { StatusPills } from "../components/StatusPills";
 import type { KindFilter } from "../lib/board";
-import { statusLabel } from "../lib/format";
+import { formatRelative, statusLabel } from "../lib/format";
+import { Link } from "../router";
 import { useCollector } from "../state/collector-context";
+import "./live-flow.css";
+
+function BoardHealth() {
+  const { status, snapshot, live } = useCollector();
+  const [now, setNow] = useState(Date.now);
+  useEffect(() => {
+    const timer = window.setInterval(() => setNow(Date.now()), 15_000);
+    return () => window.clearInterval(timer);
+  }, []);
+  const observedAt = snapshot?.sync.lastAuthoritativeSnapshotAt ?? snapshot?.generatedAt;
+  const seconds = observedAt ? Math.max(0, Math.floor((now - observedAt) / 1_000)) : undefined;
+  const sources = status?.hosts;
+  const healthy = sources?.filter((host) => host.reachable && host.gatewayConnected === true).length;
+  const partial = sources && healthy !== sources.length;
+  const label = live.state === "reconnecting" || live.state === "stopped"
+    ? "Updates paused"
+    : live.state === "connecting" ? "Connecting" : partial ? "Partial" : statusLabel(status);
+  const good = label === "Live";
+  return (
+    <Link className={`board-health${good ? " is-live" : ""}`} to="/connections" aria-label={`Data sources: ${label}`}>
+      <span className="board-health-dot" aria-hidden="true" />
+      <b>{label}</b>
+      {sources ? <span>{healthy}/{sources.length} sources</span> : null}
+      {seconds !== undefined ? <span title={new Date(observedAt!).toLocaleString()}>{seconds < 60 ? `${seconds}s ago` : formatRelative(observedAt)}</span> : null}
+    </Link>
+  );
+}
 
 /**
  * Kind and query are owned by the app shell rather than by this view: the live
@@ -41,7 +67,7 @@ export function LiveFlowView({
   onSelectOverflow: (agentId: string, groups: SettledGroupSummary[]) => void;
   onOpenIncomingOverflow: (agentId: string, queued: ActivityItem[], schedules: UpcomingSchedule[]) => void;
 }) {
-  const { status, snapshot, settled, error, range, refresh } = useCollector();
+  const { status, snapshot, settled, error, range, refresh, live } = useCollector();
 
   const hostOptions = useMemo(() => {
     if (status?.hosts && status.hosts.length > 0) {
@@ -96,34 +122,11 @@ export function LiveFlowView({
     return { ...settled, groupsByAgent, totalSeries, totalRuns, outcomeCounts };
   }, [settled, hostFilter]);
 
-  const active = visibleOperationalItems.length;
-  const waiting = visibleOperationalItems.filter((item) => item.stage === "waiting" || item.stage === "unresolved").length;
-  const scheduled = visibleSchedules.length;
-  const agentCount = new Set([
-    ...visibleOperationalItems.map((item) => item.agentId),
-    ...visibleSchedules.map((item) => item.agentId),
-    ...Object.keys(visibleSettled?.groupsByAgent ?? {}),
-  ]).size;
-
   return (
-    <>
-      <section className="summary-bar">
-        <div className="summary-copy">
-          <span className="eyebrow">LIVE ACTIVITY</span>
-          <h1>{status?.syncState === "live" ? (active > 0 ? "Activity is flowing" : "Collector is watching") : statusLabel(status)}</h1>
-          <div className="metrics">
-            <span><b>{active}</b> operational</span>
-            <span><b>{scheduled}</b> scheduled next 1h</span>
-            <span className="wait"><b>{waiting}</b> waiting / unresolved</span>
-            <span><b>{visibleSettled?.totalSeries ?? "—"}</b> settled series</span>
-            <span><b>{visibleSettled?.totalRuns ?? "—"}</b> runs · {range}</span>
-            <span><b>{agentCount}</b> agents</span>
-            {hostOptions.length > 1 ? <span><b>{hostOptions.length}</b> hosts</span> : null}
-          </div>
-        </div>
-        <div className="summary-actions">
-          <StatusPills status={status} snapshot={snapshot} settled={visibleSettled} />
-          <div className="filters">
+    <div className="live-flow-view">
+      <section className="live-flow-toolbar">
+        <div className="live-flow-title"><h1>Live flow</h1><BoardHealth /></div>
+        <div className="filters live-flow-filters">
             <label className="search"><span>⌕</span><input value={query} onChange={(event) => onQueryChange(event.target.value)} placeholder="Search activity, schedule or series" aria-label="Search board" /></label>
             {hostOptions.length > 0 ? (
               <label className="host-filter">
@@ -137,16 +140,13 @@ export function LiveFlowView({
               </label>
             ) : null}
             <div className="segmented" aria-label="Activity kind"><button aria-pressed={kind === "all"} onClick={() => onKindChange("all")}>All</button><button aria-pressed={kind === "task"} onClick={() => onKindChange("task")}>Tasks</button><button aria-pressed={kind === "attempt"} onClick={() => onKindChange("attempt")}>Attempts</button></div>
-            <RangeSelector value={range} onChange={onRangeChange} />
             <button className="refresh-button" onClick={() => void refresh()} aria-label="Refresh snapshots">↻</button>
-          </div>
         </div>
       </section>
       <main className="board-shell">
-        {error ? <div className="connection-banner"><span />{error}<button onClick={() => void refresh()}>Retry now</button></div> : null}
-        <section className="flow-board surface" aria-label="Adaptive activity flowboard">
+        {error && live.state === "open" ? <div className="live-flow-error" role="status"><span>{error}</span><button onClick={() => void refresh()}>Refresh</button></div> : null}
+        <section className="flow-board" aria-label="Observed activity">
           <FlowBoard
-            key={range}
             items={visibleOperationalItems}
             schedules={visibleSchedules}
             scheduleState={snapshot?.schedule}
@@ -154,6 +154,10 @@ export function LiveFlowView({
             range={range}
             kind={kind}
             query={query}
+            status={status}
+            loading={!snapshot}
+            paused={live.state !== "open"}
+            onRangeChange={onRangeChange}
             selectedId={selectedId}
             selectedSeriesKey={selectedSeriesKey}
             onSelectActivity={onSelectActivity}
@@ -163,6 +167,6 @@ export function LiveFlowView({
           />
         </section>
       </main>
-    </>
+    </div>
   );
 }

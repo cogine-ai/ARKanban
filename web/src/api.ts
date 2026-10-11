@@ -71,9 +71,20 @@ export type PublicSettings = {
   server: { host: string; port: number; lanExposed: boolean; token: PublicSecretState };
   hub: { nodes: Array<{ id: string; url: string; label?: string; token: PublicSecretState }> };
   localSources: { standaloneCli: "enabled" | "disabled" };
+  storage: { transcriptSync: "enabled" | "disabled" };
   pairing: { active?: { code: string; expiresAt: number; hostId: string; label: string } };
   paths: { config: string; secrets: string };
   restartRequired: boolean;
+  /** Startup configuration, kept separate from the saved configuration above. */
+  runtime: {
+    role: "node" | "hub" | "both";
+    host: { id: string; label: string };
+    server: { host: string; port: number; lanExposed: boolean };
+    gateway: { name: string; url: string };
+    storage: { transcriptSync: "enabled" | "disabled" };
+    nodeIds: string[];
+    startedAt: number;
+  };
 };
 
 /**
@@ -145,7 +156,7 @@ export const collectorApi = {
     getJson<SettledSeriesRuns>(
       `/api/v1/settled-groups/${encodeURIComponent(seriesKey)}/runs?range=${range}&rangeEnd=${rangeEnd}`,
     ),
-  detail: (id: string) => getJson<ActivityDetail>(`/api/v1/activities/${encodeURIComponent(id)}`),
+  detail: (id: string, signal?: AbortSignal) => getJson<ActivityDetail>(`/api/v1/activities/${encodeURIComponent(id)}`, signal),
   agents: () => getJson<{ agents: AgentOverview[] }>("/api/v1/agents"),
   agent: (agentId: string) => getJson<AgentDetail>(`/api/v1/agents/${encodeURIComponent(agentId)}`),
   /**
@@ -166,7 +177,7 @@ export const collectorApi = {
     getJson<{ items: SessionSummary[]; nextCursor?: string }>(
       `/api/v1/sessions?${sessionQuery(filters, cursor, limit)}`,
     ),
-  session: (sessionKey: string) => getJson<SessionDetail>(`/api/v1/sessions/${encodeURIComponent(sessionKey)}`),
+  session: (sessionKey: string, signal?: AbortSignal) => getJson<SessionDetail>(`/api/v1/sessions/${encodeURIComponent(sessionKey)}`, signal),
   sessionActivities: (sessionKey: string) =>
     getJson<{ activities: ActivityItem[] }>(`/api/v1/sessions/${encodeURIComponent(sessionKey)}/activities`),
   sessionMessages: (sessionKey: string, afterSeq?: number) => {

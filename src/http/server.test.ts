@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import type { FastifyInstance } from "fastify";
@@ -7,23 +7,26 @@ import { attemptPatch } from "../activity/projector.js";
 import { SIGNAL_ALGORITHM_VERSION } from "../activity/session-signals.js";
 import { CollectorRuntime } from "../collector/runtime.js";
 import type { AgentOverview, AgentRollupWindow } from "../contracts.js";
-import type { ResolvedCollectorConfig } from "../config.js";
+import { loadConfig, type ResolvedCollectorConfig } from "../config.js";
+import { HubRuntime } from "../hub/runtime.js";
+import { clearPairingOffers } from "../settings/pairing.js";
 import type { AgentWrite, SessionWrite } from "../storage/repository.js";
 import { createHttpServer } from "./server.js";
 
 const cleanups: Array<() => Promise<void> | void> = [];
 
 afterEach(async () => {
+  clearPairingOffers();
   for (const cleanup of cleanups.splice(0).reverse()) await cleanup();
 });
 
-function runtimeFixture(retentionDays = 30): { runtime: CollectorRuntime; config: ResolvedCollectorConfig } {
+function runtimeFixture(retentionDays = 30, transcriptSync: "enabled" | "disabled" = "enabled", gatewayUrl = "ws://127.0.0.1:18789"): { runtime: CollectorRuntime; config: ResolvedCollectorConfig } {
   const directory = mkdtempSync(path.join(tmpdir(), "collector-http-"));
   const configPath = path.join(directory, "collector.config.json");
   const config: ResolvedCollectorConfig = {
     host: { id: "local", label: "local" },
     role: "node",
-    gateway: { name: "test", url: "ws://127.0.0.1:18789", tokenEnv: "TEST_TOKEN", token: "secret" },
+    gateway: { name: "test", url: gatewayUrl, tokenEnv: "TEST_TOKEN", token: "secret" },
     server: { host: "127.0.0.1", port: 47_123 },
     hub: { nodes: [] },
     localSources: { standaloneCli: "disabled" },
@@ -34,7 +37,7 @@ function runtimeFixture(retentionDays = 30): { runtime: CollectorRuntime; config
       sessionRetentionDays: 90,
       transcriptRetentionDays: 180,
       transcriptMaxBytes: 64 * 1024 * 1024,
-      transcriptSync: "enabled",
+      transcriptSync,
     },
     reconcile: { tasksMs: 15_000, sessionsMs: 8_000 },
     ui: { recentLimit: 200 },
@@ -53,7 +56,7 @@ function runtimeFixture(retentionDays = 30): { runtime: CollectorRuntime; config
         terminalRetentionDays: retentionDays,
         usageRetentionDays: 14,
         sessionRetentionDays: 90,
-        transcriptSync: "enabled",
+        transcriptSync,
       },
     }),
   );
@@ -81,8 +84,7 @@ describe("settled group HTTP API", () => {
    * browser page. The CLI has always redacted it; these routes had not.
    */
   it("does not serve the Gateway credentials to the page", async () => {
-    const { runtime, config } = runtimeFixture();
-    config.gateway.url = "ws://operator:hunter2@127.0.0.1:18789/rpc?token=abc";
+    const { runtime, config } = runtimeFixture(30, "enabled", "ws://operator:hunter2@127.0.0.1:18789/rpc?token=abc");
     const app = await createHttpServer(runtime, config);
     cleanups.push(() => app.close());
 
@@ -391,6 +393,57 @@ describe("transcript HTTP API", () => {
     expect(response.statusCode).toBe(200);
     expect(response.json()).toMatchObject({ enabled: true, retentionDays: 180 });
     expect(response.body).not.toContain("登录接口");
+  });
+
+  it("saves archive shutdown as pending and preserves searchable text after restarting with it off", async () => {
+    const app = await serverWithTranscript();
+    const saved = await app.inject({ method: "PUT", url: "/api/v1/settings", payload: { storage: { transcriptSync: "disabled" } } });
+    expect(saved.statusCode).toBe(200);
+    expect(saved.json()).toMatchObject({ storage: { transcriptSync: "disabled" }, runtime: { storage: { transcriptSync: "enabled" } }, restartRequired: true });
+    expect((await app.inject({ method: "GET", url: "/api/v1/transcripts/status" })).json()).toMatchObject({ enabled: true, messageCount: 2 });
+
+    const reloadedConfig = loadConfig(saved.json().paths.config, { TEST_TOKEN: "secret" });
+    const reloadedRuntime = new CollectorRuntime(reloadedConfig);
+    cleanups.push(() => reloadedRuntime.stop());
+    const restarted = await createHttpServer(reloadedRuntime, reloadedConfig);
+    cleanups.push(() => restarted.close());
+    expect((await restarted.inject({ method: "GET", url: "/api/v1/transcripts/status" })).json()).toMatchObject({ enabled: false, messageCount: 2 });
+    expect((await restarted.inject({ method: "GET", url: "/api/v1/settings" })).json()).toMatchObject({ storage: { transcriptSync: "disabled" }, runtime: { storage: { transcriptSync: "disabled" } }, restartRequired: false });
+    const search = await restarted.inject({ method: "GET", url: "/api/v1/search/messages?q=login" });
+    expect(search.statusCode).toBe(200);
+    expect(search.json().hits).toHaveLength(1);
+  });
+
+  it("keeps archive acquisition off until a saved enable choice is applied by a new runtime", async () => {
+    const { runtime, config } = runtimeFixture(30, "disabled");
+    const app = await createHttpServer(runtime, config);
+    cleanups.push(() => app.close());
+    const saved = await app.inject({ method: "PUT", url: "/api/v1/settings", payload: { storage: { transcriptSync: "enabled" } } });
+    expect(saved.statusCode).toBe(200);
+    expect(saved.json()).toMatchObject({ storage: { transcriptSync: "enabled" }, runtime: { storage: { transcriptSync: "disabled" } }, restartRequired: true });
+    expect((await app.inject({ method: "GET", url: "/api/v1/transcripts/status" })).json().enabled).toBe(false);
+    expect(runtime.config.storage.transcriptSync).toBe("disabled");
+
+    const reloadedConfig = loadConfig(config.configPath, { TEST_TOKEN: "secret" });
+    const reloadedRuntime = new CollectorRuntime(reloadedConfig);
+    cleanups.push(() => reloadedRuntime.stop());
+    const restarted = await createHttpServer(reloadedRuntime, reloadedConfig);
+    cleanups.push(() => restarted.close());
+    expect((await restarted.inject({ method: "GET", url: "/api/v1/transcripts/status" })).json().enabled).toBe(true);
+  });
+
+  it("rejects malformed archive settings without changing saved or running policy", async () => {
+    const { runtime, config } = runtimeFixture();
+    const app = await createHttpServer(runtime, config);
+    cleanups.push(() => app.close());
+    const original = readFileSync(config.configPath, "utf8");
+    for (const storage of [null, [], "enabled", { transcriptSync: "automatic" }, { transcriptSync: null }]) {
+      const response = await app.inject({ method: "PUT", url: "/api/v1/settings", payload: { host: { label: "Partial change" }, storage } });
+      expect(response.statusCode).toBe(400);
+      expect(response.json()).toEqual({ error: "invalid_transcript_sync" });
+    }
+    expect(readFileSync(config.configPath, "utf8")).toBe(original);
+    expect((await app.inject({ method: "GET", url: "/api/v1/settings" })).json()).toMatchObject({ host: { label: "local" }, storage: { transcriptSync: "enabled" }, runtime: { storage: { transcriptSync: "enabled" } }, restartRequired: false });
   });
 });
 
@@ -840,7 +893,7 @@ describe("browser-facing guards", () => {
     expect(response.json()).toMatchObject({ error: "pairing_code_invalid" });
   });
 
-  it("accepts pairing offer with application/json and an empty body", async () => {
+  it("parses an empty pairing JSON body but requires applied LAN access", async () => {
     const app = await server();
     const response = await app.inject({
       method: "POST",
@@ -848,9 +901,9 @@ describe("browser-facing guards", () => {
       headers: { "content-type": "application/json" },
       payload: "",
     });
-    expect(response.statusCode).toBe(200);
-    expect(response.json()).toMatchObject({ hostId: "local", createdToken: expect.any(Boolean) });
-    expect(typeof response.json().code).toBe("string");
+    expect(response.statusCode).toBe(409);
+    expect(response.json()).toMatchObject({ error: "pairing_requires_lan" });
+    expect((await app.inject({ method: "GET", url: "/api/v1/settings" })).json().server.token.configured).toBe(false);
   });
 
   it("lets the loopback operator UI reach Settings when bound off loopback", async () => {
@@ -892,6 +945,113 @@ describe("browser-facing guards", () => {
     expect(response.json()).toMatchObject({ error: "invalid_node_url" });
   });
 
+  it("exposes startup settings separately from a saved LAN configuration and shares only after reload", async () => {
+    const { runtime, config } = runtimeFixture();
+    const startedAt = runtime.getStatus().process.startedAt;
+    const app = await createHttpServer(runtime, config);
+    cleanups.push(() => app.close());
+
+    const saved = await app.inject({
+      method: "PUT",
+      url: "/api/v1/settings",
+      payload: { server: { host: "0.0.0.0" }, host: { label: "Renamed node" } },
+    });
+    expect(saved.statusCode).toBe(200);
+    expect(saved.json()).toMatchObject({
+      restartRequired: true,
+      host: { label: "Renamed node" },
+      server: { lanExposed: true, token: { configured: true } },
+      runtime: { host: { label: "local" }, server: { lanExposed: false }, startedAt },
+    });
+    expect((await app.inject({ method: "GET", url: "/api/v1/meta", headers: { host: "192.168.1.10:47123" } })).statusCode).toBe(403);
+    const blocked = await app.inject({ method: "POST", url: "/api/v1/pairing/offer", payload: {} });
+    expect(blocked.statusCode).toBe(409);
+    expect(blocked.json()).toMatchObject({ error: "pairing_restart_required" });
+    expect((await app.inject({ method: "GET", url: "/api/v1/settings" })).json().pairing.active).toBeUndefined();
+
+    // Rebuild the HTTP surface from disk without starting or connecting a Gateway.
+    const reloadedConfig = loadConfig(config.configPath, { TEST_TOKEN: "secret" });
+    const restarted = await createHttpServer(runtime, reloadedConfig);
+    cleanups.push(() => restarted.close());
+    const offer = await restarted.inject({ method: "POST", url: "/api/v1/pairing/offer", payload: {} });
+    expect(offer.statusCode).toBe(200);
+    expect(offer.json()).toMatchObject({ hostId: "local", label: "Renamed node", createdToken: false, restartRequired: false });
+    expect((await restarted.inject({ method: "GET", url: "/api/v1/settings" })).json().runtime.server.lanExposed).toBe(true);
+    expect((await restarted.inject({ method: "GET", url: "/api/v1/meta", headers: { host: "192.168.1.10:47123" } })).statusCode).toBe(401);
+  });
+
+  it("reports the startup host and Gateway until a saved source change is applied by a new runtime", async () => {
+    const { runtime, config } = runtimeFixture();
+    const app = await createHttpServer(runtime, config);
+    cleanups.push(() => app.close());
+    const before = (await app.inject({ method: "GET", url: "/api/v1/meta" })).json();
+    const saved = await app.inject({
+      method: "PUT", url: "/api/v1/settings",
+      payload: { host: { id: "renamed-node", label: "Renamed node" }, gateway: { name: "new-source", url: "ws://127.0.0.1:18790" } },
+    });
+    expect(saved.statusCode).toBe(200);
+    expect(saved.json()).toMatchObject({ restartRequired: true, host: { id: "renamed-node" }, runtime: { host: { id: before.host.id, label: before.host.label }, gateway: { name: before.gateway.name, url: before.gateway.endpoint } } });
+    const pending = (await app.inject({ method: "GET", url: "/api/v1/meta" })).json();
+    expect(pending.host).toEqual(before.host);
+    expect(pending.gateway).toEqual(before.gateway);
+    expect(pending.epoch).toBe(before.epoch);
+
+    const restartedConfig = loadConfig(config.configPath, { TEST_TOKEN: "secret" });
+    const restartedRuntime = new CollectorRuntime(restartedConfig);
+    cleanups.push(() => restartedRuntime.stop());
+    const restarted = await createHttpServer(restartedRuntime, restartedConfig);
+    cleanups.push(() => restarted.close());
+    const applied = (await restarted.inject({ method: "GET", url: "/api/v1/meta" })).json();
+    expect(applied).toMatchObject({ host: { id: "renamed-node", label: "Renamed node", role: "node" }, gateway: { name: "new-source", endpoint: "ws://127.0.0.1:18790/" } });
+  });
+
+  it("prepares a missing node credential without minting a code for an unauthenticated startup", async () => {
+    const { runtime, config } = runtimeFixture();
+    config.server.host = "0.0.0.0";
+    const app = await createHttpServer(runtime, config);
+    cleanups.push(() => app.close());
+    const response = await app.inject({ method: "POST", url: "/api/v1/pairing/offer", payload: {} });
+    expect(response.statusCode).toBe(409);
+    expect(response.json()).toMatchObject({ error: "pairing_restart_required" });
+    const settings = (await app.inject({ method: "GET", url: "/api/v1/settings" })).json();
+    expect(settings).toMatchObject({ restartRequired: true, server: { token: { configured: true } } });
+    expect(settings.pairing.active).toBeUndefined();
+  });
+
+  it("does not offer connection codes from the hub surface", async () => {
+    const { config } = runtimeFixture();
+    config.role = "hub";
+    config.server.host = "0.0.0.0";
+    config.server.token = "hub-secret";
+    config.hub.nodes = [{ id: "desk-a", url: "http://192.168.1.20:47123", tokenEnv: "NODE_TOKEN", token: "node-token" }];
+    const hub = new HubRuntime(config);
+    const app = await createHttpServer(hub, config);
+    cleanups.push(() => hub.stop(), () => app.close());
+    const response = await app.inject({ method: "POST", url: "/api/v1/pairing/offer", payload: {} });
+    expect(response.statusCode).toBe(409);
+    expect(response.json()).toMatchObject({ error: "pairing_requires_node" });
+  });
+
+  it("can share the local Collector in the compatibility both role", async () => {
+    const { runtime, config } = runtimeFixture();
+    config.role = "both";
+    config.server.host = "0.0.0.0";
+    config.server.token = "node-secret";
+    const app = await createHttpServer(runtime, config);
+    cleanups.push(() => app.close());
+    const response = await app.inject({ method: "POST", url: "/api/v1/pairing/offer", payload: {} });
+    expect(response.statusCode).toBe(200);
+    expect((await app.inject({ method: "GET", url: "/api/v1/settings" })).json().runtime.role).toBe("both");
+  });
+
+  it("rejects saving an empty hub and keeps the local role", async () => {
+    const app = await server();
+    const response = await app.inject({ method: "PUT", url: "/api/v1/settings", payload: { role: "hub" } });
+    expect(response.statusCode).toBe(400);
+    expect(response.json()).toMatchObject({ error: "hub_nodes_required" });
+    expect((await app.inject({ method: "GET", url: "/api/v1/settings" })).json()).toMatchObject({ role: "node", restartRequired: false });
+  });
+
   it("accepts an authenticated LAN-style Host when a server token is configured", async () => {
     const { runtime, config } = runtimeFixture();
     config.server.host = "0.0.0.0";
@@ -930,6 +1090,43 @@ describe("browser-facing guards", () => {
 
     expect(response.statusCode).toBe(400);
     expect(response.json()).toMatchObject({ error: "repeated_query_parameter", parameter: "agentId" });
+  });
+});
+
+describe("HTML style nonces", () => {
+  it("uses a fresh matching style nonce for every entry route while keeping static assets and scripts restricted", async () => {
+    const { runtime, config } = runtimeFixture();
+    const webRoot = mkdtempSync(path.join(tmpdir(), "collector-web-"));
+    cleanups.push(() => rmSync(webRoot, { recursive: true, force: true }));
+    mkdirSync(path.join(webRoot, "assets"));
+    writeFileSync(path.join(webRoot, "index.html"), '<!doctype html><html><head><title>Collector</title></head><body><div id="root"></div><script src="/assets/main.js"></script></body></html>');
+    writeFileSync(path.join(webRoot, "assets", "main.js"), "console.log('collector');");
+    const app = await createHttpServer(runtime, config, undefined, { webRoot });
+    cleanups.push(() => app.close());
+
+    const nonces = new Set<string>();
+    for (const url of ["/", "/index.html", "/sessions/example", "/"]) {
+      const response = await app.inject({ method: "GET", url });
+      expect(response.statusCode).toBe(200);
+      expect(response.headers["content-type"]).toContain("text/html");
+      expect(response.headers["cache-control"]).toBe("no-store");
+      const nonce = response.body.match(/<meta name="collector-style-nonce" content="([A-Za-z0-9+/]{24})">/)?.[1];
+      expect(nonce).toBeDefined();
+      const policy = response.headers["content-security-policy"] as string;
+      expect(policy).toContain(`style-src 'self' 'nonce-${nonce}'`);
+      expect(policy).toContain("script-src 'self';");
+      expect(policy).not.toContain("unsafe-inline");
+      expect(policy).not.toContain("unsafe-eval");
+      expect(response.body).not.toContain("<style");
+      expect(response.body).toContain('<script src="/assets/main.js"></script>');
+      nonces.add(nonce!);
+    }
+    expect(nonces.size).toBe(4);
+
+    const asset = await app.inject({ method: "GET", url: "/assets/main.js" });
+    expect(asset.statusCode).toBe(200);
+    expect(asset.body).toBe("console.log('collector');");
+    expect(asset.headers["content-security-policy"]).not.toContain("nonce-");
   });
 });
 

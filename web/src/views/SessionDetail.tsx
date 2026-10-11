@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import type {
   ActivityItem,
   ArchivedMessage,
@@ -13,6 +13,7 @@ import {
   type SessionDetail as SessionDetailData,
 } from "../api";
 import { GradeChip } from "../components/GradeChip";
+import { CopyReference, SessionSource } from "../components/SessionSource";
 import { Timestamp } from "../components/Timestamp";
 import { TranscriptText } from "../components/TranscriptText";
 import {
@@ -27,6 +28,7 @@ import {
 } from "../lib/format";
 import { Link } from "../router";
 import { useCollector } from "../state/collector-context";
+import "./session-detail.css";
 
 /**
  * How long typing settles before the archive is searched.
@@ -51,7 +53,7 @@ function SignalPanel({ signals }: { signals?: SessionSignals }) {
     return (
       <div className="detail-panel">
         <h2>Signals</h2>
-        <p className="muted">Not scored yet.</p>
+        <p className="session-reading-state muted"><span aria-hidden="true">?</span>Not scored</p>
       </div>
     );
   }
@@ -79,7 +81,7 @@ function SignalPanel({ signals }: { signals?: SessionSignals }) {
           ))}
         </ul>
       ) : (
-        <p className="muted">No penalties charged.</p>
+        <p className="session-reading-state muted"><span aria-hidden="true">○</span>No penalties</p>
       )}
       {/* Shown, not hidden: the grade is heuristic and the version is what makes
           a number from last week comparable to one from today. */}
@@ -95,16 +97,16 @@ function UsagePanel({ usage, coverage }: { usage?: SessionUsage; coverage: strin
     return (
       <div className="detail-panel">
         <h2>Usage</h2>
-        <p className="muted">
+        <p className="session-reading-state muted"><span aria-hidden="true">?</span>
           {coverage === "unavailable"
-            ? "The Gateway does not report usage."
+            ? "Usage unavailable"
             : coverage === "unauthorized"
-              ? "This token lacks the usage scope."
+              ? "Usage permission missing"
               : coverage === "unreported"
-                ? "The Gateway was asked and reported no usage for this session. Its harness records no token counts, so there is nothing to price — not a session that cost nothing."
+                ? "Usage unreported"
                 : coverage === "error"
-                  ? "The last usage read failed. Nothing here has been measured yet."
-                  : "No reading collected for this session yet."}
+                  ? "Usage read failed"
+                  : "Usage not observed"}
         </p>
       </div>
     );
@@ -137,7 +139,12 @@ function TranscriptPanel({ sessionKey, revision }: { sessionKey: string; revisio
   const [error, setError] = useState<string>();
   const [loadingMore, setLoadingMore] = useState(false);
   const [query, setQuery] = useState("");
-  const [hits, setHits] = useState<ArchivedMessage[]>();
+  const [searchResult, setSearchResult] = useState<{
+    sessionKey: string;
+    query: string;
+    messages: ArchivedMessage[];
+    truncated: boolean;
+  }>();
   const [searching, setSearching] = useState(false);
 
   useEffect(() => {
@@ -207,7 +214,7 @@ function TranscriptPanel({ sessionKey, revision }: { sessionKey: string; revisio
   useEffect(() => {
     const needle = query.trim();
     if (needle.length === 0) {
-      setHits(undefined);
+      setSearchResult(undefined);
       return;
     }
     const controller = new AbortController();
@@ -218,7 +225,7 @@ function TranscriptPanel({ sessionKey, revision }: { sessionKey: string; revisio
     // `error` is deliberately left alone: it also carries a failure to load the
     // transcript itself, and clearing it here would erase the only explanation
     // for an empty panel.
-    setHits(undefined);
+    setSearchResult(undefined);
     setSearching(true);
     const timer = setTimeout(() => {
       void (async () => {
@@ -231,7 +238,7 @@ function TranscriptPanel({ sessionKey, revision }: { sessionKey: string; revisio
           // answered runs its continuation regardless, so the request has to say
           // whether it is still the one being asked before it writes to the panel.
           if (controller.signal.aborted) return;
-          setHits(result.hits.map((hit) => hit.message));
+          setSearchResult({ sessionKey, query: needle, messages: result.hits.map((hit) => hit.message), truncated: result.truncated });
         } catch (cause) {
           // A cancelled search is not a failure to report; the next keystroke's
           // search is already on its way.
@@ -249,7 +256,9 @@ function TranscriptPanel({ sessionKey, revision }: { sessionKey: string; revisio
   }, [query, sessionKey]);
 
   const searchActive = query.trim().length > 0;
-  const shown = searchActive ? (hits ?? []) : (messages ?? []);
+  const currentSearchResult = searchResult?.sessionKey === sessionKey && searchResult.query === query.trim()
+    ? searchResult : undefined;
+  const shown = searchActive ? (currentSearchResult?.messages ?? []) : (messages ?? []);
   const archived = sync?.syncedCount ?? 0;
   const remaining = messages === undefined ? 0 : Math.max(0, archived - messages.length);
 
@@ -263,7 +272,7 @@ function TranscriptPanel({ sessionKey, revision }: { sessionKey: string; revisio
         {sync === undefined
           ? "Loading…"
           : sync.syncedCount === 0
-            ? "Nothing archived for this session."
+            ? "No archived messages"
             : `${sync.syncedCount} messages · ${formatBytes(sync.syncedBytes)} · ${sync.complete ? "complete" : "partial"}${sync.syncedAt ? ` · synced ${formatRelative(sync.syncedAt)}` : ""}`}
         {sync?.errorCode ? ` · last sync failed (${sync.errorCode})` : ""}
       </p>
@@ -271,18 +280,20 @@ function TranscriptPanel({ sessionKey, revision }: { sessionKey: string; revisio
           read as a sequence of clock times, and those times mean nothing unless
           the reader knows the zone they are being shown in. */}
       {messages && messages.length > 0 ? (
-        <p className="transcript-zone muted">Times shown in {localZoneLabel()}.</p>
+        <p className="transcript-zone muted">{localZoneLabel()}</p>
       ) : null}
 
       {error ? <div className="inline-error">{error}</div> : null}
 
       {messages && messages.length > 0 ? (
         <label className="transcript-search">
-          <span className="eyebrow">FIND IN TRANSCRIPT</span>
+          <span className="sr-only">Find in transcript</span>
           <input type="search" value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Search this session" />
           {searchActive ? (
             <small className="muted">
-              {searching ? "searching the archive…" : `${shown.length} matching ${shown.length === 1 ? "message" : "messages"}`}
+              {searching ? "Searching…" : currentSearchResult?.truncated
+                ? `${shown.length} shown · Results limited`
+                : `${shown.length} matching ${shown.length === 1 ? "message" : "messages"}`}
             </small>
           ) : null}
         </label>
@@ -292,7 +303,7 @@ function TranscriptPanel({ sessionKey, revision }: { sessionKey: string; revisio
           rather than left to be inferred from where the scrollbar stops. */}
       {!searchActive && messages && remaining > 0 ? (
         <p className="transcript-truncation muted">
-          Showing the oldest {messages.length} of {archived} archived messages.
+          Oldest {messages.length} / {archived} messages
         </p>
       ) : null}
 
@@ -352,7 +363,7 @@ function TimelinePanel({ activities }: { activities?: ActivityItem[] }) {
       {activities === undefined ? (
         <p className="muted">Loading…</p>
       ) : activities.length === 0 ? (
-        <p className="muted">No activity is attributed to this session.</p>
+        <p className="session-reading-state muted"><span aria-hidden="true">○</span>No attributed activity</p>
       ) : (
         <ol className="detail-timeline">
           {activities.map((activity) => (
@@ -381,11 +392,15 @@ export function SessionDetailView({ sessionKey }: { sessionKey: string }) {
   // when the reader follows a link from here. Only the newest request may write:
   // an earlier one landing later would show another session under this URL.
   const generation = useRef(0);
+  const detailController = useRef<AbortController | undefined>(undefined);
   const reload = useCallback(async () => {
     const requested = (generation.current += 1);
+    detailController.current?.abort();
+    const controller = new AbortController();
+    detailController.current = controller;
     try {
       const [session, timeline] = await Promise.all([
-        collectorApi.session(sessionKey),
+        collectorApi.session(sessionKey, controller.signal),
         collectorApi.sessionActivities(sessionKey),
       ]);
       if (requested !== generation.current) return;
@@ -405,7 +420,12 @@ export function SessionDetailView({ sessionKey }: { sessionKey: string }) {
     setActivities(undefined);
     setError(undefined);
     void reload();
-    return subscribeTopics(["sessions", "activities", "usage"], () => void reload());
+    const unsubscribe = subscribeTopics(["sessions", "activities", "usage"], () => void reload());
+    return () => {
+      generation.current += 1;
+      detailController.current?.abort();
+      unsubscribe();
+    };
   }, [reload, subscribeTopics]);
 
   useEffect(
@@ -422,33 +442,50 @@ export function SessionDetailView({ sessionKey }: { sessionKey: string }) {
     );
   }
 
-  if (!detail) return <section className="surface view-surface"><div className="simple-empty">Loading session…</div></section>;
-
-  const { lineage } = detail;
-  const hasLineage = Object.values(lineage).some((value) => value !== undefined);
+  if (!detail || detail.sessionKey !== sessionKey) return <section className="surface view-surface"><div className="simple-empty">Loading session…</div></section>;
 
   return (
     <section className="surface view-surface session-detail">
       <div className="view-heading">
         <div>
-          <span className="eyebrow">
+          <nav className="session-detail-breadcrumb" aria-label="Session navigation">
+            <Link to="/sessions">← Sessions</Link><span aria-hidden="true">/</span>
             <Link to={`/sessions?agentId=${encodeURIComponent(detail.agentId)}`}>{detail.agentId}</Link>
-          </span>
+          </nav>
           <h1>{detail.label}</h1>
-          <code className="session-key">{detail.sessionKey}</code>
+          <div className="session-summary-chips">
+            <span>{detail.kindHint}</span>{detail.runtime ? <span>{detail.runtime}</span> : null}{detail.model ? <span>{detail.model}</span> : null}
+          </div>
         </div>
         <span className="detail-badges">
           <GradeChip signals={detail.signals} />
-          <span className="session-state" data-active={detail.hasActiveRun ? "true" : "false"}>
-            {detail.archived ? "archived" : detail.hasActiveRun ? "running" : "idle"}
+          <span className="session-state" data-active={!detail.archived && detail.hasActiveRun ? "true" : "false"}>
+            <span className="session-run-symbol" aria-hidden="true" />{detail.archived ? "Archived" : detail.hasActiveRun ? "Running" : "Idle"}
           </span>
         </span>
       </div>
 
+      <SessionSource session={detail} />
+
+      <div className="session-observation-strip">
+        <span><b>{detail.activityCount}</b> activities</span>
+        <span title={formatExact(detail.lastActivityAt)}>Last activity {formatRelative(detail.lastActivityAt)}</span>
+        <div className="session-coverage" aria-label="Observation coverage">
+          {Object.entries(detail.coverage).map(([source, state]) => <span key={source} className="session-coverage-chip" data-state={state}><i aria-hidden="true" />{source} · {state.replaceAll("_", " ")}</span>)}
+        </div>
+      </div>
+
       <div className="detail-grid">
-        <div className="detail-panel">
-          <h2>Archive</h2>
-          <div className="fact-grid">
+        <SignalPanel signals={detail.signals} />
+        <UsagePanel usage={detail.usage} coverage={detail.coverage.usage} />
+      </div>
+
+      <TimelinePanel activities={activities} />
+
+      <details className="session-metadata">
+        <summary>Session fields</summary>
+        <div className="session-source-reference-row"><span>Session key</span><code>{detail.sessionKey}</code><CopyReference value={detail.sessionKey} label="Copy session key" /></div>
+        <div className="fact-grid">
             <Fact label="KIND" value={detail.kindHint} />
             <Fact label="RUNTIME" value={detail.runtime} />
             <Fact label="MODEL" value={detail.model} />
@@ -465,38 +502,10 @@ export function SessionDetailView({ sessionKey }: { sessionKey: string }) {
               value={formatDateTime(detail.lastActivityAt)}
               title={formatExact(detail.lastActivityAt)}
             />
-          </div>
-          {/* Coverage per source, so a blank field reads as "not observed"
-              rather than "not there". */}
-          <footer className="detail-foot muted">
-            index {detail.coverage.index} · detail {detail.coverage.detail} · usage {detail.coverage.usage} · messages{" "}
-            {detail.coverage.messages}
-          </footer>
         </div>
+      </details>
 
-        <div className="detail-panel">
-          <h2>Lineage</h2>
-          {hasLineage ? (
-            <div className="fact-grid">
-              <Fact label="PARENT SESSION" value={lineage.parentSessionKey} />
-              <Fact label="PREVIOUS GENERATION" value={lineage.previousSessionId} />
-              <Fact label="FORKED FROM" value={lineage.forkSourceKey} />
-              <Fact label="SPAWNED BY" value={lineage.spawnedBy} />
-              <Fact label="DEPTH" value={lineage.spawnDepth} />
-              <Fact label="SUBAGENT ROLE" value={lineage.subagentRole} />
-              <Fact label="WORKTREE" value={lineage.worktreeBranch} />
-            </div>
-          ) : (
-            <p className="muted">No lineage reported; this session stands alone.</p>
-          )}
-        </div>
-
-        <SignalPanel signals={detail.signals} />
-        <UsagePanel usage={detail.usage} coverage={detail.coverage.usage} />
-        <TimelinePanel activities={activities} />
-      </div>
-
-      <TranscriptPanel sessionKey={sessionKey} revision={transcriptRevision} />
+      <TranscriptPanel key={sessionKey} sessionKey={sessionKey} revision={transcriptRevision} />
     </section>
   );
 }

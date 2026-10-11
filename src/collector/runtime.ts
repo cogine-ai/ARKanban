@@ -223,10 +223,19 @@ export class CollectorRuntime {
     items: [],
   };
   private stopped = true;
+  private readonly runningHost: CollectorStatus["host"];
+  private readonly runningGateway: Pick<CollectorStatus["gateway"], "name" | "endpoint">;
 
   constructor(readonly config: ResolvedCollectorConfig) {
-    const hostId = config.host?.id ?? "local";
-    this.repository = new CollectorRepository(config.storage.path, hostId);
+    // Settings writes saved choices into config while the repository and
+    // Gateway client keep their startup identities until the next process.
+    this.runningHost = {
+      id: config.host?.id ?? "local",
+      label: config.host?.label ?? config.gateway.name,
+      role: config.role ?? "node",
+    };
+    this.runningGateway = { name: config.gateway.name, endpoint: redactEndpoint(config.gateway.url) };
+    this.repository = new CollectorRepository(config.storage.path, this.runningHost.id);
     this.repository.subscribe((change) => {
       this.emitChange(change);
     });
@@ -314,20 +323,13 @@ export class CollectorRuntime {
         startedAt: this.startedAt,
         ready: this.syncState === "live" || this.syncState === "reconciling",
       },
-      host: {
-        id: this.config.host?.id ?? "local",
-        label: this.config.host?.label ?? this.config.gateway.name,
-        role: this.config.role ?? "node",
-      },
+      host: { ...this.runningHost },
       epoch: this.repository.epoch,
       revision: this.repository.revision,
       syncState: this.syncState,
       syncReasons: [...this.syncReasons],
       gateway: {
-        name: this.config.gateway.name,
-        // Redacted for the same reason the CLI redacts it: `ws://user:pass@host`
-        // is a legal endpoint, and this field is read by a browser page.
-        endpoint: redactEndpoint(this.config.gateway.url),
+        ...this.runningGateway,
         connected: this.gateway.isConnected,
         ...(this.gatewayHello?.server.version ? { serverVersion: this.gatewayHello.server.version } : {}),
         ...(this.gatewayHello?.protocol ? { protocolVersion: this.gatewayHello.protocol } : {}),
@@ -982,7 +984,7 @@ export class CollectorRuntime {
       const now = Date.now();
       const selected = selectUpcomingSchedules(jobs, {
         now,
-        hostId: this.config.host?.id ?? "local",
+        hostId: this.runningHost.id,
         ...(this.defaultAgentId ? { defaultAgentId: this.defaultAgentId } : {}),
       });
       // A cron job proves its agent exists even when the roster call omits it,

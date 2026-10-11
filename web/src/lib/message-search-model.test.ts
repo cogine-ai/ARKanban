@@ -1,12 +1,26 @@
 import { describe, expect, it } from "vitest";
 import type { MessageSearchHit } from "../../../src/contracts";
-import type { TranscriptArchiveStatus } from "../api";
+import type { MessageSearchFilters, TranscriptArchiveStatus } from "../api";
 import { archiveSearchState, groupMessageHits, messageSearchIssue, messageSnippet } from "./message-search-model";
+import { validateMessageFilters } from "./session-filters";
 
 const archive = (patch: Partial<TranscriptArchiveStatus> = {}): TranscriptArchiveStatus => ({ enabled: true, retentionDays: 180, maxBytes: 1000, filePermissionsEnforced: true, messageCount: 4, contentBytes: 200, sync: null, ...patch });
 const hit = (key: string, id: number, sessionId?: string): MessageSearchHit => ({ sessionLabel: "Same name", agentId: "writer", message: { id, sessionKey: key, sessionId, seq: id, role: "assistant", content: "release", createdAt: id, divergent: false } });
 
 describe("message search facts", () => {
+  it("keeps form and result admission consistent, including an empty query with a malformed range", () => {
+    const cases: Array<[MessageSearchFilters, ReturnType<typeof validateMessageFilters>, ReturnType<typeof messageSearchIssue>]> = [
+      [{ q: "", from: NaN }, "invalid-range", "range"],
+      [{ q: " ", from: 200, to: 100 }, "invalid-range", "range"],
+      [{ q: " " }, "empty", "empty"],
+      [{ q: "😀😀", to: 100 }, "range-required", "scope"],
+      [{ q: "😀😀", from: 0 }, undefined, undefined],
+    ];
+    for (const [filters, formIssue, resultIssue] of cases) {
+      expect(validateMessageFilters(filters)).toBe(formIssue);
+      expect(messageSearchIssue(filters)).toBe(resultIssue);
+    }
+  });
   it("counts Unicode code points and refuses an end-only scope", () => {
     expect(messageSearchIssue({ q: "你好", to: 100 })).toBe("scope");
     expect(messageSearchIssue({ q: "😀😀", to: 100 })).toBe("scope");

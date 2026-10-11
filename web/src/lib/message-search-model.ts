@@ -1,12 +1,12 @@
 import type { MessageSearchHit } from "../../../src/contracts";
 import type { MessageSearchFilters, TranscriptArchiveStatus } from "../api";
+import { validateMessageFilters } from "./session-filters";
 
 export function messageSearchIssue(filters: MessageSearchFilters): "empty" | "scope" | "range" | undefined {
-  if (!filters.q.trim()) return "empty";
-  if ([filters.from, filters.to].some((value) => value !== undefined && (!Number.isSafeInteger(value) || value < 0))
-    || (filters.from !== undefined && filters.to !== undefined && filters.from > filters.to)) return "range";
-  if ([...filters.q.trim()].length < 3 && !filters.agentId?.trim() && !filters.sessionKey?.trim() && filters.from === undefined) return "scope";
-  return undefined;
+  const issue = validateMessageFilters(filters);
+  if (issue === "invalid-range") return "range";
+  if (issue === "range-required") return "scope";
+  return issue;
 }
 
 /** Groups cover the returned hits, never the entire matching archive. */

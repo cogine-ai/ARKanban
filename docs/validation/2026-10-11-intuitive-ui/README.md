@@ -8,7 +8,7 @@ restart are never presented as success, causality, zero cost, or applied setting
 
 ## Verification
 
-- Fresh `pnpm verify`: type checking, **615 tests in 49 files**, server build, and
+- Fresh `pnpm verify`: type checking, **620 tests in 49 files**, server build, and
   production web build passed after the final review fixes.
 - Production Chrome checks covered 1440px, 1280px, and 390px viewports. The session
   list/search pass had 62 assertions; the relations/detail pass had 58. Archive
@@ -26,6 +26,11 @@ restart are never presented as success, causality, zero cost, or applied setting
   `200 shown · Results limited`. Changing to a single-match query removed that
   flag; clearing restored the ordinary transcript. These checks had no browser
   or HTTP errors and no horizontal overflow.
+- Session-detail search failures have a query-owned alert and do not display a
+  zero-match count. Regression tests cover failure recovery, true zero results,
+  stale rejections, and retaining unrelated transcript paging failures. Form
+  and result validation now share one rule implementation, including the error
+  priority for an empty query with an invalid date range.
 
 All images below are unedited captures of the running production UI using mock
 Gateway observations and isolated example archives. The main-view images were
@@ -74,3 +79,17 @@ offline; no API response was intercepted or fabricated in the browser.
 ![Limited detail search, 1440 × 900](detail-limited.png)
 
 ![Limited detail search, 390 × 844](detail-limited-mobile.png)
+
+## Session detail search failure
+
+These production UI panel captures use a separate temporary database. Renaming
+its FTS index induced a real HTTP 500; restoring the index made the next query
+succeed with three matches. Both viewport checks confirmed that the failed
+request displays an alert without a result count, while a successful zero-hit
+response still displays `0 matching messages`. Clearing search restored the
+ordinary transcript. There was no browser response interception or unexpected
+HTTP/page error.
+
+![Search failure panel at a 1440px viewport](detail-search-failed.png)
+
+![Search failure panel at a 390px viewport](detail-search-failed-mobile.png)

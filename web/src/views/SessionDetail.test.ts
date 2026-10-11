@@ -148,4 +148,85 @@ describe("session navigation request ownership", () => {
     expect(container.querySelector(".transcript")?.textContent).toContain("Transcript current");
     expect(container.textContent).not.toContain("Results limited");
   });
+
+  it("shows a failed search without a zero-match count and clears it when search is cleared", async () => {
+    vi.useFakeTimers();
+    api.session.mockImplementation(async (key: string) => session(key));
+    api.searchMessages.mockRejectedValue(new Error("archive read failed"));
+    await mount("current");
+    await enterSearch("release");
+    await settleSearch();
+    expect(container.querySelector("[role=alert]")?.textContent).toBe("Search failed · archive read failed");
+    expect(container.querySelector(".transcript-search small")).toBeNull();
+    expect(container.textContent).not.toContain("0 matching messages");
+    await enterSearch("");
+    expect(container.querySelector("[role=alert]")).toBeNull();
+    expect(container.textContent).not.toContain("archive read failed");
+    expect(container.querySelector(".transcript")?.textContent).toContain("Transcript current");
+  });
+
+  it("clears a prior search failure immediately on a new query and accepts a real zero-result response", async () => {
+    vi.useFakeTimers();
+    api.session.mockImplementation(async (key: string) => session(key));
+    api.searchMessages.mockRejectedValueOnce(new Error("old search unavailable"))
+      .mockResolvedValueOnce(searchResult("current", "no-match", 0));
+    await mount("current");
+    await enterSearch("old");
+    await settleSearch();
+    expect(container.textContent).toContain("old search unavailable");
+    await enterSearch("no-match");
+    expect(container.querySelector("[role=alert]")).toBeNull();
+    expect(container.querySelector(".transcript-search small")?.textContent).toBe("Searching…");
+    await settleSearch();
+    expect(container.querySelector(".transcript-search small")?.textContent).toBe("0 matching messages");
+    expect(container.textContent).not.toContain("old search unavailable");
+    await mount("next");
+    expect(container.querySelector("[role=alert]")).toBeNull();
+    expect(container.querySelector<HTMLInputElement>(".transcript-search input")?.value).toBe("");
+  });
+
+  it("ignores an old query's late rejection after a newer search has succeeded", async () => {
+    vi.useFakeTimers();
+    api.session.mockImplementation(async (key: string) => session(key));
+    let failOld!: (cause: Error) => void;
+    api.searchMessages.mockImplementation(({ q }: { q: string }) => q === "old"
+      ? new Promise<MessageSearchResult>((_resolve, reject) => { failOld = reject; })
+      : Promise.resolve(searchResult("current", q, 2)));
+    await mount("current");
+    await enterSearch("old");
+    await settleSearch();
+    const signal = api.searchMessages.mock.calls[0]![1].signal as AbortSignal;
+    await enterSearch("new");
+    expect(signal.aborted).toBe(true);
+    await settleSearch();
+    await act(async () => failOld(new Error("late old failure")));
+    expect(container.querySelector("[role=alert]")).toBeNull();
+    expect(container.querySelector(".transcript-search small")?.textContent).toBe("2 matching messages");
+    expect(container.textContent).not.toContain("late old failure");
+  });
+
+  it("preserves a transcript paging failure while a search fails, recovers and is cleared", async () => {
+    vi.useFakeTimers();
+    api.session.mockImplementation(async (key: string) => session(key));
+    api.sessionMessages.mockImplementation((key: string, after?: number) => after === undefined
+      ? Promise.resolve(transcript(key, "Transcript current", 2))
+      : Promise.reject(new Error("transcript page unavailable")));
+    api.searchMessages.mockRejectedValueOnce(new Error("search unavailable"))
+      .mockResolvedValueOnce(searchResult("current", "release", 1));
+    await mount("current");
+    await act(async () => container.querySelector<HTMLButtonElement>(".transcript-more")!.click());
+    expect(container.textContent).toContain("transcript page unavailable");
+    await enterSearch("bad");
+    await settleSearch();
+    expect(container.textContent).toContain("transcript page unavailable");
+    expect(container.querySelector("[role=alert]")?.textContent).toContain("search unavailable");
+    await enterSearch("release");
+    await settleSearch();
+    expect(container.querySelector(".transcript-search small")?.textContent).toBe("1 matching message");
+    expect(container.querySelector("[role=alert]")).toBeNull();
+    expect(container.textContent).toContain("transcript page unavailable");
+    await enterSearch("");
+    expect(container.textContent).toContain("transcript page unavailable");
+    expect(container.textContent).not.toContain("search unavailable");
+  });
 });

@@ -145,6 +145,7 @@ function TranscriptPanel({ sessionKey, revision }: { sessionKey: string; revisio
     messages: ArchivedMessage[];
     truncated: boolean;
   }>();
+  const [searchError, setSearchError] = useState<{ sessionKey: string; query: string; message: string }>();
   const [searching, setSearching] = useState(false);
 
   useEffect(() => {
@@ -213,8 +214,10 @@ function TranscriptPanel({ sessionKey, revision }: { sessionKey: string; revisio
    */
   useEffect(() => {
     const needle = query.trim();
+    setSearchError(undefined);
     if (needle.length === 0) {
       setSearchResult(undefined);
+      setSearching(false);
       return;
     }
     const controller = new AbortController();
@@ -222,9 +225,8 @@ function TranscriptPanel({ sessionKey, revision }: { sessionKey: string; revisio
     // to this one. The count beside the field is drawn from them, so leaving them
     // up reports the old query's tally against the new query's text.
     //
-    // `error` is deliberately left alone: it also carries a failure to load the
-    // transcript itself, and clearing it here would erase the only explanation
-    // for an empty panel.
+    // Transcript loading failures are separate from this query's failure; a new
+    // search must not erase an error reading the underlying transcript.
     setSearchResult(undefined);
     setSearching(true);
     const timer = setTimeout(() => {
@@ -239,11 +241,12 @@ function TranscriptPanel({ sessionKey, revision }: { sessionKey: string; revisio
           // whether it is still the one being asked before it writes to the panel.
           if (controller.signal.aborted) return;
           setSearchResult({ sessionKey, query: needle, messages: result.hits.map((hit) => hit.message), truncated: result.truncated });
+          setSearchError(undefined);
         } catch (cause) {
           // A cancelled search is not a failure to report; the next keystroke's
           // search is already on its way.
           if (isAbortError(cause) || controller.signal.aborted) return;
-          setError(cause instanceof Error ? cause.message : String(cause));
+          setSearchError({ sessionKey, query: needle, message: cause instanceof Error ? cause.message : String(cause) });
         } finally {
           if (!controller.signal.aborted) setSearching(false);
         }
@@ -258,6 +261,8 @@ function TranscriptPanel({ sessionKey, revision }: { sessionKey: string; revisio
   const searchActive = query.trim().length > 0;
   const currentSearchResult = searchResult?.sessionKey === sessionKey && searchResult.query === query.trim()
     ? searchResult : undefined;
+  const currentSearchError = searchError?.sessionKey === sessionKey && searchError.query === query.trim()
+    ? searchError : undefined;
   const shown = searchActive ? (currentSearchResult?.messages ?? []) : (messages ?? []);
   const archived = sync?.syncedCount ?? 0;
   const remaining = messages === undefined ? 0 : Math.max(0, archived - messages.length);
@@ -284,14 +289,15 @@ function TranscriptPanel({ sessionKey, revision }: { sessionKey: string; revisio
       ) : null}
 
       {error ? <div className="inline-error">{error}</div> : null}
+      {currentSearchError ? <div className="inline-error" role="alert">Search failed · {currentSearchError.message}</div> : null}
 
       {messages && messages.length > 0 ? (
         <label className="transcript-search">
           <span className="sr-only">Find in transcript</span>
           <input type="search" value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Search this session" />
-          {searchActive ? (
+          {searchActive && !currentSearchError ? (
             <small className="muted">
-              {searching ? "Searching…" : currentSearchResult?.truncated
+              {searching || !currentSearchResult ? "Searching…" : currentSearchResult.truncated
                 ? `${shown.length} shown · Results limited`
                 : `${shown.length} matching ${shown.length === 1 ? "message" : "messages"}`}
             </small>

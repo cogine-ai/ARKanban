@@ -1,0 +1,130 @@
+{
+  "environment": "Production build, actual Collector HTTP/SSE, static loopback WebSocket Gateway and isolated SQLite; no browser API interception",
+  "timingBoundary": "UI latency measured from the actual /api/v1/transcripts/status transition. Collector itself syncs every 30 s; browser poll is 15 s.",
+  "checks": [
+    "Actual empty history reports Sync ready with inserted=0",
+    "primary_failed: failure and recovery reflected automatically within 30 s of actual API transition, with inserted=0",
+    "No messages/sessions invalidation during error/recovery; no browser reload, retry, API interception, or Gateway runtime broadcasts"
+  ],
+  "transitions": [
+    {
+      "mode": "primary_failed",
+      "switchedAt": 1791707732682,
+      "apiFaultAt": 1791707756916,
+      "apiFault": {
+        "sync": {
+          "requests": 0,
+          "inserted": 0,
+          "sessions": 0,
+          "capacity": "ok",
+          "evictedSessions": 0,
+          "skipped": "primary_sync_failed"
+        },
+        "enabled": true,
+        "retentionDays": 30,
+        "maxBytes": 67108864,
+        "filePermissionsEnforced": true,
+        "messageCount": 0,
+        "contentBytes": 0
+      },
+      "uiFaultAt": 1791707762234,
+      "uiFaultLatencyMs": 5318,
+      "recoverySwitchedAt": 1791707762368,
+      "apiRecoveryAt": 1791707786880,
+      "apiRecovery": {
+        "sync": {
+          "requests": 1,
+          "inserted": 0,
+          "sessions": 1,
+          "capacity": "ok",
+          "evictedSessions": 0
+        },
+        "enabled": true,
+        "retentionDays": 30,
+        "maxBytes": 67108864,
+        "filePermissionsEnforced": true,
+        "messageCount": 0,
+        "contentBytes": 0
+      },
+      "uiRecoveryAt": 1791707792194,
+      "uiRecoveryLatencyMs": 5314
+    }
+  ],
+  "invalidations": [],
+  "browserErrors": [],
+  "screenshots": [
+    "connections-sync-failed-1440.png",
+    "connections-sync-failed-390.png"
+  ],
+  "gateway": {
+    "mode": "ready",
+    "startedAt": 1791707661185,
+    "calls": {
+      "connect": 1,
+      "sessions.subscribe": 1,
+      "tasks.list": 9,
+      "sessions.list": 16,
+      "cron.status": 3,
+      "sessions.usage": 1,
+      "cron.list": 3,
+      "sessions.usage.timeseries": 1,
+      "agents.list": 2,
+      "chat.history": 4,
+      "audit.list": 1
+    },
+    "faults": [
+      {
+        "at": 1791707666737,
+        "method": "sessions.usage",
+        "mode": "ready",
+        "code": "method_not_found"
+      },
+      {
+        "at": 1791707666737,
+        "method": "sessions.usage.timeseries",
+        "mode": "ready",
+        "code": "method_not_found"
+      },
+      {
+        "at": 1791707666738,
+        "method": "audit.list",
+        "mode": "ready",
+        "code": "method_not_found"
+      },
+      {
+        "at": 1791707738737,
+        "method": "sessions.list",
+        "mode": "primary_failed",
+        "code": "fixture_primary_failure"
+      },
+      {
+        "at": 1791707746739,
+        "method": "sessions.list",
+        "mode": "primary_failed",
+        "code": "fixture_primary_failure"
+      },
+      {
+        "at": 1791707754741,
+        "method": "sessions.list",
+        "mode": "primary_failed",
+        "code": "fixture_primary_failure"
+      }
+    ],
+    "controls": [
+      {
+        "at": 1791707671341,
+        "mode": "ready"
+      },
+      {
+        "at": 1791707732682,
+        "mode": "primary_failed"
+      },
+      {
+        "at": 1791707762368,
+        "mode": "ready"
+      }
+    ],
+    "broadcastEvents": 0
+  },
+  "success": true
+}

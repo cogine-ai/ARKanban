@@ -92,24 +92,22 @@ try {
         await gotoView("Agents");
         const cards = page.locator(".agent-card");
         const first = cards.first();
-        const systemToggle = page.locator(".agent-system-toggle");
-        const hasSystemGroup = await systemToggle.count() > 0;
-        const collapsedCount = await cards.count();
-        if (hasSystemGroup) await systemToggle.click();
+        await first.waitFor({ state: "visible" });
+        const detailsCollapsedByDefault = await first.locator(".roster-more").getAttribute("aria-expanded") === "false";
+        await first.locator(".roster-more").click();
         await page.waitForTimeout(250);
         return {
-          heading: normalise(await page.locator(".view-heading h1").textContent()),
-          eyebrow: normalise(await page.locator(".view-heading .eyebrow").textContent()),
-          chip: normalise(await page.locator(".count-chip").textContent()),
-          visibleCards: collapsedCount,
-          cardsWithSystemExpanded: await cards.count(),
-          systemCollapsedByDefault: hasSystemGroup ? collapsedCount < (await cards.count()) : "no system agents",
-          sectionLabels: (await first.locator(".eyebrow").allTextContents()).map(normalise),
-          rollupWindows: await first.locator(".agent-rollup tbody th").allTextContents(),
-          rollupColumns: (await first.locator(".agent-rollup thead th").allTextContents()).map(normalise),
-          firstCardRollup: (await first.locator(".agent-rollup tbody td").allTextContents()).map(normalise),
+          heading: normalise(await page.locator(".roster-heading h1").textContent()),
+          count: normalise(await page.locator(".roster-count").textContent()),
+          visibleCards: await cards.count(),
+          detailsCollapsedByDefault,
+          filters: (await page.locator(".roster-filters button").allTextContents()).map(normalise),
+          firstSignal: normalise(await first.locator(".roster-signal").textContent()),
+          rollupWindows: await first.locator(".roster-rollup").evaluateAll((elements) => elements.map((element) => element.getAttribute("data-window"))),
+          rollupColumns: (await first.locator(".roster-primary-rollup .roster-rollup small").allTextContents()).map(normalise),
+          firstCardRollup: (await first.locator(".roster-primary-rollup .roster-rollup b").allTextContents()).map(normalise),
           costLine: normalise(await first.locator(".agent-cost").textContent()),
-          // The roster must be ordered busiest-first; capture enough to see it.
+          // Capture the priority order and detail disclosure without exposing IDs by default.
           order: (await page.locator(".agent-card .agent-identity b").allTextContents()).slice(0, 8),
         };
       })()
@@ -143,20 +141,28 @@ try {
 
   await gotoView("Archive");
   const archive = {
-    heading: normalise(await page.locator(".view-heading h1").textContent()),
-    eyebrow: normalise(await page.locator(".view-heading .eyebrow").textContent()),
-    chip: normalise(await page.locator(".count-chip").textContent()),
-    head: (await page.locator(".archive-head span").allTextContents()).map(normalise),
-    rows: await count(page, ".archive-table button"),
+    heading: normalise(await page.locator(".archive-view-heading h1").textContent()),
+    subtitle: normalise(await page.locator(".archive-view-heading > div > span").textContent()),
+    recent: normalise(await page.locator(".archive-retained-count").textContent()),
+    filters: await page.locator(".archive-control > span").allTextContents(),
+    groups: (await page.locator(".archive-day h2").allTextContents()).map(normalise),
+    rows: await count(page, ".archive-row"),
+    pagination: normalise(await page.locator(".archive-paging").textContent()),
   };
 
   await gotoView("Connections");
+  const diagnostics = page.locator(".connection-diagnostics");
+  const diagnosticsCollapsedByDefault = await diagnostics.getAttribute("open") === null;
+  await diagnostics.locator("summary").click();
   const connections = {
     heading: normalise(await page.locator(".view-heading h1").textContent()),
-    eyebrow: normalise(await page.locator(".view-heading .eyebrow").textContent()),
-    chip: normalise(await page.locator(".count-chip").textContent()),
-    coverage: (await page.locator(".coverage-grid article small").allTextContents()).map(normalise),
-    gatewayTerms: (await page.locator(".gateway-main dt").allTextContents()).map(normalise),
+    pageStatus: normalise(await page.locator(".connection-heading-actions .connection-signal").textContent()),
+    flow: await page.locator(".connection-flow").getAttribute("aria-label"),
+    steps: (await page.locator(".connection-step-label").allTextContents()).map(normalise),
+    coverage: (await page.locator(".connection-sources article strong").allTextContents()).map(normalise),
+    archiveDisclosure: await page.locator(".connection-archive-disclosure, .connection-hub-archive").first().textContent(),
+    diagnosticsCollapsedByDefault,
+    diagnosticTerms: (await diagnostics.locator("dt").allTextContents()).map(normalise),
   };
 
   // Search text is held above the view switch; losing it on navigation would be
@@ -185,7 +191,7 @@ try {
     backReturnsToArchive: await (async () => {
       await page.goBack();
       await page.waitForTimeout(400);
-      return { path: new URL(page.url()).pathname, heading: normalise(await page.locator(".view-heading h1").textContent()) };
+      return { path: new URL(page.url()).pathname, heading: normalise(await page.locator(".archive-view-heading h1").textContent()) };
     })(),
     deepLinkRendersView: await (async () => {
       await page.goto(`${baseUrl}/relations`, { waitUntil: "networkidle" });
@@ -218,6 +224,7 @@ try {
     process.stderr.write(`Browser console errors:\n${consoleErrors.join("\n")}\n`);
     process.exitCode = 1;
   }
+  if (eventSourceCount !== 1) throw new Error(`Expected one collector stream, observed ${eventSourceCount}`);
 } finally {
   await browser.close();
 }

@@ -6,6 +6,7 @@ import type { KindFilter } from "./lib/board";
 import { formatRelative, statusLabel } from "./lib/format";
 import { Link, matchPath, useLocation, useNavigate } from "./router";
 import { useCollector } from "./state/collector-context";
+import { useAgents } from "./state/use-agents";
 import { AgentDetailView } from "./views/AgentDetail";
 import { AgentsView } from "./views/Agents";
 import { ArchiveView } from "./views/Archive";
@@ -65,6 +66,12 @@ function LiveStreamNotice() {
       )}
     </div>
   );
+}
+
+function ArchiveRoute({ selectedId, onSelect }: { selectedId?: string; onSelect: (id: string) => void }) {
+  const { snapshot, status, error, refresh } = useCollector();
+  const { agents } = useAgents();
+  return <ArchiveView items={snapshot?.items} agents={agents} status={status} selectedId={selectedId} error={error} onRetry={() => void refresh()} onSelect={onSelect} />;
 }
 
 export function App() {
@@ -152,7 +159,7 @@ export function App() {
           {matchPath("/sessions", pathname) ? <SessionsView /> : null}
           {sessionDetail ? <SessionDetailView sessionKey={sessionDetail.sessionKey!} /> : null}
           {matchPath("/relations", pathname) ? <RelationsView snapshot={snapshot} status={status} selectedId={selectedId} paused={live.state !== "open"} onSelect={openItem} /> : null}
-          {matchPath("/archive", pathname) ? <ArchiveView items={snapshot?.items ?? []} onSelect={openItem} /> : null}
+          {matchPath("/archive", pathname) ? <ArchiveRoute selectedId={selectedId} onSelect={openItem} /> : null}
           {matchPath("/connections", pathname) ? <ConnectionsView status={status} /> : null}
           {matchPath("/settings", pathname) ? <SettingsView /> : null}
         </main>

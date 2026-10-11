@@ -1,0 +1,103 @@
+.agents-view { padding: 24px; }
+.roster-heading { display: flex; align-items: center; justify-content: space-between; gap: 16px; margin-bottom: 22px; }
+.roster-heading > div { display: flex; align-items: center; gap: 14px; }
+.roster-heading h1 { margin: 0; font-size: 30px; font-weight: 680; letter-spacing: -.85px; }
+.roster-count { color: var(--secondary); font-size: 16px; font-variant-numeric: tabular-nums; }
+.roster-source-state { color: #89530f; font-size: 13px; text-decoration: none; }
+.roster-source-state:hover { text-decoration: underline; }
+.roster-toolbar { display: flex; align-items: center; justify-content: space-between; gap: 16px; margin-bottom: 18px; }
+.roster-filters { display: flex; flex-wrap: wrap; gap: 4px; padding: 4px; background: #ebebef; border-radius: 12px; }
+.roster-filters button { min-height: 36px; display: flex; align-items: center; gap: 9px; padding: 7px 12px; border: 0; border-radius: 8px; background: transparent; color: var(--secondary); cursor: pointer; font: inherit; font-size: 13px; }
+.roster-filters button[aria-pressed="true"] { background: #fff; color: var(--ink); box-shadow: 0 1px 4px #0000000a; }
+.roster-filters button[data-filter="attention"] span { color: #89530f; }
+.roster-filters button span { color: var(--tertiary); font-variant-numeric: tabular-nums; }
+.roster-search { display: flex; align-items: center; gap: 8px; width: 240px; min-width: 0; padding: 0 12px; min-height: 42px; border: 1px solid var(--line); border-radius: 11px; background: #fff; }
+.roster-search svg { width: 18px; height: 18px; flex: 0 0 auto; fill: none; stroke: var(--secondary); stroke-width: 1.6; }
+.roster-search input { width: 100%; min-width: 0; border: 0; outline: 0; background: transparent; color: var(--ink); font: inherit; font-size: 13px; }
+.agents-view .roster-list { display: flex; flex-direction: column; gap: 0; border: 1px solid var(--line); border-radius: 16px; overflow: hidden; background: #fff; }
+.roster-columns, .roster-row-main { display: grid; grid-template-columns: minmax(180px,1.65fr) minmax(125px,1fr) minmax(220px,1.6fr) minmax(100px,.75fr) 88px 32px; align-items: center; gap: 16px; padding: 0 20px; }
+.roster-columns { min-height: 44px; color: var(--secondary); font-size: 13px; background: #fbfbfc; border-bottom: 1px solid var(--line); }
+.agents-view .agent-card { display: block; padding: 0; border: 0; border-radius: 0; background: #fff; }
+.agents-view .agent-card + .agent-card { border-top: 1px solid var(--line); }
+.roster-row-main { min-height: 104px; }
+.agents-view .agent-card-open { grid-template-columns: 38px minmax(0,1fr); gap: 12px; }
+.agents-view .agent-avatar { width: 38px; height: 38px; font-size: 13px; }
+.agents-view .agent-identity b { font-size: 15px; font-weight: 630; letter-spacing: -.2px; }
+.agents-view .agent-identity small { font-size: 13px; margin-top: 5px; }
+.roster-signal { min-width: 0; color: var(--secondary); font-size: 13px; }
+.roster-state { display: inline-flex; align-items: center; gap: 8px; }
+.roster-state > i { width: 17px; height: 17px; display: inline-flex; align-items: center; justify-content: center; flex: 0 0 auto; color: #fff; border-radius: 50%; font-size: 11px; font-weight: 700; font-style: normal; background: #c8c8cd; }
+.roster-signal[data-state="running"] { color: #17784b; }
+.roster-signal[data-state="running"] .roster-state > i { background: #248a58; font-size: 9px; }
+.roster-signal[data-state="attention"] { color: #89530f; }
+.roster-signal[data-state="attention"] .roster-state > i { background: #bf7414; }
+.roster-signal[data-state="unknown"] .roster-state > i { background: transparent; border: 1px dashed #b1b1b8; }
+.roster-signal > small { display: block; margin: 4px 0 0 25px; font-size: 13px; color: var(--secondary); }
+.roster-rollup { display: grid; grid-template-columns: repeat(3,minmax(0,1fr)); gap: 14px; font-variant-numeric: tabular-nums; }
+.roster-rollup > span { display: grid; align-content: start; gap: 5px; position: relative; }
+.roster-rollup small { color: var(--secondary); font-size: 13px; }
+.roster-rollup b { font-size: 17px; line-height: 1.2; font-weight: 590; }
+.roster-success-track { display: block; position: absolute; top: calc(100% + 5px); height: 3px; width: 42px; border-radius: 3px; overflow: hidden; background: #e7e7ec; }
+.roster-success-track > i { display: block; height: 100%; background: #248a58; }
+.roster-mobile-window { display: none; }
+.roster-next { display: flex; align-items: center; gap: 8px; color: var(--secondary); }
+.roster-next svg { flex: 0 0 auto; height: 18px; width: 18px; fill: none; stroke: currentColor; stroke-width: 1.4; }
+.roster-next small { display: none; }
+.roster-next b { display: block; font-size: 13px; font-weight: 500; }
+.agents-view .roster-sessions { display: grid; gap: 4px; font-size: 13px; color: var(--secondary); }
+.roster-sessions b { color: var(--ink); font-size: 17px; font-weight: 590; }
+.roster-more { display: grid; place-items: center; height: 36px; width: 32px; border: 0; border-radius: 8px; background: transparent; color: var(--secondary); cursor: pointer; }
+.roster-more:hover { background: #f0f0f4; }
+.roster-more svg { width: 20px; height: 20px; fill: none; stroke: currentColor; stroke-width: 1.7; }
+.roster-more[aria-expanded="true"] svg { transform: rotate(180deg); }
+.roster-details { display: grid; grid-template-columns: minmax(210px,1fr) minmax(210px,1fr) minmax(240px,1.2fr); align-items: start; gap: 28px; padding: 22px 24px; border-top: 1px solid var(--line); background: #fafafb; }
+.roster-details h2 { margin: 0 0 14px; font-size: 13px; font-weight: 600; color: var(--secondary); }
+.roster-detail-rollup { max-width: 270px; }
+.agents-view .agent-cost { gap: 14px; }
+.agents-view .agent-cost .eyebrow { font-size: 13px; font-weight: 600; letter-spacing: 0; color: var(--secondary); }
+.agents-view .cost-empty { font-size: 13px; }
+.agents-view .cost-window small { font-size: 13px; }
+.agents-view .cost-window b { font-size: 17px; }
+.roster-facts { margin: 0; display: grid; gap: 10px; font-size: 13px; }
+.roster-facts > div { display: grid; grid-template-columns: 105px minmax(0,1fr); gap: 10px; }
+.roster-facts dt { color: var(--secondary); }
+.roster-facts dd { margin: 0; min-width: 0; overflow-wrap: anywhere; }
+.roster-facts code { font-size: 13px; }
+.roster-error { display: flex; justify-content: space-between; align-items: center; gap: 16px; margin-bottom: 18px; padding: 12px 14px; background: #fff7ea; border: 1px solid #bf741433; border-radius: 11px; color: #89530f; font-size: 13px; }
+.roster-error button, .roster-empty button { border: 0; background: transparent; color: var(--blue); font: inherit; font-size: 13px; font-weight: 600; cursor: pointer; }
+.roster-error button { color: inherit; padding: 8px; }
+.roster-empty { display: grid; justify-items: center; align-content: center; gap: 12px; padding: 50px 20px; min-height: 260px; color: var(--secondary); }
+.roster-empty-symbol { display: grid; place-items: center; width: 54px; height: 54px; border-radius: 16px; background: #ededf2; color: var(--tertiary); font-size: 28px; }
+.roster-empty h2 { margin: 0; color: var(--ink); font-size: 17px; font-weight: 600; }
+.roster-empty a { color: var(--blue); font-size: 13px; text-decoration: none; }
+.agents-view button:focus-visible, .agents-view a:focus-visible, .roster-search:focus-within { outline: 2px solid var(--blue); outline-offset: 3px; }
+@media (max-width: 1140px) {
+  .roster-columns { display: none; }
+  .roster-row-main { grid-template-columns: minmax(180px,1.5fr) minmax(120px,1fr) minmax(90px,.7fr) 88px 32px; grid-template-areas: "identity identity signal signal more" "metrics metrics next sessions sessions"; gap: 18px; padding: 18px 20px 22px; }
+  .roster-identity { grid-area: identity; }
+  .roster-signal { grid-area: signal; }
+  .roster-primary-rollup { grid-area: metrics; max-width: 350px; }
+  .roster-mobile-window { display: block; font-size: 13px; color: var(--secondary); margin-bottom: 10px; }
+  .roster-next { grid-area: next; }
+  .roster-next small { display: block; margin-bottom: 5px; font-size: 13px; }
+  .roster-sessions { grid-area: sessions; }
+  .roster-more { grid-area: more; }
+  .roster-details { grid-template-columns: repeat(2,minmax(0,1fr)); }
+  .roster-facts { grid-column: 1 / -1; }
+}
+@media (max-width: 760px) {
+  .agents-view { padding: 20px 16px; }
+  .roster-heading h1 { font-size: 26px; }
+  .roster-heading > div { flex-wrap: wrap; gap: 8px 12px; }
+  .roster-toolbar { flex-direction: column-reverse; align-items: stretch; gap: 12px; }
+  .roster-search { width: auto; }
+  .roster-filters { justify-content: space-between; }
+  .roster-filters button { gap: 5px; padding: 8px 9px; }
+  .roster-row-main { grid-template-columns: minmax(0,1fr) auto 30px; grid-template-areas: "identity identity more" "signal signal signal" "metrics metrics metrics" "next sessions sessions"; gap: 17px 10px; padding: 18px 16px 21px; }
+  .roster-primary-rollup { width: 100%; }
+  .roster-rollup { gap: 22px; }
+  .agents-view .roster-sessions { display: inline-flex; align-items: center; justify-content: end; gap: 6px; }
+  .roster-sessions b { font-size: 13px; }
+  .roster-details { grid-template-columns: minmax(0,1fr); gap: 24px; padding: 22px 16px; }
+  .roster-detail-rollup { max-width: none; }
+}

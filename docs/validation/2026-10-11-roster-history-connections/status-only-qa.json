@@ -126,5 +126,26 @@
     ],
     "broadcastEvents": 0
   },
-  "success": true
+  "success": true,
+  "mobileCapture": {
+    "file": "/Users/kiedis/.codex/visualizations/2026/10/10/01a1283f-99eb-7312-ad39-57ca032fed1b/agents-archive-connections-2026-10-11/screenshots/connections-sync-failed-390.png",
+    "viewport": "390x844",
+    "behavior": "Fresh narrow page, archive panel scrolled into view and details expanded; stable actual primary_sync_failed API, inserted=0",
+    "api": {
+      "sync": {
+        "requests": 0,
+        "inserted": 0,
+        "sessions": 0,
+        "capacity": "ok",
+        "evictedSessions": 0,
+        "skipped": "primary_sync_failed"
+      },
+      "enabled": true,
+      "retentionDays": 30,
+      "maxBytes": 67108864,
+      "filePermissionsEnforced": true,
+      "messageCount": 0,
+      "contentBytes": 0
+    }
+  }
 }
